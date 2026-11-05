@@ -1618,15 +1618,22 @@ let lodMat = null;
  * tile that would have painted it was discarded anyway. Measured at zoom 4734 with all 327 tiles
  * drawn and 0 gaps: 34 of 84 screen samples hit no geometry at all. */
 const COV_N = 128;                                // the patch grid wraps at 128 (the world is ~64)
-const covData = new Uint8Array(COV_N * COV_N);
-const covTex = new THREE.DataTexture(covData, COV_N, COV_N, THREE.RedFormat, THREE.UnsignedByte);
+// RGBA, not RedFormat: a 1-channel DataTexture sampled in the patched shader came back 0 for every
+// fragment on this driver (proven by forcing the whole map covered, which changed 0.5% of pixels
+// while an unconditional discard changed 30%), so the discard silently did nothing.
+const covData = new Uint8Array(COV_N * COV_N * 4);
+const covTex = new THREE.DataTexture(covData, COV_N, COV_N, THREE.RGBAFormat, THREE.UnsignedByte);
+covTex.colorSpace = THREE.NoColorSpace;
 covTex.magFilter = covTex.minFilter = THREE.NearestFilter;
 covTex.generateMipmaps = false;
 covTex.needsUpdate = true;
 const uLodCov = { value: covTex };
 const uCovAt = { value: new THREE.Vector2(0, 0) };   // patch coordinate sitting at the origin
 const uCovBlk = { value: 256 };                      // blocks per far-grid patch (S.patch * CH)
+const uKill = { value: 0 };                          // debug: unconditional discard for the baked tiles
 let lodClipOn = 0, lodClipRect = [1e9, 1e9, -1e9, -1e9], lodCovPatches = 0;
+let covForce = 0;                                // debug: 1 = everything covered, -1 = nothing, 0 = normal
+let lodKill = 0;                                 // debug: unconditional discard, to prove the patch is live
 
 /**
  * Is the eye inside the rock? The test is skylight, not depth: a ravine floor 40 blocks under the rim
@@ -1659,7 +1666,10 @@ function updateLodClip() {
   const PB = uCovBlk.value = S.patch * CH;
   covData.fill(0);
   lodCovPatches = 0;
-  if (on) {
+  if (covForce) {                                 // debug path: is the discard reaching the GPU at all?
+    covData.fill(covForce > 0 ? 255 : 0);
+    lodCovPatches = covForce > 0 ? 1 : 0;
+  } else if (on) {
     const [tcx, tcz] = centerChunk();
     const acx = Math.floor(tcx / S.patch), acz = Math.floor(tcz / S.patch);
     uCovAt.value.set(acx, acz);
@@ -1668,8 +1678,9 @@ function updateLodClip() {
       const c = pk.indexOf(',');
       const px = +pk.slice(0, c), pz = +pk.slice(c + 1);
       const tx = ((px - acx) % COV_N + COV_N) % COV_N, tz = ((pz - acz) % COV_N + COV_N) % COV_N;
-      if (covData[tz * COV_N + tx]) continue;
-      covData[tz * COV_N + tx] = 1;
+      const ci = (tz * COV_N + tx) << 2;
+      if (covData[ci]) continue;
+      covData[ci] = 255;
       lodCovPatches++;
       if (px < x0) x0 = px;
       if (pz < z0) z0 = pz;
@@ -1687,12 +1698,13 @@ const lodMatFor = () => {
   const m = new THREE.MeshBasicMaterial({ vertexColors: true, fog: true, side: THREE.FrontSide });
   m.onBeforeCompile = (sh) => {
     sh.uniforms.uLodCov = uLodCov; sh.uniforms.uCovAt = uCovAt; sh.uniforms.uCovBlk = uCovBlk;
+    sh.uniforms.uKill = uKill;
     sh.vertexShader = 'varying vec3 dvWorld;\n' + sh.vertexShader.replace(
       '#include <begin_vertex>',
       '#include <begin_vertex>\n\tdvWorld = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;');
-    sh.fragmentShader = 'uniform sampler2D uLodCov;\nuniform vec2 uCovAt;\nuniform float uCovBlk;\nvarying vec3 dvWorld;\n' + sh.fragmentShader.replace(
-      '#include <clipping_planes_fragment>',
-      '#include <clipping_planes_fragment>\n\tif ( texture2D( uLodCov, ( mod( floor( dvWorld.xz / uCovBlk ) - uCovAt, 128.0 ) + 0.5 ) / 128.0 ).r > 0.5 ) discard;');
+    sh.fragmentShader = 'uniform sampler2D uLodCov;\nuniform vec2 uCovAt;\nuniform float uCovBlk;\nuniform float uKill;\nvarying vec3 dvWorld;\n' + sh.fragmentShader.replace(
+        '#include <clipping_planes_fragment>',
+        '#include <clipping_planes_fragment>\n\tif ( uKill > 0.5 && uKill < 1.5 ) discard;\n\tif ( uKill > 1.5 && texture2D( uLodCov, vec2( 0.5, 0.5 ) ).r > 0.5 ) discard;\n\tif ( texture2D( uLodCov, ( mod( floor( dvWorld.xz / uCovBlk ) - uCovAt, 128.0 ) + 0.5 ) / 128.0 ).r > 0.5 ) discard;');
   };
   // Without a distinct cache key three reuses the unpatched program for the same material shape.
   m.customProgramCacheKey = () => 'dvclip';
@@ -2554,6 +2566,28 @@ window.__world = {
   }),
   // Which unloaded-but-far-painted neighbours a chunk's faces would be hidden behind.
   coveredAt: (cx, cz) => coveredNeighbours(cx, cz),
+  /**
+   * Debug for the baked-tile discard, because "the coarse layer is still painting the close ground"
+   * can come from three different bugs (the coverage set is wrong / the CPU thinks it is covered but
+   * the GPU never sees it / the shader patch is not in the compiled program). These answer each one:
+   *   dbgCovAt(x, z)  what the CPU-side coverage map says for that block column
+   *   dbgCovFill(1)   force the whole map covered - if tiles still paint, the discard is not in the
+   *                   compiled shader
+   *   dbgLodUniforms  the uniforms the shader is sampling with, and how many compiled programs carry
+   *                   the patched material's cache key
+   */
+  dbgCovAt: (wx, wz) => {
+    const px = Math.floor(wx / uCovBlk.value), pz = Math.floor(wz / uCovBlk.value);
+    const tx = ((px - uCovAt.value.x) % COV_N + COV_N) % COV_N, tz = ((pz - uCovAt.value.y) % COV_N + COV_N) % COV_N;
+    return { patch: [px, pz], texel: [tx, tz], covered: covData[((tz * COV_N + tx) << 2)], blk: uCovBlk.value };
+  },
+  dbgCovFill: (v) => { covForce = v === 0 ? 0 : (v > 0 ? 1 : -1); },
+  dbgLodKill: (v) => { lodKill = +v || 0; uKill.value = lodKill; },
+  dbgPrograms: () => renderer.info.programs.map((p) => ({ name: p.name, used: p.usedTimes, key: /dvclip\w*/.exec(p.cacheKey) })),
+  dbgLodUniforms: () => ({
+    at: [uCovAt.value.x, uCovAt.value.y], blk: uCovBlk.value, tex: !!uLodCov.value,
+    patchedPrograms: renderer.info.programs.filter((p) => /dvclip/.test(p.cacheKey)).length,
+  }),
   lodAt: (wx, wz) => lodAt(wx, wz),
   pickState,
   pickStack,
