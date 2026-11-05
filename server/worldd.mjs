@@ -235,3 +235,27 @@ server.listen(PORT, HOST, () => {
   }
   console.log(`  states ${atlas.states.length}  textures ${atlas.textures.length}`);
 });
+
+// "The server ain't loading" has three possible answers — dead, wedged, or merely slow — and the log
+// could not tell them apart (it ended with a clean startup banner and no stack when a process vanished
+// silently). So: a 60 s heartbeat with RSS and request-counter deltas, plus a line on the way out.
+// Reading it: no exit line but the heartbeat stops = killed from outside (OOM / job teardown);
+// heartbeat keeps printing while requests time out = the event loop is blocked; counter deltas say
+// what it was busy with. Disable with --heartbeat 0.
+const T0 = Date.now();
+const HEARTBEAT = Math.max(0, +arg('heartbeat', 60));
+if (HEARTBEAT) {
+  let prev = { ...svc.stats };
+  setInterval(() => {
+    const d = [];
+    for (const [k, v] of Object.entries(svc.stats)) { if (v !== prev[k]) d.push(`${k}+${v - prev[k]}`); prev[k] = v; }
+    console.log(`hb ${Math.round((Date.now() - T0) / 1000)}s rss=${(process.memoryUsage().rss / 1048576).toFixed(0)}MB` +
+      ` packs=${svc.packs.size}${d.length ? ' ' + d.join(' ') : ''}`);
+  }, HEARTBEAT * 1000).unref();
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) {
+  try { process.on(sig, () => { console.log(`worldd: ${sig}, exiting`); process.exit(0); }); } catch { }
+}
+process.on('uncaughtException', (e) => { console.error('worldd: UNCAUGHT ' + (e && e.stack || e)); process.exit(7); });
+process.on('unhandledRejection', (e) => console.error('worldd: unhandled rejection: ' + (e && e.stack || e)));
+process.on('exit', (code) => console.log(`worldd: exit code=${code} after ${Math.round((Date.now() - T0) / 1000)}s`));
