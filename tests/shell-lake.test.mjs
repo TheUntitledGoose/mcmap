@@ -322,10 +322,29 @@ test('shell mesh: the textured paint carries shade only, and only real water get
   // And a canopy is not a lake. isSeeThrough - a full block whose sprite is not opaque - is true of
   // leaves as well, because a cutout sprite has holes; reading that as a film laid water-tinted sheets
   // over every forest. Only an atlas kind 2 sprite, one you can see through, earns a film.
+  // Reading it the other way was also wrong: because leaves are not opaque, the bake refused to paint a
+  // column with them, so the far view drew every forest as a field of brown trunks. Shape decides the
+  // colour now: a full cube you cannot see through like water *is* the surface.
   const canopy = {
     height: new Uint16Array(256).fill(120 + HEIGHT_BIAS),
     cover: new Uint16Array(256).fill(ID.leaves),
   };
-  assert.deepEqual(first(mesh(box(canopy), { tex: true })), [255, 255, 255], 'a canopy earns no film');
-  assert.deepEqual(first(mesh(box(canopy), {})), first(plate), 'no film in the plate paint either');
+  const leafTex = mesh(box(canopy), { tex: true });
+  const leafPlate = mesh(box(canopy), {});
+  const leaf = first(leafTex);
+  assert.ok(leaf[1] > leaf[2] + 30 && leaf[1] > leaf[0] + 10,
+    'a canopy paints its own leaves, green rather than water-blue or the ground under it: ' + leaf);
+  const direct = first(mesh(box({ ...canopy, state: new Uint16Array(256).fill(ID.leaves) }), { tex: true }));
+  assert.deepEqual([...leaf], [...direct], 'the canopy colour is the leaves sprite, not a blend over its ground');
+  assert.deepEqual([...leafTex.stream.position], [...leafPlate.stream.position],
+    'a canopy changes the colour of the cell, never its geometry');
+  const leafP = first(leafPlate);
+  assert.ok(leafP[1] > leafP[0] && leafP[1] > leafP[2], 'the plate paint carries the canopy too: ' + leafP);
+  // ... and the trunk still wears bark. A canopy cell hangs walls down to the ground next to it, and
+  // painting those leaf-coloured is what made a far forest read as scattered cubes instead of trees.
+  const sides = shades(mesh(box(canopy), { tex: true, maxSkirt: 8 }).stream);
+  const green = [...sides].filter((c) => { const [r, g, b] = c.split(',').map(Number); return g > r + 12 && g > b + 12; });
+  const bark = [...sides].filter((c) => { const [r, g] = c.split(',').map(Number); return g <= r; });
+  assert.ok(green.length, 'the canopy roof is leaf-coloured: ' + [...sides].join(' '));
+  assert.ok(bark.length, 'the walls under it keep the ground block itself: ' + [...sides].join(' '));
 });

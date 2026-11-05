@@ -50,6 +50,18 @@ function isFilm(assets, id) {
 }
 
 /**
+ * Which state paints a cell. The bake picked one with an *opaque* cube test, and leaves measure as
+ * non-opaque (their sprite has holes), so every forest in the far view painted its trunks and threw
+ * its canopy away: a field of brown stumps where the truth is white magnolia tops. Shape, not
+ * transparency, is the right question here: if the cover is a full cube and the eye does not see
+ * through it the way it sees through water, the cover *is* the surface and deserves the colour.
+ */
+function paintFor(assets, coverId, groundId) {
+  if (coverId && coverId !== groundId && isFullBlock(assets, coverId) && !isFilm(assets, coverId)) return coverId;
+  return groundId;
+}
+
+/**
  * The height a coarse cell stands at. `height` is what the eye sees from far away (a lake skin, a
  * canopy); `ground` is the top of the solid block that paints the cell. Where the cell's cover is a
  * plane the eye sees *through*, keep the plane: it is the surface, and dropping the cell to the lake
@@ -352,7 +364,10 @@ function meshColumns(assets, shell, ctx, topAt) {
           if (g < gap) { gap = g; bestH = hk; bestI = k; }
         }
       }
-      const id = shell.state[bestI];
+      const gid = shell.state[bestI];
+      const cid0 = shell.cover ? shell.cover[bestI] : 0;
+      const id = paintFor(assets, cid0, gid);
+      const stem = id !== gid ? gid : 0;          // a canopy paints its top; the wall is its trunk
       if (!id || bestH < 0) continue;
       const state = assets.states[id - 1];
       if (!state) continue;
@@ -420,6 +435,17 @@ function meshColumns(assets, shell, ctx, topAt) {
         }
       }
       const wx = shell.cx * 16 + x0, wz = shell.cz * 16 + z0;
+      // A canopy paints its roof with leaves and its sides with whatever holds them up. Painting the
+      // stem leaf-coloured is what made the far forest read as a field of floating cubes: the wall is
+      // the trunk, and the trunk has its own sprite and its own colour.
+      let wallPer = per, wallCol = col;
+      if (stem && assets.states[stem - 1]) {
+        const gp = faceSprites(assets, stem, ctx.sprites);
+        if (gp && gp[1]) {
+          wallPer = gp;
+          wallCol = faceColors(assets, assets.states[stem - 1], gp, shade, ctx.colors, false, mul, lm.key);
+        }
+      }
       // The heightmap counts the top block, so the column is a cube sitting one below it.
       const yTop = bestH - HEIGHT_BIAS + 1;
       emitRect(ctx, 1, wx, wz, yTop - 1, yTop, cell, per[1], col[1]);
@@ -430,7 +456,7 @@ function meshColumns(assets, shell, ctx, topAt) {
         // loaded area reads as a cliff that is not there.
         const yLo = nt === null ? yTop - maxSkirt : Math.min(yTop, nt + 1);
         if (yLo >= yTop) continue;
-        emitRect(ctx, f, wx, wz, yLo, yTop, cell, per[f] ?? per[1], col[f]);
+        emitRect(ctx, f, wx, wz, yLo, yTop, cell, wallPer[f] ?? wallPer[1], wallCol[f]);
         stats.walls++;
       }
     }
@@ -519,7 +545,9 @@ export function meshOverview(assets, ov, opts = {}) {
       wof(i, j), ov.cell, ctx.groundFar) - HEIGHT_BIAS;
   for (let j = j0; j < j1; j++) {
     for (let i = 0; i < ov.w; i++) {
-      const st = ov.state[j * ov.w + i];
+      const st0 = ov.state[j * ov.w + i];
+      if (!st0) continue;
+      const st = paintFor(assets, ov.cover ? ov.cover[wof(i, j)] : 0, st0);
       if (!st) continue;
       const cx = ov.x0 + i * ov.cell, cz = ov.z0 + j * ov.cell;
       // Counted, not just skipped: "the coarse layer is still covering the fine one" and "the coarse

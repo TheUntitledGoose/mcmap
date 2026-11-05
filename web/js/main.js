@@ -1667,10 +1667,16 @@ let lodKill = 0;                                 // debug: unconditional discard
  * is open to the sky and must keep the walls painted around it, a lava cavern is not. Measured in the
  * cavern at (40, 20, 8): the far layers there are 1.66 M shell verts plus 0.92 M baked-tile verts of
  * geometry nobody can use, and 16 fps against 30 with them off.
+ *
+ * When the eye sits over ground nothing is held for, the answer is *not* underground. Holding the last
+ * answer was a bug with teeth: fly up out of a cave and far away, the chunk under the eye is no longer
+ * held, `top` is null, and the flag stayed true - the surface layer stayed invisible until a zoom
+ * gesture happened to put a chunk back under the lens. Hiding the surface layer is the destructive
+ * direction, so it needs evidence, and losing the evidence means putting it back.
  */
-let underFar = false;
+let underFar = false, underUnknownAt = 0;
 function updateUnderground() {
-  if (!S.underFar) { underFar = false; return; }
+  if (!S.underFar) { underFar = false; underUnknownAt = 0; return; }
   const p = camera.position;
   const [ecx, ecz] = eyeChunk();
   const lx = Math.floor(p.x) & 15, lz = Math.floor(p.z) & 15, wy = Math.floor(p.y);
@@ -1684,7 +1690,17 @@ function updateUnderground() {
     const sh = shellAt(ecx, ecz);
     if (sh) top = sh.height[(lz << 4) | lx] - HEIGHT_BIAS;
   }
-  if (top === null) return;                     // nothing to judge by yet: keep the last answer
+  if (top === null) {
+    // Nothing held under the eye: no evidence either way. Do not decide instantly - a chunk that is
+    // simply mid-flight would blink the whole surface layer in and out - but do not hold the old
+    // answer forever either, which is what left the surface invisible after coming up out of a cave.
+    if (!underFar) return;
+    const now = performance.now();
+    if (!underUnknownAt) underUnknownAt = now;
+    else if (now - underUnknownAt > 400) underFar = false;
+    return;
+  }
+  underUnknownAt = 0;
   underFar = p.y < top - S.underDepth && (sky < 0 ? true : sky <= S.underSky);
 }
 
