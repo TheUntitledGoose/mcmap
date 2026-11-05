@@ -96,7 +96,16 @@ const S = {
   // A face pointing at a chunk whose voxels are not held, but whose ground the heightmap skin paints,
   // is behind that skin. Drawing it is the wall of dirt a hole grows when a neighbour never arrived.
   // ?cullcovered=0 puts the walls back to compare.
-  cullCovered: params.has('nocullcovered') ? 0 : (num('cullcovered', 1) ? 1 : 0),
+  // Off by default: it culled nothing in a settled view (the payload ring leads the mesh ring) and
+  // its wall-removal is one of the things that opened seams where the far layers meet. ?cullcovered=1
+  // turns it back on for a comparison.
+  cullCovered: params.has('nocullcovered') ? 0 : (num('cullcovered', 0) ? 1 : 0),
+  // Underground, the far layers are not a far view - they are the *surface*. Their coarse plates and
+  // skirt walls then hang around and above the camera as floating scraps.
+  underFar: params.has('nounderfar') ? 0 : (num('underfar', 1) ? 1 : 0),
+  underDepth: Math.max(0, num('underdepth', 4)),
+  buriedSky: Math.max(0, Math.min(15, num('buriedsky', 2))),
+  underSky: Math.max(0, Math.min(15, num('undersky', 2))),
   water: num('water', 0.72),
   // The far layer has no corners to occlude, so it borrows the close-up pass's mean AO darkening
   // instead of pretending the two are equally lit. 0.931 is measured (tools/dbg-aomean.mjs).
@@ -486,6 +495,7 @@ const meshOpts = () => ({
   // misread as a threshold of 0 by a worker that spread the object.
   darkcut: S.caves ? -1 : S.darkcut,
   buried: S.caves ? 0 : S.buried,
+  buriedSky: S.buriedSky,
 });
 
 /**
@@ -553,7 +563,7 @@ const meshBytes = new Map();          // "cx,cz" -> { passes, stats, bytes, sig 
 let meshBytesTotal = 0, cachedInstalls = 0, meshBytesDropped = 0, lastBytesSweep = 0;
 
 const detailSig = () => `A${S.ao ? 1 : 0}/${S.aoMin}L${S.light ? 1 : 0}/${S.darkFloor}/${S.darkGamma}` +
-  `/${S.skyScale}D${S.caves ? -1 : S.darkcut}B${S.caves ? 0 : S.buried}C${S.shellOn && S.cullCovered ? 1 : 0}` +
+  `/${S.skyScale}D${S.caves ? -1 : S.darkcut}B${S.caves ? 0 : S.buried}S${S.buriedSky}C${S.shellOn && S.cullCovered ? 1 : 0}` +
   `G${dimGen}`;
 
 function dropBytes(key) {
@@ -1162,11 +1172,21 @@ function rebuildPatch(pk) {
   }
   const [px, pz] = pk.split(',').map(Number);
   const x0 = px * S.patch, z0 = pz * S.patch;
-  let any = false;
-  for (let dz = 0; dz < S.patch && !any; dz++) {
-    for (let dx = 0; dx < S.patch; dx++) if (shellAt(x0 + dx, z0 + dz)) { any = true; break; }
+  let held = 0;
+  for (let dz = 0; dz < S.patch; dz++) for (let dx = 0; dx < S.patch; dx++) if (shellAt(x0 + dx, z0 + dz)) held++;
+  if (!held) { patchTier.delete(pk); return; }
+  // A patch takes its ground away from the baked tiles only when it is whole: frames are still
+  // arriving mid-load and the save really does have holes, and half a live patch over a discarded
+  // tile is a hole in the view - which is what "the far LODs never load" looked like. With no baked
+  // layer standing behind it there is nothing to hand the ground back to, so cut it anyway.
+  if (held < S.patch * S.patch && lodPainting()) {
+    if (old) {
+      for (const m of [old.mesh, old.mesh2]) if (m) { shellGroup.remove(m); m.geometry.dispose(); }
+      shellMeshes.delete(pk); recountShellVerts();
+    }
+    patchTier.delete(pk);
+    return;
   }
-  if (!any) { patchTier.delete(pk); return; }
   const tier = patchTierFor(pk, patchTier.get(pk) ?? 0);
   // The baked tiles already paint this patch. The live skin stops where the tile grid takes over, so
   // the coarse ring is not meshed anywhere - that is the frame cost the bake was for.
@@ -1192,7 +1212,7 @@ function rebuildPatch(pk) {
   shellN++;
   shellMs += (ms - shellMs) / shellN;
   if (ms > shellMsMax) shellMsMax = ms;
-  if (!stream.count) return;
+  if (!stream.count) { patchTier.delete(pk); return; }
   // Two paints, two materials: a far cell is either a sprite quad or a plate of its sprite's mean
   // colour, and the sprite material has no partial alpha, so a lake stays a plate either way.
   const build = (s, mat) => {
@@ -1591,33 +1611,88 @@ let lodMat = null;
  * grid off, the baked tiles are the only thing painting the ground under the camera and clipping
  * them would open a hole. "Off" is an empty rectangle, not a branch, so the shader never varies.
  */
-const lodClip = { value: new THREE.Vector4(1e9, 1e9, -1e9, -1e9) };
-let lodClipOn = 0, lodClipRect = [1e9, 1e9, -1e9, -1e9];
+/* One texel per live far-grid patch: a baked tile fragment is discarded exactly where a live patch
+ * paints, and nowhere else. A clip *rectangle* looked equivalent and is not - it came from the skin
+ * radius, but patches are refused where their live cell would be too coarse, where shell frames have
+ * not arrived, or where the save has a hole, and each of those left a square of nothing because the
+ * tile that would have painted it was discarded anyway. Measured at zoom 4734 with all 327 tiles
+ * drawn and 0 gaps: 34 of 84 screen samples hit no geometry at all. */
+const COV_N = 128;                                // the patch grid wraps at 128 (the world is ~64)
+const covData = new Uint8Array(COV_N * COV_N);
+const covTex = new THREE.DataTexture(covData, COV_N, COV_N, THREE.RedFormat, THREE.UnsignedByte);
+covTex.magFilter = covTex.minFilter = THREE.NearestFilter;
+covTex.generateMipmaps = false;
+covTex.needsUpdate = true;
+const uLodCov = { value: covTex };
+const uCovAt = { value: new THREE.Vector2(0, 0) };   // patch coordinate sitting at the origin
+const uCovBlk = { value: 256 };                      // blocks per far-grid patch (S.patch * CH)
+let lodClipOn = 0, lodClipRect = [1e9, 1e9, -1e9, -1e9], lodCovPatches = 0;
+
+/**
+ * Is the eye inside the rock? The test is skylight, not depth: a ravine floor 40 blocks under the rim
+ * is open to the sky and must keep the walls painted around it, a lava cavern is not. Measured in the
+ * cavern at (40, 20, 8): the far layers there are 1.66 M shell verts plus 0.92 M baked-tile verts of
+ * geometry nobody can use, and 16 fps against 30 with them off.
+ */
+let underFar = false;
+function updateUnderground() {
+  if (!S.underFar) { underFar = false; return; }
+  const p = camera.position;
+  const [ecx, ecz] = eyeChunk();
+  const lx = Math.floor(p.x) & 15, lz = Math.floor(p.z) & 15, wy = Math.floor(p.y);
+  let top = null, sky = -1;
+  const c = store ? store.get(ecx, ecz) : null;
+  if (c) {
+    top = c.surfaceAt(Math.floor(p.x), Math.floor(p.z));
+    sky = store.skyLevelAt(ecx, ecz, lx, wy, lz);
+  }
+  if (top === null) {
+    const sh = shellAt(ecx, ecz);
+    if (sh) top = sh.height[(lz << 4) | lx] - HEIGHT_BIAS;
+  }
+  if (top === null) return;                     // nothing to judge by yet: keep the last answer
+  underFar = p.y < top - S.underDepth && (sky < 0 ? true : sky <= S.underSky);
+}
 
 function updateLodClip() {
-  const on = lodActive() && S.shellOn && S.lodClip !== 0 ? 1 : 0;
-  lodClipOn = on;
-  if (!on) { lodClip.value.set(1e9, 1e9, -1e9, -1e9); lodClipRect = [1e9, 1e9, -1e9, -1e9]; return; }
-  const [tcx, tcz] = centerChunk();
-  // One chunk of margin: the live grid's outermost patch is keyed by its own corner, and a clip that
-  // lands a block inside the square it paints shows as a seam in the middle of the far field.
-  const r = (skinR + 1) * CH;
-  const x0 = tcx * CH - r, z0 = tcz * CH - r, x1 = tcx * CH + CH + r, z1 = tcz * CH + CH + r;
-  lodClip.value.set(x0, z0, x1, z1);
-  lodClipRect = [x0, z0, x1, z1];
+  const on = lodActive() && S.shellOn && S.lodClip !== 0;
+  const PB = uCovBlk.value = S.patch * CH;
+  covData.fill(0);
+  lodCovPatches = 0;
+  if (on) {
+    const [tcx, tcz] = centerChunk();
+    const acx = Math.floor(tcx / S.patch), acz = Math.floor(tcz / S.patch);
+    uCovAt.value.set(acx, acz);
+    let x0 = 1e9, z0 = 1e9, x1 = -1e9, z1 = -1e9;
+    for (const pk of shellMeshes.keys()) {
+      const c = pk.indexOf(',');
+      const px = +pk.slice(0, c), pz = +pk.slice(c + 1);
+      const tx = ((px - acx) % COV_N + COV_N) % COV_N, tz = ((pz - acz) % COV_N + COV_N) % COV_N;
+      if (covData[tz * COV_N + tx]) continue;
+      covData[tz * COV_N + tx] = 1;
+      lodCovPatches++;
+      if (px < x0) x0 = px;
+      if (pz < z0) z0 = pz;
+      if (px + 1 > x1) x1 = px + 1;
+      if (pz + 1 > z1) z1 = pz + 1;
+    }
+    lodClipRect = lodCovPatches ? [x0 * PB, z0 * PB, x1 * PB, z1 * PB] : [1e9, 1e9, -1e9, -1e9];
+  } else lodClipRect = [1e9, 1e9, -1e9, -1e9];
+  lodClipOn = lodCovPatches ? 1 : 0;
+  covTex.needsUpdate = true;
 }
 
 const lodMatFor = () => {
   if (lodMat) return lodMat;
   const m = new THREE.MeshBasicMaterial({ vertexColors: true, fog: true, side: THREE.FrontSide });
   m.onBeforeCompile = (sh) => {
-    sh.uniforms.uDvClip = lodClip;
+    sh.uniforms.uLodCov = uLodCov; sh.uniforms.uCovAt = uCovAt; sh.uniforms.uCovBlk = uCovBlk;
     sh.vertexShader = 'varying vec3 dvWorld;\n' + sh.vertexShader.replace(
       '#include <begin_vertex>',
       '#include <begin_vertex>\n\tdvWorld = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;');
-    sh.fragmentShader = 'uniform vec4 uDvClip;\nvarying vec3 dvWorld;\n' + sh.fragmentShader.replace(
+    sh.fragmentShader = 'uniform sampler2D uLodCov;\nuniform vec2 uCovAt;\nuniform float uCovBlk;\nvarying vec3 dvWorld;\n' + sh.fragmentShader.replace(
       '#include <clipping_planes_fragment>',
-      '#include <clipping_planes_fragment>\n\tif ( dvWorld.x > uDvClip.x && dvWorld.x < uDvClip.z && dvWorld.z > uDvClip.y && dvWorld.z < uDvClip.w ) discard;');
+      '#include <clipping_planes_fragment>\n\tif ( texture2D( uLodCov, ( mod( floor( dvWorld.xz / uCovBlk ) - uCovAt, 128.0 ) + 0.5 ) / 128.0 ).r > 0.5 ) discard;');
   };
   // Without a distinct cache key three reuses the unpatched program for the same material shape.
   m.customProgramCacheKey = () => 'dvclip';
@@ -1923,18 +1998,21 @@ function frameBody(now) {
   // the entire vertex budget on itself, which is what made the frame 22 ms in the first place.
   // Whichever coarse whole-world layer is drawing is the only one allowed on screen, and the answer
   // can change without a settings event: a bake landing, a tile refusal, a dimension switch.
-  const ovOn = ovActive();
+  updateUnderground();
+  const ovOn = ovActive() && !underFar;
   if (ovGroup.visible !== ovOn) ovGroup.visible = ovOn;
-  drainLod(performance.now()); lap('lod');
+  if (shellMeshes.size || shellGroup.visible !== (S.shellOn && !underFar)) shellGroup.visible = S.shellOn && !underFar;
+  if (lodGroup.visible !== (lodPainting() && !underFar)) lodGroup.visible = lodPainting() && !underFar;
+  if (!underFar) drainLod(performance.now()); lap('lod');
   // Coarsest layer first: the overview is one request and a second of meshing, and it is what makes
   // the world legible at all while the chunk skin and the voxel detail are still arriving. Up close
   // the order is reversed - there the voxel detail is the whole picture, and making it wait behind a
   // 12 000 cell grid would only delay the thing the user is looking at.
   if (skinR > S.radius * 2) {
     drainOverview(now); lap('ov');
-    if (shellStore) drainShellPatches(now); lap('shell');
+    if (shellStore && !underFar) { drainShellPatches(now); updateLodClip(); } lap('shell');
   } else {
-    if (shellStore) drainShellPatches(now); lap('shell');
+    if (shellStore && !underFar) { drainShellPatches(now); updateLodClip(); } lap('shell');
     drainOverview(now); lap('ov');
   }
 
@@ -2309,6 +2387,7 @@ window.__world = {
       // that was invisible before: `verts - shellVerts - ovVerts` used to be the only way to get it.
       detailRadius: detailR, detailCeiling: S.radius, payloadRadius: payloadR, detailPx: S.detailPx,
       detailMeshes: meshes.size, detailVerts, demoted, dirtyPatches: dirtyPatches.size, bytesHeld: store ? store.bytesHeld : 0,
+      underFar: underFar ? 1 : 0,
       cullDark: aggTotal.darkCulled, cullBuried: aggTotal.buried, cullCoveredFaces: aggTotal.covered,
       detailLod: S.detailLod, detailReachBlocks: Math.round(detailReach(pxPerRad(), S.detailPx)),
       lightOn: S.light ? 1 : 0, darkFloor: S.darkFloor, darkGamma: S.darkGamma, skyScale: S.skyScale, ao: S.ao ? 1 : 0,
@@ -2460,7 +2539,7 @@ window.__world = {
   // The baked far layer: which tile covers a block, how many are held/drawn, and what was refused.
   lodDiag: () => ({
     on: lodActive() ? 1 : 0, avail: lodAvail ? 1 : 0, cap: S.lodCap,
-    clipOn: lodClipOn, clip: lodClipRect.map((v) => (v > 1e8 ? 'off' : v)),
+    clipOn: lodClipOn, clip: lodClipRect.map((v) => (v > 1e8 ? 'off' : v)), cov: lodCovPatches,
     held: lodStore ? lodStore.tiles.size : 0, drawn: lodTiles, verts: lodVerts,
     wanted: lodStore ? lodStore.wanted.size : 0, gaps: lodStore ? lodStore.gaps() : 0,
     indexed: lodStore && lodStore.index ? lodStore.index.size : -1,
@@ -2867,6 +2946,23 @@ function buildPanel() {
       { key: 'cullcovered', label: 'drop walls the far view already paints', kind: 'check', live: false,
         hint: 'The edge of the loaded area is a full-depth wall of dirt down to the void. When the \nfar layer paints that ground the wall is hidden behind it, so it is not meshed at all - \nfewer trixels and no black band while chunks stream in. Where the save has no chunk there \n(a world frontier) the wall stays: it is the only thing painting that ground. Off restores \nevery wall. URL: ?nocullcovered',
         get: () => S.cullCovered, set: (v) => { S.cullCovered = v ? 1 : 0; applySettings('light'); } },
+
+      { key: 'underfar', label: 'hide the surface layer underground', kind: 'check', live: true,
+        hint: 'Down in a cavern the far layers are not a far view, they are the *surface*: their coarse \nplates and skirt walls hang around you as floating scraps, and cost verts and frames for nothing. \nWhen the block you stand in gets no skylight those layers stand down, until you are back under open \nskylight. A ravine keeps its walls - its floor sees the sky. URL: ?nounderfar',
+        get: () => S.underFar,
+        set: (v) => { S.underFar = v ? 1 : 0; } },
+
+      { key: 'underdepth', label: 'blocks underground before the far view returns', min: 0, max: 24, step: 1,
+        fmt: (v) => (v | 0),
+        hint: 'How far below the surface skin the eye has to be before the far layers stand down. Small \nkeeps the ground painted around a shallow hole; large means the plates vanish the moment you \ndip under a canopy. URL: ?underdepth',
+        get: () => S.underDepth,
+        set: (v) => { S.underDepth = Math.max(0, v | 0); } },
+
+      { key: 'buriedsky', label: 'skylight that still counts as open sky', min: 0, max: 15, step: 1,
+        fmt: (v) => (v | 0),
+        hint: 'A face under the surface skin is dropped only if the air in front of it gets no more \nthan this much skylight. Modded and Starlight light fields are not tidy: a sealed cavern reads \nskylight 1-2 in places, and demanding total darkness leaves floating scraps on cave walls. \nAt 15 nothing is ever dropped for being underground. URL: ?buriedsky',
+        get: () => S.buriedSky,
+        set: (v) => { S.buriedSky = Math.max(0, Math.min(15, v | 0)); applySettings('light'); } },
 
       { key: 'lodclip', label: 'hide baked tiles under the close view', kind: 'check', live: true,
         hint: 'A baked tile is one mesh over 512x512 blocks, so it cannot be unloaded near the camera -\nit is clipped there instead, or its 16 block columns stand over the close terrain as flat slabs\nwith straight cliff walls. Off draws them everywhere. URL: ?nolodclip',
