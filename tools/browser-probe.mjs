@@ -13,11 +13,28 @@ import WebSocket from 'ws';
 const argv = process.argv.slice(2);
 const arg = (name, dflt) => { const i = argv.indexOf(`--${name}`); return i >= 0 ? argv[i + 1] : dflt; };
 const flag = (name) => argv.includes(`--${name}`);
-const URL0 = arg('url', 'http://127.0.0.1:8765/');
+
+// Which switches consume the next token. Anything else that is not a --flag is a positional, and the
+// positional that looks like a URL is the page to open. Without this, `node tools/browser-probe.mjs
+// "http://...&lodclip=0"` silently loaded the *default* URL instead: every A/B in that run measured
+// the same page twice and reported a 1% difference as if it were a finding.
+const VALUED = ['url', 'out', 'wait', 'port', 'width', 'height', 'edge', 'profile', 'goto', 'orbit',
+  'eval', 'shot', 'click', 'keys'];
+const pos = [];
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i].startsWith('--')) { if (VALUED.includes(argv[i].slice(2))) i++; continue; }
+  pos.push(argv[i]);
+}
+const URL0 = arg('url', pos.find((p) => /^https?:\/\//.test(p)) ?? 'http://127.0.0.1:8765/');
+const stray = pos.filter((p) => !/^https?:\/\//.test(p));
+if (stray.length) console.log(`probe: ignoring positional argument(s) ${JSON.stringify(stray)}`);
+if (!pos.includes(URL0) && !argv.includes('--url')) console.log('probe: no URL given, using ' + URL0);
 const OUT = path.resolve(arg('out', 'build/probe.png'));
 const WAIT = +arg('wait', 7000);
 const PORT = +arg('port', 9223);
-const W = +arg('width', 1280), H = +arg('height', 800);
+const SHOT = arg('shot', null);            // --shot 480x270: a small frame is quicker to read and diff
+const W = +arg('width', SHOT ? +SHOT.split('x')[0] : 1280);
+const H = +arg('height', SHOT ? +SHOT.split('x')[1] : 800);
 const EDGE = arg('edge', 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe');
 const PROFILE = arg('profile') || fs.mkdtempSync(path.join(os.tmpdir(), 'pi-edge-'));
 

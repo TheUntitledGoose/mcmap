@@ -117,6 +117,25 @@ export function closestApproach(dChunks, eChunks) {
 }
 
 /**
+ * The distance a far-grid tier is keyed to, in chunks.
+ *
+ * `approach` is the old rule: how close the eye can get to that ground while orbiting
+ * (`closestApproach`). It is honest about what the eye could resolve, but it is a function of the
+ * zoom, so pulling back pushes the ground *under the crosshair* into the coarse tier too: at a 4 km
+ * pull-back every chunk in the skin, including the one in the middle of the frame, went to 16-block
+ * plates, and the gesture itself unloaded and reloaded the whole skin.
+ *
+ * `center` keys the tier on the distance from the orbit target instead, so the sharp ground sits in
+ * the middle of the view at any zoom and falls off toward the rim. That is what people look for when
+ * they pull back (a building, a village), and it costs the same total vertices, because the cost
+ * controller still decides how far the fine region reaches. Floor of 1 chunk: a patch sitting exactly
+ * on the target is not "zero blocks away", and a zero distance would ask for an infinitely fine grid.
+ */
+export function tierDistance(dChunks, eChunks, anchor = 'center') {
+  return anchor === 'approach' ? closestApproach(dChunks, eChunks) : Math.max(1, dChunks);
+}
+
+/**
  * Biggest far-grid cell, in blocks, that still projects to under `px` pixels at `dBlocks`.
  *
  * A cell `c` blocks wide at `d` blocks away covers `c * pxPerRad / d` pixels. The far grid
