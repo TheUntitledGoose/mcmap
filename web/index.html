@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DarkRPG world viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0e12; overflow: hidden;
+    font: 12px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  #gl { display: block; width: 100%; height: 100%; touch-action: none; }
+  #hud { position: fixed; left: 10px; top: 10px; padding: 9px 11px; border-radius: 8px;
+    background: rgba(8, 11, 15, .72); border: 1px solid rgba(255, 255, 255, .12);
+    color: #dfe7ef; backdrop-filter: blur(3px); pointer-events: none; }
+  body.hidehud #hud { opacity: 0; }
+  #hud b { color: #9fc7ff; font-weight: 600; }
+  #hud .row { display: flex; gap: 8px; }
+  #hud .k { color: #8b96a3; min-width: 62px; }
+  #hud .msg { margin-top: 6px; color: #7fe0a8; }
+  #hud .msg.err { color: #ff8f8f; }
+  #help { position: fixed; right: 10px; top: 10px; padding: 8px 10px; border-radius: 8px;
+    background: rgba(8, 11, 15, .72); border: 1px solid rgba(255, 255, 255, .12); color: #a8b3c0;
+    pointer-events: none; }
+  #help b { color: #dfe7ef; }
+  select { color-scheme: dark; background: #131922; color: #dfe7ef; border: 1px solid #2c3642;
+    border-radius: 4px; padding: 1px 4px; font: inherit; }
+  /* The HUD is pointer-events:none so drags fall through to the canvas - but its dimension picker
+     has to be clickable, or the world can only be changed by editing the URL. */
+  #hud select { pointer-events: auto; }
+
+  /* The settings panel (web/js/ui.js). It is plain DOM, so its look lives here. */
+  .panel { position: fixed; right: 10px; bottom: 10px; width: 296px; border-radius: 8px;
+    background: rgba(8, 11, 15, .8); border: 1px solid rgba(255, 255, 255, .12); color: #cfd8e3;
+    backdrop-filter: blur(3px); user-select: none; z-index: 3; }
+  .panel-head { display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 8px; border-bottom: 1px solid rgba(255, 255, 255, .08); }
+  .panel-title { color: #9fc7ff; }
+  .panel.collapsed { width: auto; }
+  .panel.collapsed .panel-body { display: none; }
+  .panel.collapsed .panel-head { border-bottom: 0; }
+  .panel-body { padding: 4px 8px 8px; max-height: 66vh; overflow-y: auto; }
+  .panel-row { display: grid; grid-template-columns: 112px 1fr 54px; align-items: center; gap: 6px;
+    padding: 2px 0; color: #a8b3c0; }
+  .panel-label { cursor: help; }
+  .panel-body { line-height: 1.3; }
+  .panel-row input[type=range] { width: 100%; height: 14px; accent-color: #6ea8ff; margin: 0; }
+  .panel-row input[type=checkbox] { justify-self: start; accent-color: #6ea8ff; }
+  .panel-val { color: #7fe0a8; text-align: right; font-weight: 600; }
+  .panel-row select { width: 100%; max-width: 150px; justify-self: end; }
+  /* The world picker names a whole dimension; give it the whole control row. */
+  .panel-row.panel-select { grid-template-columns: 112px 1fr; }
+  .panel-row.panel-select select { max-width: none; }
+  .panel-section { margin: 7px 0 2px; border-top: 1px solid rgba(255, 255, 255, .08); padding-top: 5px; }
+  .panel-section > summary { color: #8b96a3; cursor: pointer; list-style: none; }
+  .panel-section > summary::before { content: '+ '; color: #6ea8ff; }
+  .panel-section[open] > summary::before { content: '- '; }
+  .panel-section > summary:hover { color: #cfd8e3; }
+  .panel-actions { display: flex; gap: 6px; margin-top: 7px; }
+  .panel-btn { background: #131922; color: #dfe7ef; border: 1px solid #2c3642; border-radius: 4px;
+    padding: 2px 7px; font: inherit; cursor: pointer; }
+  .panel-btn:hover { background: #1b2431; border-color: #3d4a5c; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="hud">
+  <div class="row"><span class="k">fps</span><b id="fps">-</b><span class="k">verts</span><b id="verts">-</b></div>
+  <div class="row"><span class="k">tris</span><b id="tris">-</b><span class="k">chunks</span><b id="chunks">-</b></div>
+  <div class="row"><span class="k">cpu</span><b id="cpu">-</b></div>
+  <div class="row"><span class="k">net</span><b id="queue">-</b></div>
+  <div class="row"><span class="k">mesh</span><b id="mesh">-</b></div>
+  <div class="row"><span class="k">far</span><b id="shell">-</b></div>
+  <div class="row"><span class="k">cam</span><b id="campos">-</b></div>
+  <div class="row"><span class="k">dim</span><select id="dim"></select></div>
+  <div class="msg" id="msg">starting…</div>
+</div>
+
+<div id="help">
+  <b>drag</b> orbit &nbsp; <b>right-drag</b> pan &nbsp; <b>wheel</b> zoom<br>
+  <b>WASD</b> move &nbsp; <b>Q/E</b> down/up &nbsp; <b>shift</b> fast<br>
+  <b>R</b> spawn &nbsp; <b>F</b> fit world &nbsp; <b>P</b> settings &nbsp; <b>[ ]</b> step y &nbsp; <b>X</b> wireframe &nbsp; <b>H</b> hud<br>
+  settings panel (bottom right): <b>world</b>, <b>zoom</b>, <b>far view</b>, <b>close detail</b>, <b>fog</b>, <b>shadow depth</b>, <b>water clarity</b><br>
+  url overrides for probing: <b>?dim=</b> <b>?radius=</b> <b>?maxradius=</b> <b>?fog=</b> <b>?dist=</b> <b>?ao=</b> <b>?workers=0</b> <b>?view=flat</b>
+</div>
+
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>

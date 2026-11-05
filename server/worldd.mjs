@@ -1,0 +1,237 @@
+// worldd — the Node side of the renderer: serves packed assets and decoded chunk payloads.
+//   node server/worldd.mjs [--world DarkRPG/world] [--assets build/assets] [--port 8765]
+//                          [--host 0.0.0.0]        (--host 127.0.0.1 to keep it local only)
+// Routes:
+//   GET /meta                       world extent, dimensions, spawn, asset summary
+//   GET /voxel?dim&cx&cz            one chunk payload (binary, gzip when accepted)
+//   GET /voxels?dim&cx0&cz0&w&h     a rectangle of payloads in one container frame
+//   GET /shell?dim&cx&cz            one heightmap shell frame (~1 KB)
+//   GET /shells?dim&cx0&cz0&w&h     a rectangle of shell frames
+//   GET /overview?dim=...           the whole dimension as one decimated heightmap frame
+//   GET /assets/<file>              atlas.json / atlas.png / geometry.bin
+//   GET /*                          the web app
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { readNbt } from '../tools/nbt.mjs';
+import { WorldService, compress } from './world-service.mjs';
+import { atlasStamp } from './shell-pack.mjs';
+import { pruneCache } from './cache-prune.mjs';
+import { buildStateIds } from './chunk-payload.mjs';
+import { classifyStates } from '../shared/cube-path.mjs';
+
+const argv = process.argv.slice(2);
+const arg = (name, dflt) => {
+  const i = argv.indexOf(`--${name}`);
+  return i >= 0 ? argv[i + 1] : dflt;
+};
+const num = (name, dflt) => {
+  const v = arg(name, null);
+  if (v === null || v === '') return dflt;
+  const n = +v;
+  return Number.isFinite(n) ? n : dflt;
+};
+const WORLD = arg('world', 'DarkRPG/world');
+const ASSETS = arg('assets', 'build/assets');
+const CACHE = arg('cache', 'build/cache');
+const WEB = arg('web', 'web');
+const VENDOR_DIR = arg('vendor', path.join('node_modules', 'three', 'build'));
+const PORT = +arg('port', 8765);
+// All interfaces by default: the point of the renderer is that it runs in any browser, including one
+// on another machine. `--host 127.0.0.1` puts it back behind loopback. Note what that means — there is
+// no auth here, so on 0.0.0.0 anyone who can reach this port can read the entire world save.
+const HOST = arg('host', '0.0.0.0');
+
+// The addresses worth typing on another machine, for the banner.
+const lanAddrs = () => Object.values(os.networkInterfaces()).flat()
+  .filter((i) => i && i.family === 'IPv4' && !i.internal && !i.address.startsWith('169.254.'))
+  .map((i) => i.address);
+
+const atlasPath = path.join(ASSETS, 'atlas.json');
+if (!fs.existsSync(atlasPath)) {
+  console.error(`no ${atlasPath} — run 'node server/pack-assets.mjs' first`);
+  process.exit(1);
+}
+const atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
+const stateIds = buildStateIds(atlas.states.map(s => s.k));
+// The shell builder needs to know which states are full cubes, so a column topped by a flower or
+// a sign reports the block under it. Same classification the browser mesher uses.
+const stateCls = classifyStates(atlas.states, atlas.textures);
+// Shell packs (server/bake-shells.mjs) turn the far view into a file read. Missing, or baked against
+// a different atlas, and the service derives shells from chunk payloads the slow way.
+const PACKS = arg('packs', 'build/shells');
+// Baked coarse LOD tiles (server/bake-lod.mjs): the far world as pre-made vertex streams. Missing,
+// and the browser keeps meshing its far layers live, which is the behaviour before this existed.
+const LODS = arg('lods', 'build/lods');
+// Counted once at startup: the browser's /meta answer for "is there a baked far layer?".
+const lodSummary = (() => {
+  if (LODS === 'none') return { dims: 0, tiles: 0 };
+  let dims = 0, tiles = 0;
+  try {
+    for (const n of fs.readdirSync(LODS)) {
+      const d = path.join(LODS, n);
+      if (!fs.statSync(d).isDirectory()) continue;
+      const t = fs.readdirSync(d).filter((f) => f.endsWith('.bin')).length;
+      if (t) { dims++; tiles += t; }
+    }
+  } catch { /* nothing baked */ }
+  return { dims, tiles };
+})();
+const stamp = atlasStamp(fs.statSync(path.join(ASSETS, 'atlas.json')), atlas.states.length);
+const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
+  isCubeState: (id) => stateCls.cube[id - 1] === 1,
+  // A far column needs two different answers: which block may *paint* it, and which one can hold a
+  // surface up. They are not the same - water holds a lake skin up but must not paint it blue, and a
+  // rose does not hold anything up at all. Both come from the packed atlas, not from block names.
+  isPaintState: (id) => stateCls.cube[id - 1] === 1 && stateCls.opaque[id - 1] === 1,
+  isSolidState: (id) => stateCls.cube[id - 1] === 1,
+  packDir: PACKS,
+  lodDir: LODS === 'none' ? null : LODS,
+  stamp,
+  // The payload cache is saved CPU, not data: the whole world re-decodes in ~25 min. Left alone it
+  // grew to 36 GB of unreachable generations, so it gets a byte budget and a startup sweep.
+  cacheMaxGb: num('cache-max-gb', 8),
+});
+
+// `--cache-sweep 0` keeps old generations on purpose (comparing two atlas stamps side by side).
+if (CACHE !== 'none' && num('cache-sweep', 1) !== 0) {
+  const r = pruneCache(CACHE, {
+    keepTags: [String(svc.tableTag)], keepHours: num('cache-keep-h', 24),
+    log: (m) => console.log('  cache: ' + m),
+  });
+  if (r.files) console.log('  cache: swept ' + r.files + ' unreachable files, ' + (r.bytes / 1e9).toFixed(2) + ' GB');
+}
+
+function levelSummary() {
+  try {
+    const dat = zlib.gunzipSync(fs.readFileSync(path.join(WORLD, 'level.dat')));
+    const d = readNbt(dat).value.Data;
+    return {
+      name: String(d.LevelName ?? ''), version: String(d.Version?.Id ?? d.version?.Id ?? ''),
+      dataVersion: Number(d.DataVersion ?? 0),
+      spawn: [Number(d.SpawnX ?? 0), Number(d.SpawnY ?? 0), Number(d.SpawnZ ?? 0)],
+      gameType: Number(d.GameType ?? -1), hardcore: Number(d.hardcore ?? 0), difficulty: String(d.difficulty ?? ''),
+    };
+  } catch (e) { return { error: String(e.message ?? e) }; }
+}
+
+const CT_MAGIC = 'DVDXB1  ';
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8', '.png': 'image/png', '.bin': 'application/octet-stream',
+  '.wasm': 'application/wasm', '.css': 'text/css; charset=utf-8', '.map': 'application/json',
+};
+
+function send(req, res, code, body, type, extra = {}) {
+  const headers = { 'Cache-Control': 'no-cache', ...extra };
+  if (body && !Buffer.isBuffer(body)) body = Buffer.from(body);
+  if (body && /\bgzip\b/.test(req.headers['accept-encoding'] ?? '') && type !== 'image/png') {
+    body = compress(body);
+    headers['Content-Encoding'] = 'gzip';
+  }
+  headers['Content-Length'] = body ? body.length : 0;
+  headers['Content-Type'] = type ?? 'application/octet-stream';
+  res.writeHead(code, headers);
+  res.end(body);
+}
+
+function serveFile(res, req, file) {
+  const p = path.resolve(file);
+  if (!p.startsWith(path.resolve(process.cwd()))) return send(req, res, 404, 'outside repo', 'text/plain');
+  if (!fs.existsSync(p) || fs.statSync(p).isDirectory()) return send(req, res, 404, 'not found', 'text/plain');
+  const body = fs.readFileSync(p);
+  const type = MIME[path.extname(p).toLowerCase()] ?? 'application/octet-stream';
+  // assets are content-addressed by the pack run; chunks are immutable per session
+  const cache = (p.startsWith(path.resolve(ASSETS)) || p.startsWith(path.resolve(VENDOR_DIR)))
+    ? 'public, max-age=86400' : 'no-cache';
+  send(req, res, 200, body, type, { 'Cache-Control': cache });
+}
+
+const server = http.createServer(async (req, res) => {
+  const u = new URL(req.url, 'http://x');
+  const q = u.searchParams;
+  try {
+    // Where the time actually goes: a decode is 25 ms of work hidden behind a 0.1 ms file read, and
+    // a regionOpen means the payload cache did not absorb the request.
+    if (u.pathname === '/stats') {
+      send(req, res, 200, JSON.stringify({ ...svc.stats, packsOpen: svc.packs.size }),
+        'application/json');
+      return;
+    }
+    if (u.pathname === '/meta') {
+      return send(req, res, 200, JSON.stringify({
+        world: WORLD, level: levelSummary(), dims: svc.dimList(),
+        assets: { states: atlas.states.length, textures: atlas.textures.length, atlasSize: atlas.atlasSize, geometry: atlas.geometry },
+        stats: svc.stats,
+        packed: { shells: fs.existsSync(PACKS), lod: lodSummary },
+      }), 'application/json; charset=utf-8');
+    }
+    if (u.pathname === '/voxel') {
+      const b = svc.chunkBytes(q.get('dim') ?? 'minecraft:overworld', +q.get('cx'), +q.get('cz'),
+        { fresh: q.get('fresh') === '1' });
+      if (!b) return send(req, res, 404, Buffer.alloc(0), 'application/octet-stream');
+      return send(req, res, 200, b, 'application/octet-stream');
+    }
+    if (u.pathname === '/voxels') {
+      // Awaited: a ring of payloads can be a few hundred chunk decodes, and the loop must stay free
+      // for the requests that came in behind it.
+      const b = await svc.batchBytesAsync(q.get('dim') ?? 'minecraft:overworld', +q.get('cx0'),
+        +q.get('cz0'), Math.min(64, +q.get('w') ?? 1), Math.min(64, +q.get('h') ?? 1));
+      return send(req, res, 200, b, 'application/octet-stream');
+    }
+    if (u.pathname === '/shell') {
+      const b = svc.shellBytes(q.get('dim') ?? 'minecraft:overworld', +q.get('cx'), +q.get('cz'));
+      if (!b) return send(req, res, 404, Buffer.alloc(0), 'application/octet-stream');
+      return send(req, res, 200, b, 'application/octet-stream');
+    }
+    if (u.pathname === '/shells') {
+      // A 16x16 tile of shells is ~256 KB, which is why the far view can cover a wide radius.
+      const b = await svc.shellBatchBytesAsync(q.get('dim') ?? 'minecraft:overworld', +q.get('cx0'), +q.get('cz0'),
+        Math.min(64, +q.get('w') ?? 1), Math.min(64, +q.get('h') ?? 1));
+      return send(req, res, 200, b, 'application/octet-stream');
+    }
+    if (u.pathname === '/lodindex') {
+      return send(req, res, 200, JSON.stringify({ tiles: svc.lodIndex(q.get('dim') ?? 'minecraft:overworld') }),
+        'application/json; charset=utf-8');
+    }
+    if (u.pathname === '/lod') {
+      // One baked region tile (32x32 chunks at 16 blocks per column), already inflated.
+      const b = svc.lodBytes(q.get('dim') ?? 'minecraft:overworld', +q.get('rx'), +q.get('rz'));
+      return b ? send(req, res, 200, b, 'application/octet-stream')
+        : send(req, res, 404, 'no lod tile (run node server/bake-lod.mjs)', 'text/plain');
+    }
+    if (u.pathname === '/overview') {
+      const b = svc.overviewBytes(q.get('dim') ?? 'minecraft:overworld');
+      return b ? send(req, res, 200, b, 'application/octet-stream')
+        : send(req, res, 404, 'no overview (run node server/bake-shells.mjs)', 'text/plain');
+    }
+    if (u.pathname.startsWith('/assets/')) return serveFile(res, req, path.join(ASSETS, u.pathname.slice(8)));
+    if (u.pathname.startsWith('/shared/')) return serveFile(res, req, path.join('shared', u.pathname.slice(8)));
+    // three is served straight out of node_modules; the build/ dir is self-contained (its
+    // three.module.js imports ./three.core.js by relative path).
+    if (u.pathname.startsWith('/vendor/')) return serveFile(res, req, path.join(VENDOR_DIR, u.pathname.slice(8)));
+    const rel = u.pathname === '/' ? 'index.html' : u.pathname.slice(1);
+    return serveFile(res, req, path.join(WEB, rel));
+  } catch (e) {
+    return send(req, res, 500, `error: ${e.message}`, 'text/plain');
+  }
+});
+server.listen(PORT, HOST, () => {
+  console.log(`worldd http://${HOST === '0.0.0.0' ? '127.0.0.1' : HOST}:${PORT}`);
+  if (HOST === '0.0.0.0') {
+    const ips = lanAddrs();
+    console.log(`  listening on all interfaces${ips.length ? ` — from another machine: ${ips.map((a) => `http://${a}:${PORT}/`).join('  ')}` : ''}`);
+    console.log('  (no auth: anyone who can reach this port can read the world save)');
+  }
+  console.log(`shell packs: ${fs.existsSync(PACKS) ? PACKS : 'none baked - run node server/bake-shells.mjs'}`);
+  console.log(`lod tiles: ${lodSummary.tiles ? `${LODS} (${lodSummary.tiles} tiles, ${lodSummary.dims} dimensions)` : 'none baked - run node server/bake-lod.mjs'}`);
+  console.log(`  world  ${WORLD}  (${svc.dims.size} dimensions)`);
+  for (const d of svc.dimList()) {
+    console.log(`  ${d.id.padEnd(24)} regions=${String(d.regions).padStart(4)} chunks<=${d.chunksUpperBound}` +
+      ` x=${d.chunkExtent?.minX}..${d.chunkExtent?.maxX} z=${d.chunkExtent?.minZ}..${d.chunkExtent?.maxZ}`);
+  }
+  console.log(`  states ${atlas.states.length}  textures ${atlas.textures.length}`);
+});

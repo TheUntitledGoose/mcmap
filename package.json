@@ -1,0 +1,30 @@
+{
+  "name": "darkrpg-renderer",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Browser-based three.js renderer for the DarkRPG Minecraft 1.20.1 world (Node does decode/asset bake; WebGL2 does the rendering). See PLAN.md.",
+  "scripts": {
+    "start": "node server/worldd.mjs",
+    "serve": "node server/worldd.mjs --port 8765",
+    "serve:local": "node server/worldd.mjs --port 8765 --host 127.0.0.1",
+    "open": "start http://127.0.0.1:8765/?debug=1",
+    "census": "node server/world-census.mjs DarkRPG/world build/census.json",
+    "pack:assets": "node server/pack-assets.mjs build/census.json build/assets",
+    "bake:shells": "node server/bake-shells.mjs",
+    "bake:lod": "node server/bake-lod.mjs --force",
+    "cache:prune": "node tools/cache-prune.mjs",
+    "bake": "npm run census && npm run pack:assets && npm run bake:shells && npm run bake:lod",
+    "probe": "node tools/probe.mjs DarkRPG/world",
+    "inspect-chunk": "node tools/inspect-chunk.mjs",
+    "nbt-trace": "node tools/nbt-trace.mjs",
+    "test": "node --test tests/",
+    "test:fast": "node --test tests/view-policy.test.mjs tests/web-shell.test.mjs tests/web-store.test.mjs tests/web-mesh.test.mjs tests/shell-pack.test.mjs",
+    "browser:probe": "node tools/browser-probe.mjs --gpu --url http://127.0.0.1:8765/?debug=1 --out build/probe.png",
+    "cache:prune:dry": "node tools/cache-prune.mjs --dry"
+  },
+  "dependencies": {
+    "three": "^0.187.0",
+    "ws": "^8.22.1"
+  }
+}

@@ -1,0 +1,139 @@
+// Heightmap shell frames (M5). A shell is the cheapest thing that still looks like terrain: four
+// u16 per column instead of ~100 KB of voxel payload. The far view is built from these; the near view
+// keeps full voxel data so filtering/X-ray stay possible.
+//
+// One column stores four numbers because the far view has to answer two different questions and a
+// single height cannot answer both:
+//   surface / cover  what the eye meets from far away - treetops, plants, the skin of a lake
+//   ground  / state  what to *paint* it with - a solid, opaque block, i.e. the ground under a flower,
+//                    the bed under 22 blocks of water, the soil under a canopy
+import { openChunk } from './chunk-payload.mjs';
+import {
+  SHELL_MAGIC, SHELL_VERSION, SHELL_HEADER, SHELL_COLS, SHELL_COLS_BYTES, SHELL_LIGHT_BYTES,
+  HEIGHT_BIAS,
+} from '../shared/chunk-format.mjs';
+import { packLight } from '../shared/light.mjs';
+
+export const SHELL_FRAME = SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES;
+// Struct of arrays, so the two height planes and the two state planes each compress as a run.
+export const SHELL_H = 0, SHELL_C = 1, SHELL_G = 2, SHELL_S = 3;
+const ARR = SHELL_COLS * 2;
+const LIGHT_OFF = SHELL_HEADER + 4 * ARR;
+
+/**
+ * Collapse a decoded chunk payload into a shell frame.
+ *
+ * The surface height comes straight from WORLD_SURFACE, which counts leaves and plants: that is the
+ * silhouette the eye actually sees from far away, and MOTION_BLOCKING would hide modded tree canopies
+ * (Regions Unexplored writes leaves that do not block motion).
+ *
+ * The paint state is the first block at or under the surface that is solid *and* opaque. "Solid"
+ * alone is not enough: water is a full cube, and painting a lake with the water sprite is what made
+ * the far view read as one flat sheet of paint with a hard square seam where the full-detail water
+ * (see-through, right down to the bed) took over. Non-solid blocks - flowers, grass, signs, panes -
+ * are skipped the same way, over a short drop, so a meadow paints grass rather than a cross sprite.
+ *
+ * @param {Buffer} bytes a packed chunk payload
+ * @param {{maxDrop?: number, maxWaterDrop?: number, isPaint?: (id:number)=>boolean,
+ *          isSolid?: (id:number)=>boolean, isCube?: (id:number)=>boolean}} [opts]
+ *        `isPaint` = solid and opaque (what a column may be painted with); `isSolid` = solid, possibly
+ *        see-through (water). `isCube` is accepted as an old alias for `isPaint`.
+ */
+export function shellFromPayload(bytes, opts = {}) {
+  const hasSky = opts.hasSky !== false;
+  const c = openChunk(bytes);
+  if (!c.height) return null;
+  const maxDrop = opts.maxDrop ?? 5;          // a flower sits one or two blocks above its ground
+  const maxWaterDrop = opts.maxWaterDrop ?? 40;  // an ocean bed can be that far below its surface
+  const isPaint = opts.isPaint ?? opts.isCube ?? null;
+  const isSolid = opts.isSolid ?? null;
+
+  const h = new Uint16Array(SHELL_COLS);      // surface height (biased)
+  const cover = new Uint16Array(SHELL_COLS);  // state at that height
+  const g = new Uint16Array(SHELL_COLS);      // top of the paint block (biased)
+  const s = new Uint16Array(SHELL_COLS);      // paint state
+  const li = new Uint8Array(SHELL_COLS);      // sky|blk light on the column's surface
+  h.set(c.height);
+  for (let i = 0; i < SHELL_COLS; i++) {
+    const x = i & 15, z = i >> 4;
+    const top = c.height[i] - HEIGHT_BIAS;
+    const at = c.stateAt(x, top, z);
+    cover[i] = at;
+    let paint = 0, py = top;
+    if (isPaint) {
+      if (at && isPaint(at)) {
+        paint = at;
+      } else {
+        // A see-through *cube* is water or slime: the block under it is the terrain, and it can be
+        // deep. Anything else (a plant, a sign, a pane) is a thin hat on the ground right below it.
+        const deep = at && isSolid && isSolid(at) ? maxWaterDrop : maxDrop;
+        for (let k = 1; k <= deep; k++) {
+          const below = c.stateAt(x, top - k, z);
+          if (below && isPaint(below)) { paint = below; py = top - k; break; }
+        }
+      }
+    } else {
+      paint = at;                              // no classifier: paint whatever is on top
+    }
+    if (!paint) { paint = at; py = top; }      // never leave a column unpaintable
+    s[i] = paint;
+    g[i] = py + HEIGHT_BIAS;
+    li[i] = columnLight(c, x, top, z, hasSky);
+  }
+
+  return frame(c.cx, c.cz, h, cover, g, s, li);
+}
+
+/**
+ * What light falls on this column, sampled in the air one above its surface. The surface block
+ * itself stores no light (a solid's cells are dark in the save), and the far layer paints the skin
+ * of the column, so the number that matters is the light arriving at it.
+ *
+ * A section with neither a light array nor a Starlight marker reports LIGHT_UNKNOWN; the only
+ * honest fallback is the dimension rule the payload decoder already uses: open sky where the
+ * dimension has skylight at all, and never in the nether.
+ */
+function columnLight(c, x, top, z, hasSky) {
+  for (const y of [top + 1, top]) {
+    let [sky, blk] = c.lightAt(x, y, z);
+    if (sky < 0 && blk < 0) continue;
+    if (sky > 15) sky = hasSky ? 15 : 0;
+    if (blk > 15) blk = 0;
+    return packLight(Math.max(0, sky), Math.max(0, blk));
+  }
+  return packLight(hasSky ? 15 : 0, 0);
+}
+
+/** Pack four u16 column planes and one light byte per column into a shell frame. */
+function frame(cx, cz, h, cover, g, s, light) {
+  const out = Buffer.alloc(SHELL_FRAME);
+  out.write(SHELL_MAGIC, 0, 'ascii');
+  out.writeUInt16LE(SHELL_VERSION, 8);
+  out.writeUInt16LE(0, 10);                    // flags: none yet
+  out.writeInt16LE(cx, 12);
+  out.writeInt16LE(cz, 14);
+  const at = (plane) => SHELL_HEADER + plane * ARR;
+  Buffer.from(h.buffer, h.byteOffset, ARR).copy(out, at(SHELL_H));
+  Buffer.from(cover.buffer, cover.byteOffset, ARR).copy(out, at(SHELL_C));
+  Buffer.from(g.buffer, g.byteOffset, ARR).copy(out, at(SHELL_G));
+  Buffer.from(s.buffer, s.byteOffset, ARR).copy(out, at(SHELL_S));
+  if (light) Buffer.from(light.buffer, light.byteOffset, SHELL_COLS).copy(out, LIGHT_OFF);
+  return out;
+}
+
+/**
+ * Re-assemble a shell frame from stored columns. Shell packs keep exactly these four u16 planes, so
+ * a pack read becomes a frame without touching NBT at all.
+ */
+export function shellFrameCols(cx, cz, h, cover, g, s, light) {
+  return frame(cx, cz, h, cover, g, s, light);
+}
+
+/** The column planes of a shell frame, as views over its bytes. */
+export function shellPlanes(buf, off = 0) {
+  const ab = buf.buffer ?? buf;
+  const base = (ab === buf ? 0 : buf.byteOffset) + off + SHELL_HEADER;
+  const plane = (k) => new Uint16Array(ab, base + k * ARR, SHELL_COLS);
+  const light = new Uint8Array(ab, base + 4 * ARR, SHELL_COLS);
+  return { h: plane(SHELL_H), cover: plane(SHELL_C), g: plane(SHELL_G), state: plane(SHELL_S), light };
+}
