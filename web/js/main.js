@@ -1992,7 +1992,6 @@ function requestLod() {
   // the eye is looking at. pickLodCell answers "what would a column of this rung measure on screen";
   // the budget is what stops a world-sized view from taking the fine rung everywhere, which would be
   // 13x the geometry of the coarse one for pixels the eye cannot tell apart.
-  const eye = camera.position;
   // Bill the decision set, not the decision set plus what is already on hand. Seeding with the held total
   // double-counted every held tile, so the vertex budget appeared spent about half-way through the
   // pass - and the seed moves every time a tile streams in or retires. That slid the point where the
@@ -2005,8 +2004,13 @@ function requestLod() {
   lodStore.request(r[0], r[1], r[2], r[3], [tcx >> 5, tcz >> 5], (rx, rz, held, have) => {
     passCand++;
     if (!have.length) { passZero++; return 0; }
-    const bx = (rx * 32 + 16) * CH, bz = (rz * 32 + 16) * CH;
-    const d = Math.max(64, Math.hypot(bx - eye.x, bz - eye.z));
+    const bx = rx * 32 + 16, bz = rz * 32 + 16;      // chunk coordinates, like the centre above
+    // Keyed on the orbit target, not the eye, for the same reason the live far grid is (see
+    // `tierDistance`): at a 1200-block pull-back the eye sweeps ~1200 blocks sideways during a drag,
+    // so with the eye as the reference every tile's pixel size moved with the gesture and the rungs
+    // re-decided mid-pan - the "the far layer where the detail used to be takes a while to come back"
+    // report, because the pass kept re-asking for rungs it had just dropped.
+    const d = Math.max(64, tierDistance(Math.hypot(bx - tcx, bz - tcz), rig.dist / CH, S.lodAnchor) * CH);
     const px1 = pxPerRad() / d;
     // A rung change costs a fetch, an upload and a dispose, and the answer for a given region slot only
     // has to be good, not newly optimal: remember what was asked here last time and hand that to the

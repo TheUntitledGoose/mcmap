@@ -82,3 +82,26 @@ test('pickLodCell still upgrades a blob it is holding', () => {
   assert.equal(pickLodCell(RUNGS, 1.4, 3, 16, 8), 4, 'a coarse blob is replaced by the finest rung that measures up');
   assert.equal(pickLodCell(RUNGS, 0.4, 3, 16, 8), 16, 'and the same rung is left alone at 6 px');
 });
+
+test('the budget takes a fine rung at its line but only releases one past a margin', () => {
+  // The second line exists because `costFor` is an average over the tiles currently held: the answer
+  // changes the number it is measured against. Without a margin, a slot sitting on the line answers
+  // fine, that changes the average, it answers coarse, and the pair repeats - measured as five region
+  // slots cycling cell 8 <-> cell 16 for 8 s straight after a pan (loaded and dropped both climbing
+  // ~10 per second, `gaps` stuck at 5 and never closing). See build/q_lodrefill.js.
+  const o = (spent, held, per = cost) =>
+    ({ minPx: 3, maxPx: 8, maxCell: 16, spent, held, budget: 200000, costFor: per });
+  assert.equal(pickLodRung(RUNGS, 0.5, o(190000, 0)).cell, 16,
+    'nothing asked for yet and the bill would cross: take the coarse rung');
+  assert.equal(pickLodRung(RUNGS, 0.5, o(190000, 8)).cell, 8,
+    'cell 8 already asked for: a 6 % overrun is not worth a fetch, an upload and a dispose');
+  assert.equal(pickLodRung(RUNGS, 0.5, o(260000, 8)).cell, 16, 'a real overrun does release it');
+  // Twenty passes with the per-tile estimate wobbling the way a changing held mix makes it wobble.
+  const seen = new Set();
+  let held = 8;
+  for (let i = 0; i < 20; i++) {
+    const r = pickLodRung(RUNGS, 0.5, o(190000, held, (c) => cost(c) * (held === 8 ? 1.08 : 1)));
+    seen.add(r.cell); held = r.cell;
+  }
+  assert.equal(seen.size, 1, `one answer for 20 passes, saw ${[...seen].join('/')}`);
+});

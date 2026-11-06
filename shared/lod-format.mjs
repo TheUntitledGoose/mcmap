@@ -221,6 +221,9 @@ export function pickLodCell(cells, pxPerBlock, minPx, held = 0, maxPx = minPx * 
  * @param {number} [o.held]   rung already asked/held for this slot, 0 if none
  * @param {number} [o.spent]  vertices billed by nearer tiles this pass
  * @param {number} [o.budget] vertex budget for the pass
+ * @param {number} [o.hysteresis] how far past the budget a fine rung already on screen has to go
+ *   before it is released (default 1.25); the budget is one line for taking a rung and a looser one
+ *   for dropping one, because dropping one costs a re-fetch the next time the view comes back
  * @param {(cell:number)=>number} [o.costFor] vertices a tile of one rung costs
  * @returns {{cell: number, spent: number}} the rung to ask for, and the bill including it
  */
@@ -243,7 +246,18 @@ export function pickLodRung(have, px, o = {}) {
   if (!(minPx > 0)) return { cell: coarsest, spent };     // one rung for every tile
   const cost = o.costFor ?? (() => 0);
   let cell = pickLodCell(avail, px, minPx, o.held ?? 0, maxPx);
-  if (cell < coarsest && spent + cost(cell) > (o.budget ?? Infinity)) cell = coarsest;
+  const budget = o.budget ?? Infinity;
+  if (cell < coarsest && spent + cost(cell) > budget) {
+    // Releasing a fine rung that is already on screen is not free: fetch, decode, upload, dispose.
+    // And the cost-per-tile this test uses is an average over the tiles currently held, so the answer
+    // changes the very number it is measured against. Measured with build/q_lodrefill.js after a
+    // 1030-block pan: five region slots ping-ponged cell 8 <-> cell 16 for the whole 8 s trace
+    // (loaded and dropped both climbing ~10 per second, `held` pinned at 327, `gaps` stuck at 5 and
+    // never closing). So the budget has two lines: a fine rung you do not already have has to fit
+    // under it, and one you already have is only let go of once the bill passes it by the margin.
+    const keep = (o.held ?? 0) >= 1 && o.held < coarsest && avail.includes(o.held) ? o.held : 0;
+    cell = keep && spent + cost(keep) <= budget * (o.hysteresis ?? 1.25) ? keep : coarsest;
+  }
   return { cell, spent: spent + cost(cell) };
 }
 
