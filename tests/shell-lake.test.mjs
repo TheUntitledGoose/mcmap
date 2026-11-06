@@ -157,8 +157,14 @@ test('shell mesh: a coarse cell stands on its ground, not on the cover above it'
   // A plant (not a cube, not see-through) is not a floor: the cell drops to the ground it stands on.
   assert.equal(topOf(mk(ID.tuft), {}), 81, 'a plant column stands on the ground');
   assert.equal(topOf(mk(ID.tuft), { groundFar: 0 }), 101, 'groundFar 0 keeps the old WORLD_SURFACE top');
-  // Leaves are see-through, so the canopy stays where it is: a forest must not go flat.
-  assert.equal(topOf(mk(ID.leaves), {}), 101, 'a canopy stays at its own top');
+  // Leaves fill the column, so their top is a real silhouette at one block per cell. Past that, the
+  // old exception stood a 16-block-wide column on the treetops, which is what made a forest read as a
+  // pile of solid towers: at a coarse cell the body is the ground and the canopy survives as colour.
+  assert.equal(topOf(mk(ID.leaves), {}), 81, 'a coarse cell stands on its ground, not on its canopy');
+  assert.equal(topOf(mk(ID.leaves), { cell: 1 }), 101, 'at one block per cell the canopy keeps its top');
+  // Water is a full cube too, but it is a plane the eye sees through: it is the surface at any cell
+  // size, or the cell collapses onto the bed and punches a hole in the world.
+  assert.equal(topOf(mk(ID.water), {}), 101, 'a lake keeps its water line even at a coarse cell');
   // A frame with no ground plane (an older bake) keeps the surface instead of collapsing to 0.
   const v1 = mk(ID.tuft);
   const get1 = (cx, cz) => {

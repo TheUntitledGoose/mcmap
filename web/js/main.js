@@ -155,6 +155,9 @@ const S = {
   // lodMatFor). ?nolodclip leaves them drawn everywhere, which is how the coarse layer
   // looked before, cliffs and all.
   lodClip: params.has('nolodclip') ? 0 : (num('lodclip', 1) ? 1 : 0),
+  // Re-cut a coarse patch when a full-resolution chunk lands inside it. Off only to A/B the plate that
+  // this exists to remove. URL: ?nopatchdetail
+  patchDetail: params.has('nopatchdetail') ? 0 : (num('patchdetail', 1) ? 1 : 0),
   invert: params.has('invert'),       // orbit drag direction: mouse-look (default) vs grab-the-world
   worldSpan: 0,        // blocks across the loaded part of this dimension, filled in at boot
   maxZoom: 1200,       // wheel ceiling, recomputed from worldSpan + skinCap
@@ -696,7 +699,13 @@ function attachChunkMesh(cx, cz, geos, stats, wasCovered) {
     for (const { geometry } of geos) geometry.dispose();
     return;
   }
+  // The skin has to stop drawing under anything the detail pass picks up, otherwise two surfaces sit at
+  // the same height and z-fight. And a coarse patch cut *before* this chunk landed still has a cell
+  // standing where the fine geometry now is: a 16-block plate parked on the roof of the house you are
+  // looking at, which used to never go away because nothing asked for the patch to be re-cut. The mesher
+  // skips chunks the detail owns, so re-cutting the patch removes it.
   if (!wasCovered) markPatch(cx, cz, 'cover');
+  else if (S.patchDetail && shellMeshes.has(patchKey(cx, cz))) { markPatch(cx, cz, 'detail'); patchDetailMarks++; }
   const list = geos.map(({ pass, geometry }) => {
     const mesh = new THREE.Mesh(geometry, materials[pass]);
     mesh.name = `detail${pass}`;
@@ -1658,7 +1667,8 @@ const uLodCov = { value: covTex };
 const uCovAt = { value: new THREE.Vector2(0, 0) };   // patch coordinate sitting at the origin
 const uCovBlk = { value: 256 };                      // blocks per far-grid patch (S.patch * CH)
 const uKill = { value: 0 };                          // debug: unconditional discard for the baked tiles
-let lodClipOn = 0, lodClipRect = [1e9, 1e9, -1e9, -1e9], lodCovPatches = 0;
+let lodClipOn = 0, lodClipRect = [1e9, 1e9, -1e9, -1e9], lodCovPatches = 0, lodCovDetail = 0, lodCovHeld = 0;
+let patchDetailMarks = 0;
 let covForce = 0;                                // debug: 1 = everything covered, -1 = nothing, 0 = normal
 let lodKill = 0;                                 // debug: unconditional discard, to prove the patch is live
 
@@ -1704,11 +1714,24 @@ function updateUnderground() {
   underFar = p.y < top - S.underDepth && (sky < 0 ? true : sky <= S.underSky);
 }
 
+/** Does the heightmap layer hold every chunk of this patch? Early exit: a patch that is not held
+ *  usually fails on its first chunk. */
+function patchHeld(px, pz, SP) {
+  if (!shellStore) return false;
+  const bx = px * SP, bz = pz * SP;
+  for (let i = 0; i < SP; i++) {
+    for (let j = 0; j < SP; j++) if (!shellStore.has(bx + i, bz + j)) return false;
+  }
+  return true;
+}
+
 function updateLodClip() {
   const on = lodActive() && S.shellOn && S.lodClip !== 0;
   const PB = uCovBlk.value = S.patch * CH;
   covData.fill(0);
   lodCovPatches = 0;
+  lodCovDetail = 0;
+  lodCovHeld = 0;
   if (covForce) {                                 // debug path: is the discard reaching the GPU at all?
     covData.fill(covForce > 0 ? 255 : 0);
     lodCovPatches = covForce > 0 ? 1 : 0;
@@ -1729,6 +1752,42 @@ function updateLodClip() {
       if (pz < z0) z0 = pz;
       if (px + 1 > x1) x1 = px + 1;
       if (pz + 1 > z1) z1 = pz + 1;
+    }
+    // Full-resolution chunks own ground too, and the far grid deliberately leaves their patches
+    // unmeshed. Marking only live shell patches meant a baked 16-block plate sat on top of the house
+    // you were looking at - the clip had nothing to say about a square the detail pass was painting.
+    for (const k of meshes.keys()) {
+      const c = k.indexOf(',');
+      const px = Math.floor(+k.slice(0, c) / S.patch), pz = Math.floor(+k.slice(c + 1) / S.patch);
+      const tx = ((px - acx) % COV_N + COV_N) % COV_N, tz = ((pz - acz) % COV_N + COV_N) % COV_N;
+      const ci = (tz * COV_N + tx) << 2;
+      if (covData[ci]) continue;
+      covData[ci] = 255;
+      lodCovPatches++;
+      lodCovDetail++;
+    }
+    // A patch the live layer owns but has not re-cut *yet* - retired on a pan, waiting out the quiesce
+    // window before it is cut again - still owns that ground. Leaving its texel clear is how a baked
+    // slab flashed through in the middle of a pan over terrain the detail pass had already painted.
+    // The heightmap is asked whether it holds the patch, a few patches per frame, and the answer is
+    // only allowed to hide a tile when all SPxSP frames are in hand.
+    const half = Math.ceil(skinR / S.patch) + 1;
+    let need = 12;
+    for (let px = acx - half; px <= acx + half && need > 0; px++) {
+      for (let pz = acz - half; pz <= acz + half && need > 0; pz++) {
+        const tx = ((px - acx) % COV_N + COV_N) % COV_N, tz = ((pz - acz) % COV_N + COV_N) % COV_N;
+        const ci = (tz * COV_N + tx) << 2;
+        if (covData[ci]) continue;
+        need--;
+        if (!patchHeld(px, pz, S.patch)) continue;
+        covData[ci] = 255;
+        lodCovPatches++;
+        lodCovHeld++;
+        if (px < x0) x0 = px;
+        if (pz < z0) z0 = pz;
+        if (px + 1 > x1) x1 = px + 1;
+        if (pz + 1 > z1) z1 = pz + 1;
+      }
     }
     lodClipRect = lodCovPatches ? [x0 * PB, z0 * PB, x1 * PB, z1 * PB] : [1e9, 1e9, -1e9, -1e9];
   } else lodClipRect = [1e9, 1e9, -1e9, -1e9];
@@ -2596,6 +2655,7 @@ window.__world = {
   lodDiag: () => ({
     on: lodActive() ? 1 : 0, avail: lodAvail ? 1 : 0, cap: S.lodCap,
     clipOn: lodClipOn, clip: lodClipRect.map((v) => (v > 1e8 ? 'off' : v)), cov: lodCovPatches,
+    covDetail: lodCovDetail,
     held: lodStore ? lodStore.tiles.size : 0, drawn: lodTiles, verts: lodVerts,
     wanted: lodStore ? lodStore.wanted.size : 0, gaps: lodStore ? lodStore.gaps() : 0,
     indexed: lodStore && lodStore.index ? lodStore.index.size : -1,
@@ -2742,6 +2802,7 @@ window.__world = {
   // units the GPU counts, so an estimate and a mesh can be compared directly.
   gridEst: () => ({ columns: gridColumns(), costScale, floorBoost, vpc: +vertsPerColumn().toFixed(1),
     cutMs: +shellCutAvg.toFixed(2), cuts: shellCuts, dirty: dirtyPatches.size,
+    detailMarks: patchDetailMarks,
     estVerts: Math.round(gridColumns() * vertsPerColumn()), budget: S.vertBudget,
     cellPx: S.cellPx * costScale,
     verts: [...shellMeshes.values()].reduce((a, e) => a + (e.verts || 0), 0),

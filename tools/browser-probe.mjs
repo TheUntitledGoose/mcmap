@@ -117,7 +117,11 @@ const send = (method, params = {}) => new Promise((res, rej) => {
 });
 
 const evaluate = async (expr) => {
-  const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
+  // A plain Runtime.evaluate runs a *script*, and a script body has no top-level await, so a probe that
+  // wants to wait for chunks to arrive (a promise, not a tick) is wrapped instead. Wrapped probes must
+  // `return` their value; every existing probe is an expression or statements and stays as-is.
+  const expression = /\bawait\b/.test(expr) ? `(async () => { ${expr} })()` : expr;
+  const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
   if (r.exceptionDetails) throw new Error(`eval failed: ${r.exceptionDetails.text} ${r.exceptionDetails.exception?.description ?? ''}`);
   return r.result.value;
 };

@@ -72,7 +72,13 @@ function paintFor(assets, coverId, groundId) {
 function colHeight(assets, sh, k, cell, groundFar) {
   const h = sh.height[k];
   if (!h || !sh.ground || !groundFar) return h;
-  if (isFullBlock(assets, sh.cover ? sh.cover[k] : 0)) return h;
+  const cov = sh.cover ? sh.cover[k] : 0;
+  // A plane the eye sees through - the skin of a lake - *is* the surface at every cell size, and
+  // dropping the cell to the bed would punch a hole in the world. A canopy is a full cube too, but
+  // standing a 16-block-wide column on its treetops is what made a forest read as a pile of solid
+  // towers: past one block per cell the cell's body is the ground, and the canopy survives as colour.
+  if (isFilm(assets, cov)) return h;
+  if (cell === 1 && isFullBlock(assets, cov)) return h;
   const g = sh.ground[k];
   return g > 0 && g < h ? g : h;
 }
