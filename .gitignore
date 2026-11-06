@@ -10,6 +10,7 @@ build/*
 !build/mk_*.cjs
 !build/panel_layout.txt
 !build/spec_*.json
+!build/doc_*.md
 !build/*.mjs
 .cache/
 *.log
