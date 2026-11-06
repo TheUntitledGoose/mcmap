@@ -13,6 +13,7 @@ import { meshShellPatch, meshOverview } from './shell-mesh.js';
 import { PATCH_REACH, packPatchFrames, packPatchPolicy, patchFrameGetter, patchPolicy } from './shell-batch.js';
 import { cutReserve, patchThreadCap } from '../../shared/pool.mjs';
 import { meshKeyTool } from './mesh-key.js';
+import { parkPasses, indexedMatch } from './mesh-bytes.js';
 import { mountPanel } from './ui.js';
 import { HEIGHT_BIAS } from '../../shared/chunk-format.mjs';
 import { layerAlpha, stackOver, over, dmax } from '../../shared/composite.mjs';
@@ -729,6 +730,11 @@ function buildChunkGeometries(chunk) {
 const meshBytes = new Map();          // "cx,cz" -> { passes, stats, bytes, sig }, oldest first
 let meshBytesTotal = 0, cachedInstalls = 0, meshBytesDropped = 0, lastBytesSweep = 0;
 let meshBytesGhost = 0;                // parked bytes whose voxels the store has let go
+// Parked passes that had an index buffer, and installs that got one. These two counters are the
+// regression check for the park losing an index: a mesh parked indexed and installed unindexed is drawn
+// as a strip over 4-corner data, which is a picture of broken quads, not a missing chunk.
+let parkedIndex = 0, installedIndex = 0;
+const parkIndexLost = { count: 0 };        // parked with an index, installed without one
 
 const detailSig = () => `A${S.ao ? 1 : 0}/${S.aoMin}L${S.light ? 1 : 0}/${S.darkFloor}/${S.darkGamma}` +
   `/${S.skyScale}D${S.caves ? -1 : S.darkcut}B${S.caves ? 0 : S.buried}S${S.buriedSky}U${S.caves ? 0 : S.surface}` +
@@ -829,22 +835,11 @@ function trimMeshBytes() {
 
 function stashMeshBytes(key, entry) {
   if (S.meshCacheMb <= 0) return;
-  const passes = [];
-  let bytes = 0;
-  for (const { pass, mesh } of entry.list) {
-    const a = mesh.geometry.attributes;
-    if (!a.position || !a.position.count) continue;
-    // slice(): the mesher's streams are power-of-two grown, so holding a view would keep an
-    // allocation up to twice the size of the chunk alive for a chunk nobody is looking at.
-    passes.push({
-      pass,
-      position: a.position.array.slice(), uv: a.uv.array.slice(), color: a.color.array.slice(),
-      index: a.index ? a.index.array.slice() : null,
-    });
-    bytes += a.position.array.byteLength + a.uv.array.byteLength + a.color.array.byteLength
-      + (a.index ? a.index.array.byteLength : 0);
-  }
+  // The copying, and the `geometry.index` vs `geometry.attributes.index` decision, live in
+  // web/js/mesh-bytes.js so a Node test can hold them.
+  const { passes, bytes, indexBuffers } = parkPasses(entry.list);
   if (!passes.length) return;
+  parkedIndex += indexBuffers;
   dropBytes(key);
   meshBytes.set(key, { passes, stats: entry.stats, bytes, mk: entry.mk, sig: detailSig() });
   meshBytesTotal += bytes;
@@ -893,10 +888,14 @@ function installCached(cx, cz, mk) {
     g.setAttribute('color', new THREE.Uint8BufferAttribute(color, 4, true));
     if (index) g.setIndex(new THREE.BufferAttribute(index, 1));
     g.computeBoundingSphere();
+    // Parked an index, installed none = the geometry is a strip over 4-corner data. Loud, because the
+    // picture it draws is garbage rather than a hole.
+    if (!indexedMatch({ index }, g)) parkIndexLost.count++;
     return { pass, geometry: g };
   });
   attachChunkMesh(cx, cz, geos, e.stats, wasCovered, mk);
   cachedInstalls++;
+  installedIndex += geos.reduce((n, { geometry }) => n + (geometry.index ? 1 : 0), 0);
   parkedAt.set(`${cx},${cz}`, performance.now());
   return true;
 }
@@ -3191,6 +3190,7 @@ window.__world = {
       meshReused: cachedInstalls, meshCacheDropped: meshBytesDropped,
       meshBuilds, meshKeyOn: S.meshKey, meshUnchanged: meshUnchanged.count,
       meshUnsettled: meshUnsettled.count, meshResultsDropped: meshResultsDropped.count, meshBytesGhost, parkThenBuild,
+      parkedIndex, installedIndex, cachedInstalls, parkIndexLost: parkIndexLost.count,
       parkedWaiting: parkedAt.size,
       payloadLead: S.payloadLead, bytesKeep: S.bytesKeep,
       // The mesh queue's own depth: keys waiting in the wave (taken from the dirty set) and jobs the
