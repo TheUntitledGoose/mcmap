@@ -10,6 +10,7 @@ import { LodStore } from './lod-store.js';
 import { pickLodRung, LOD_CELL } from '../../shared/lod-format.mjs';
 import { openOverview } from './payload.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
+import { PATCH_REACH, packPatchFrames, packPatchPolicy } from './shell-batch.js';
 import { mountPanel } from './ui.js';
 import { HEIGHT_BIAS } from '../../shared/chunk-format.mjs';
 import { layerAlpha, stackOver, over, dmax } from '../../shared/composite.mjs';
@@ -70,6 +71,7 @@ const S = {
   // How long a block of far terrain waits after new ground arrives under it before it is drawn again.
   shellQuiesce: Math.max(0, num('quiesce', 250)),
   workers: num('workers', -1),
+  patchWorkers: Math.max(0, Math.min(6, num('patchworkers', 2))),
   mipmax: num('mipmax', 4),
   ao: !params.has('noao'),
   aoMin: num('ao', 0.42),
@@ -811,13 +813,20 @@ function plainChunk(c) {
 function startWorkers() {
   const n = workerCount();
   if (!n || !assetSource) return;
+  // One generation number for the whole pool. It used to be one number per worker (`w.seq = ++workerSeq`),
+  // and the two places that ask "is this worker still current?" compare a worker's seq against the
+  // running counter - so for a pool of eight, exactly the last worker ever matched. workerReady stuck at
+  // 1, workersUsable() was false forever, and every chunk mesh ran on the render thread at 30-40 ms a
+  // frame while the HUD cheerfully reported 8 workers. The pool was never the fix; it was the bug.
+  const gen = ++workerSeq;
   for (let i = 0; i < n; i++) {
     // type: 'module' because the worker imports the same ESM modules the page and the tests use.
     const w = new Worker('/js/mesh-worker.js', { type: 'module' });
     w.busy = false;
-    w.seq = ++workerSeq;
+    w.seq = gen;
     w.onmessage = (e) => {
       const m = e.data;
+      if (m.patch) { patchResult(w, m); return; }
       if (m.ready) { workerReadyMsgs++; if (w.seq === workerSeq) workerReady++; return; }
       w.busy = false;
       const job = jobs.get(m.seq);
@@ -867,12 +876,22 @@ function resetWorkers() {
     jobs.delete(seq); jobForKey.delete(job.key);
     if (store) store.dirty.add(job.key);
   }
+  for (const [seq, job] of [...patchJobs]) { patchJobs.delete(seq); patchJobForKey.delete(job.pk); }
+  patchInflight = 0;
   startWorkers();
 }
 
 function meshAsync(cx, cz) {
   const key = `${cx},${cz}`;
   if (jobForKey.has(key)) return true;
+  // A pan wants two kinds of work at once: chunk meshes for the middle of the view and far patch cuts
+  // for everything around it. If the chunk queue takes every worker, the patch cut falls back to the
+  // render thread - a 20 ms hitch, which is the whole reason the cut has workers now - so while patches
+  // are waiting, some slots stay free for them.
+  const reserve = S.patchWorkers && dirtyPatches.size ? Math.min(S.patchWorkers, pool.length - 1) : 0;
+  let free = 0;
+  for (const x of pool) if (!x.busy) free++;
+  if (free <= reserve) return false;
   const w = pool.find((x) => !x.busy);
   const chunk = store.get(cx, cz);
   if (!w || !chunk) return false;
@@ -1248,56 +1267,95 @@ function retierPatches_tiers() {
   }
 }
 
-function rebuildPatch(pk) {
+// A far patch cut used to happen on the render thread. It is 20-25 ms of mesher work - more than a
+// frame - and a pan asks for sixty of them (measured: 64-82 cuts per leg at 19-25 ms each, so 1.3-1.8 s
+// of main-thread work for a gesture that should cost nothing). The cut now runs on the mesh workers,
+// which already hold the atlas and the same DOM-free mesher module.
+//
+// What crosses the boundary is data, never policy: the patch's shell frames as packed bytes, plus the
+// per-chunk answers only the page can give (cell size, and which cells the voxel detail owns). Coming
+// back it is the vertex streams. The packing is pinned byte-identical to a live cut by
+// tests/web-shellbatch.test.mjs, and `PATCH_REACH` is measured rather than guessed
+// (tools/dbg-patchreach.mjs), because a frame that reads null where the page found one opens a hole at
+// a patch border.
+const patchJobs = new Map();          // seq -> {pk, gen, tier, mode, sig, t0}
+const patchJobForKey = new Map();     // patch key -> seq: one cut per patch at a time
+let patchSeq = 0, patchInflight = 0, patchPosted = 0, patchDropped = 0, patchOutside = 0;
+
+/**
+ * Decide a patch cut without paying for it: tier, paint mode, the frames, and the two per-chunk
+ * answers. Returns {skip: true} when the patch should not be drawn at all, which also drops whatever
+ * mesh it had.
+ */
+function planPatch(pk) {
+  const [px, pz] = pk.split(',').map(Number);
+  const x0 = px * S.patch, z0 = pz * S.patch;
+  let held = 0;
+  for (let dz = 0; dz < S.patch; dz++) for (let dx = 0; dx < S.patch; dx++) if (shellAt(x0 + dx, z0 + dz)) held++;
+  if (!held) return { skip: true };
+  // A patch takes its ground away from the baked tiles only when it is whole: frames are still
+  // arriving mid-load and the save really does have holes, and half a live patch over a discarded
+  // tile is a hole in the view - which is what "the far LODs never load" looked like. With no baked
+  // layer standing behind it there is nothing to hand the ground back to, so cut it anyway.
+  if (held < S.patch * S.patch && lodPainting()) return { skip: true };
+  const tier = patchTierFor(pk, patchTier.get(pk) ?? 0);
+  // The baked tiles already paint this patch. The live skin stops where the tile grid takes over, so
+  // the coarse ring is not meshed anywhere - that is the frame cost the bake was for.
+  if (lodActive() && S.lodCap > 0 && cellOfTier(tier) > S.lodCap) return { skip: true };
+  patchTier.set(pk, tier);
+  const mode = patchTexMode(px, pz, tier);
+  const cell = cellOfTier(tier);
+  const opts = {
+    cell, cellFor: cellForChunk, maxSkirt: S.skirt, skip: detailHere,
+    blend: S.blend, trackStates: true, groundFar: S.groundFar, waterOpacity: S.water,
+    aoFar: S.aoFar, tex: mode === 1, ...farLightOpts(),
+    caps: S.caps, capDrop: S.capDrop, capCell: S.capCell,
+  };
+  // One chunk of border, because that is exactly how far the mesher reaches (measured at every cell
+  // size); the walls along a shared patch edge are drawn from the neighbour's columns.
+  const r = PATCH_REACH;
+  const fw = S.patch + 2 * r, fh = S.patch + 2 * r;
+  const pack = packPatchFrames(shellAt, x0 - r, z0 - r, fw, fh);
+  const pol = packPatchPolicy(cellForChunk, detailHere, x0 - r, z0 - r, fw, fh);
+  // The signature is taken here, at the moment the decision was made, so a cut that lands after the
+  // settings or the tier moved under it can be recognised as stale instead of painted.
+  return { tier, mode, cell, x0, z0, w: S.patch, h: S.patch, opts, pack, cells: pol.cells, skips: pol.skips, sig: patchSig(pk) };
+}
+
+/** Hand the cut to a free worker. False when none is free, in which case the caller pays for it here. */
+function postPatchJob(pk, plan) {
+  const w = pool.find((x) => !x.busy);
+  if (!w) return false;
+  const seq = ++patchSeq;
+  patchJobs.set(seq, { pk, gen: dimGen, tier: plan.tier, mode: plan.mode, sig: plan.sig, t0: performance.now() });
+  patchJobForKey.set(pk, seq);
+  const opts = { ...plan.opts };
+  delete opts.cellFor; delete opts.skip;          // closures cannot travel; their answers are the arrays
+  const { pack, cells, skips } = plan;
+  w.busy = true; patchInflight++; patchPosted++;
+  w.postMessage({
+    seq,
+    patch: {
+      key: pk, x0: plan.x0, z0: plan.z0, w: plan.w, h: plan.h, cell: plan.cell, opts,
+      fx0: pack.x0, fz0: pack.z0, fw: pack.w, fh: pack.h, offs: pack.offs, bytes: pack.bytes,
+      cells, skips,
+    },
+  }, [pack.bytes, pack.offs.buffer, cells.buffer, skips.buffer]);
+  return true;
+}
+
+/** Put a finished cut on screen: the old mesh goes, the new one arrives, the vertex count is recounted. */
+function installPatch(pk, plan, stream, stats, ms) {
+  shellN++;
+  shellMs += (ms - shellMs) / shellN;
+  if (ms > shellMsMax) shellMsMax = ms;
   const old = shellMeshes.get(pk);
   if (old) {
     for (const m of [old.mesh, old.mesh2]) if (m) { shellGroup.remove(m); m.geometry.dispose(); }
     shellMeshes.delete(pk);
   }
-  const [px, pz] = pk.split(',').map(Number);
-  const x0 = px * S.patch, z0 = pz * S.patch;
-  let held = 0;
-  for (let dz = 0; dz < S.patch; dz++) for (let dx = 0; dx < S.patch; dx++) if (shellAt(x0 + dx, z0 + dz)) held++;
-  if (!held) { patchTier.delete(pk); return; }
-  // A patch takes its ground away from the baked tiles only when it is whole: frames are still
-  // arriving mid-load and the save really does have holes, and half a live patch over a discarded
-  // tile is a hole in the view - which is what "the far LODs never load" looked like. With no baked
-  // layer standing behind it there is nothing to hand the ground back to, so cut it anyway.
-  if (held < S.patch * S.patch && lodPainting()) {
-    if (old) {
-      for (const m of [old.mesh, old.mesh2]) if (m) { shellGroup.remove(m); m.geometry.dispose(); }
-      shellMeshes.delete(pk); recountShellVerts();
-    }
-    patchTier.delete(pk);
-    return;
-  }
-  const tier = patchTierFor(pk, patchTier.get(pk) ?? 0);
-  // The baked tiles already paint this patch. The live skin stops where the tile grid takes over, so
-  // the coarse ring is not meshed anywhere - that is the frame cost the bake was for.
-  if (lodActive() && S.lodCap > 0 && cellOfTier(tier) > S.lodCap) {
-    const old = shellMeshes.get(pk);
-    if (old) {
-      for (const m of [old.mesh, old.mesh2]) if (m) { shellGroup.remove(m); m.geometry.dispose(); }
-      shellMeshes.delete(pk);
-      recountShellVerts();
-    }
-    patchTier.delete(pk);
-    return;
-  }
-  patchTier.set(pk, tier);
-  const mode = patchTexMode(px, pz, tier);
-  const t0 = performance.now();
-  const { stream, stats } = meshShellPatch(assets, shellAt, x0, z0, S.patch, S.patch, {
-    cell: cellOfTier(tier), cellFor: cellForChunk, maxSkirt: S.skirt, skip: detailHere,
-    blend: S.blend, trackStates: true, groundFar: S.groundFar, waterOpacity: S.water,
-    aoFar: S.aoFar, tex: mode === 1, ...farLightOpts(),
-    caps: S.caps, capDrop: S.capDrop, capCell: S.capCell,
-  });
-  const ms = performance.now() - t0;
-  shellN++;
-  shellMs += (ms - shellMs) / shellN;
-  if (ms > shellMsMax) shellMsMax = ms;
-  if (!stream.count) { patchTier.delete(pk); return; }
+  if (!stream.count) { patchTier.delete(pk); recountShellVerts(); return; }
+  const mode = plan.mode;
   // Two paints, two materials: a far cell is either a sprite quad or a plate of its sprite's mean
   // colour, and the sprite material has no partial alpha, so a lake stays a plate either way.
   const build = (s, mat) => {
@@ -1318,9 +1376,54 @@ function rebuildPatch(pk) {
   shellMeshes.set(pk, {
     mesh: build(stream, mode === 1 ? shellTexMat : shellMat),
     verts: stream.count,
-    tier, mode, caps: stats.caps || 0, sig: patchSig(pk),
+    tier: plan.tier, mode, caps: stats.caps || 0, sig: plan.sig,
   });
   recountShellVerts();
+}
+
+/** A worker's answer for a patch. It may be about a view that no longer exists, so it is checked. */
+function patchResult(w, m) {
+  w.busy = false;
+  if (patchInflight > 0) patchInflight--;
+  const job = patchJobs.get(m.seq);
+  patchJobs.delete(m.seq);
+  patchJobForKey.delete(m.patch.key);
+  if (!job || job.gen !== dimGen || job.pk !== m.patch.key) { patchDropped++; return; }
+  patchOutside += m.outside || 0;
+  // The patch left the skin square while its cut was running. Installing it would be the old carpet
+  // of far terrain standing where the pan has already moved on - the "LODs don't disappear" bug.
+  const side = Math.max(1, S.patch);
+  const [px, pz] = job.pk.split(',').map(Number);
+  const [ccx, ccz] = centerChunk();
+  if (Math.abs(px * side + (side >> 1) - ccx) > skinR + side
+    || Math.abs(pz * side + (side >> 1) - ccz) > skinR + side) { patchDropped++; return; }
+  // Or the tier / far settings moved under it. Keep the mesh that is on screen and re-cut: a patch
+  // built for a superseded decision must not be stamped with the current signature, because the settle
+  // test would then believe it is finished.
+  if (patchSig(job.pk) !== job.sig) { dirtyAdd(job.pk, 'stale'); patchDropped++; return; }
+  installPatch(job.pk, job, m.stream, m.stats, m.ms ?? 0);
+}
+
+function rebuildPatch(pk) {
+  if (patchJobForKey.has(pk)) return;      // a cut is already running for this patch
+  const plan = planPatch(pk);
+  if (plan.skip) {
+    const old = shellMeshes.get(pk);
+    if (old) {
+      for (const m of [old.mesh, old.mesh2]) if (m) { shellGroup.remove(m); m.geometry.dispose(); }
+      shellMeshes.delete(pk);
+      recountShellVerts();
+    }
+    patchTier.delete(pk);
+    return;
+  }
+  // The cut goes to a worker when one is free, and the previous mesh stays on screen until the new one
+  // arrives: that is also what stops a re-cut from blanking a patch for a frame, which is what far
+  // terrain flickering during a drag used to mean.
+  if (S.patchWorkers > 0 && patchInflight < S.patchWorkers && postPatchJob(pk, plan)) return;
+  const t0 = performance.now();
+  const { stream, stats } = meshShellPatch(assets, shellAt, plan.x0, plan.z0, plan.w, plan.h, plan.opts);
+  installPatch(pk, plan, stream, stats, performance.now() - t0);
 }
 
 // Counted from the live meshes rather than the mesher stats: a patch that was skipped (detail owns
@@ -2614,6 +2717,7 @@ window.__world = {
       ovBands: ovBands.size, ovBandsTotal: ovBandTotal(), ovBandRows: ovBandRows(),
       shellMissing: shellStore ? shellStore.missing.size : 0,
       shellMs: +shellMs.toFixed(2), shellMsMax: +shellMsMax.toFixed(2),
+      shellJobs: patchJobs.size, patchOutside, patchPosted, patchDropped,
       shellCells: tiers().slice(), shellTiers: tierLabel(),
       shellTiersLive: [...patchTier.values()],
       skinRadius: skinR, skinCap: S.skinCap, skinFloor: S.skinFloor,
@@ -2927,6 +3031,7 @@ window.__world = {
   // units the GPU counts, so an estimate and a mesh can be compared directly.
   gridEst: () => ({ columns: gridColumns(), costScale, floorBoost, vpc: +vertsPerColumn().toFixed(1),
     cutMs: +shellCutAvg.toFixed(2), cuts: shellCuts, dirty: dirtyPatches.size,
+    jobs: patchJobs.size, outside: patchOutside, posted: patchPosted, dropped: patchDropped,
     detailMarks: patchDetailMarks,
     caps: [...shellMeshes.values()].reduce((s, e) => s + (e.caps || 0), 0),
     estVerts: Math.round(gridColumns() * vertsPerColumn()), budget: S.vertBudget,
@@ -3456,6 +3561,10 @@ function buildPanel() {
         hint: 'What auto resolution aims at. URL: ?targetfps',
         get: () => S.targetFps, set: (v) => { S.targetFps = Math.max(20, Math.min(120, v | 0)); } },
 
+      { key: 'patchthreads', label: 'far cut threads', min: 0, max: 6, step: 1, live: true,
+        hint: 'How many far patches may be cut at once off the render thread. A patch cut is 20-25 ms\nand the render thread has 16 ms in a frame, so the cut runs on these instead. 0 cuts them here.\nRaising it competes with chunk meshing for the same threads. URL: ?patchworkers',
+        get: () => S.patchWorkers,
+        set: (v) => { S.patchWorkers = Math.max(0, Math.min(6, v | 0)); } },
       { key: 'workers', label: 'meshing threads', min: 0, max: 8, step: 1, live: false,
         hint: 'Background threads that build chunk meshes. Changing this restarts them (a moment of stutter).\n0 meshes on the render thread instead. URL: ?workers',
         get: () => workerCount(),

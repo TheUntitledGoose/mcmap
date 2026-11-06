@@ -8,6 +8,8 @@
 import { Assets } from './assets.js';
 import { meshChunk, NEIGH_COVERED } from './mesher.js';
 import { sectionIndex, stateIndexAt, lightLevelAt, skyLevelAt } from './lookup.js';
+import { meshShellPatch } from './shell-mesh.js';
+import { patchFrameGetter, patchPolicy } from './shell-batch.js';
 
 let assets = null;
 
@@ -23,6 +25,24 @@ self.onmessage = ({ data: m }) => {
   if (m.init) {
     assets = new Assets(m.atlas, m.geo);
     self.postMessage({ ready: true, states: assets.states.length, textures: assets.json.textures.length });
+    return;
+  }
+
+  // A far patch cut (web/js/main.js planPatch). It is the same mesher module the page runs, over shell
+  // frames that arrived as packed bytes; `cellFor` and `skip` are the page's answers, packed as arrays
+  // because a decision made in a worker would be a second opinion about what the view owns.
+  if (m.patch) {
+    const p = m.patch;
+    const pack = { x0: p.fx0, z0: p.fz0, w: p.fw, h: p.fh, offs: p.offs, bytes: p.bytes };
+    const get = patchFrameGetter(pack);
+    const pol = patchPolicy(pack, p.cells, p.skips);
+    const t0 = performance.now();
+    const { stream, stats } = meshShellPatch(assets, get, p.x0, p.z0, p.w, p.h,
+      { ...p.opts, cellFor: pol.cellFor, skip: pol.skip });
+    const ms = performance.now() - t0;
+    const transfer = [stream.position.buffer, stream.uv.buffer, stream.color.buffer];
+    if (stream.stateIds) transfer.push(stream.stateIds.buffer);
+    self.postMessage({ patch: { key: p.key }, seq: m.seq, stream, stats, ms, outside: get.outside }, transfer);
     return;
   }
 
