@@ -182,6 +182,10 @@ export function openShellFrame(buf, byteOffset = 0, length = buf.byteLength - by
     : new Uint8Array(SHELL_COLS);
   return {
     cx, cz, height, cover, ground, state, light, band,
+    // The frame's own bytes, where they live. A patch cut moved into a worker has to be handed these
+    // frames, and shipping 324 parsed objects (six typed arrays and six closures each) costs more than
+    // parsing them again would: the bytes travel, and the worker runs this same parser on them.
+    buf, p: byteOffset, len: length,
     /** world Y of the top counted block in a column (chunk-local x,z) */
     surfaceAt(x, z) { return height[((z & 15) << 4) | (x & 15)] - HEIGHT_BIAS; },
     /** shell state id at a column, as a 1-based global state id (0 = nothing there) */
