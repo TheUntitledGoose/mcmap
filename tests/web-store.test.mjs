@@ -244,3 +244,23 @@ test('dirty chunks are meshed nearest-first, not in arrival order', () => {
   assert.deepEqual(store.takeDirty(9), ['9,9'], 'an over-large limit just drains the set');
   assert.equal(store.dirty.size, 0, 'taken keys leave the set');
 });
+
+test('a held chunk outside the sharp ring is offered exactly once, so the ring needs re-marking', async () => {
+  stubFetch();
+  const store = new ChunkStore('minecraft:overworld', { tile: 3, maxChunks: 400, evictLimit: 20 });
+  store.center = [0, 0];
+  store.request(0, 0, 3);
+  await drain(store);
+  assert.ok(store.loaded >= 40, `a radius-3 square, got ${store.loaded}`);
+  assert.ok(store.dirty.has('1,1'), 'an arrival marks itself and its neighbours');
+  const offered = store.takeDirty(Infinity);
+  assert.equal(offered.length, store.loaded, 'every held chunk is offered once');
+  assert.equal(store.dirty.size, 0, 'the store does not remember what the viewer chose to skip');
+  // The store has no notion of a mesh ring, so it cannot re-offer a chunk when the view slides over
+  // it. That re-marking is the viewer's job (markDetailRing, web/js/main.js): a pan keeps the ring's
+  // radius and changes only its centre, and the ring's mark used to run on radius changes alone.
+  // Measured with the scan off: 165 of 289 ring chunks held, unmeshed and unqueued after one pan,
+  // stable forever, and `dirty 0` claimed the queue was calm (build/q_ringscan.js).
+  store.center = [6, 6];
+  assert.equal(store.dirty.size, 0, 'a centre change marks nothing by itself');
+});

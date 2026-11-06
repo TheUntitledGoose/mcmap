@@ -20,13 +20,23 @@ const argv = process.argv.slice(2);
 const file = argv[0];
 const specPath = argv[1];
 if (!file || !specPath) { console.error('usage: node tools/patchfile.mjs <file> <spec.json>'); process.exit(2); }
-const MAX_SHRINK = +(argv[argv.indexOf('--max-shrink') + 1] ?? 0);
+// The absent-flag case has to be 0, not argv[0]: indexOf returns -1, so the old expression read
+// the *file name* and turned MAX_SHRINK into NaN, and `shrink > NaN` is false for every size.
+// The guard that exists to stop a truncated write had itself stopped working.
+const shrinkFlag = argv.indexOf('--max-shrink');
+const MAX_SHRINK = shrinkFlag >= 0 ? +(argv[shrinkFlag + 1] ?? 0) : 0;
 
 const raw = fs.readFileSync(file);
 const CRLF = raw.toString('utf8').includes('\r\n');
 const src = raw.toString('utf8').replace(/\r\n/g, '\n');
 const spec = JSON.parse(fs.readFileSync(specPath, 'utf8'));
 
+if (!(spec.replace ?? []).length && !(spec.expect ?? []).length) {
+  // A spec whose top-level key is misspelled applied nothing and used to print
+  // `patched ... 0 replacement(s)`, which reads like success.
+  console.error(`spec has no "replace" or "expect" entries (keys: ${Object.keys(spec).join(', ')})`);
+  process.exit(1);
+}
 let t = src;
 for (const [i, r] of (spec.replace ?? []).entries()) {
   const n = t.split(r.old).length - 1;

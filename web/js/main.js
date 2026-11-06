@@ -46,7 +46,13 @@ const S = {
   // ground, ~290 chunk meshes, ~4 M verts. The panel row goes to 24 for people with the GPU for it.
   detailPx: num('detailpx', 1),            // a 1-block column must cover this many px to earn triangles
   detailLod: !params.has('nodetaillod'),   // off = the old behaviour: full res whatever the zoom
-  payloadLead: num('payloadlead', 6),            // chunks of voxel payload kept warm beyond the mesh ring
+  payloadLead: num('payloadlead', 6),
+  // Re-mark the sharp ring when the view centre moves (URL: ?noringscan). A pan slides the
+  // ring over payloads that were pre-fetched and already dropped from the mesh queue.
+  ringScan: params.has('noringscan') ? 0 : (num('ringscan', 1) ? 1 : 0),
+  // payloadLead keeps voxel payload warm beyond the mesh ring. Those payloads are marked dirty on
+  // arrival and the mesh queue drops the ones that are out of ring - which is why a centre change
+  // has to re-mark the ring (ringScan, just above).
   skinFloor: Math.max(4, num('minradius', num('far', 40))),  // skin held even at eye level
   skinCap: Math.max(8, num('maxradius', 96)),   // skin ceiling when zoomed out
   patch: Math.max(1, num('patch', 8)),
@@ -303,6 +309,9 @@ const applyGoto = () => {
 let skinR = S.skinFloor;              // chunk radius of heightmap skin the view currently needs
 let detailR = S.radius;               // chunk radius actually meshed at full resolution right now
 let payloadR = S.radius;              // chunk radius whose voxels are kept (meshed or not)
+// The centre chunk the sharp ring was last marked for. The ring marking is what finds
+// payloads that are already held; it used to run only when the ring's RADIUS changed.
+let lastMarkCx = null, lastMarkCz = null;
 let lastDetailR = -1, demoted = 0, detailVerts = 0;
 let lastTierSig = '', lastTierSigAt = 0;   // what the far grid was last tiered for
 // Movement basis, measured against the camera matrix (__world.axes) rather than trusted from trig:
@@ -366,6 +375,19 @@ function updateView() {
   // than needed, so a wheel drag does not thrash 300 chunks between mesh and demote every frame.
   detailR = wantD >= detailR ? wantD : (wantD <= detailR - 2 ? wantD : detailR);
   if (detailR !== lastDetailR) { lastDetailR = detailR; applyDetailBudget(); }
+  // A pan moves the ring without changing its radius, and `markDetailRing` - the only thing
+  // that marks chunks which are *already held* - used to run only when the radius changed.
+  // A payload fetched in the lead ring is marked dirty on arrival and dropped from the queue
+  // as out-of-ring; slide the ring back over it and the chunk is held, unmeshed and unqueued
+  // forever. The far grid then paints ground the sharp layer owns, and only an action that
+  // calls applyDetailBudget (a zoom, a panel change - the user found that clicking anything
+  // in the panel 'kick-started the chunk gen') would clear it.
+  const [mcx, mcz] = centerChunk();
+  if (S.ringScan && (mcx !== lastMarkCx || mcz !== lastMarkCz)) {
+    lastMarkCx = mcx; lastMarkCz = mcz;
+    markDetailRing();
+    // drainMeshes already puts this wave's leftovers back and re-picks from the new centre
+  }
   // The far plane has to contain everything that is drawn, not just the per-chunk skin. The
   // whole-dimension layer reaches to the edge of the save, and a far plane sized for the skin alone
   // cut it off mid-distance: tilting toward the horizon showed a hard line where the world stopped,
@@ -2879,6 +2901,20 @@ function atLight(wx, wy, wz) {
   return [s.sky ?? 0, s.blk ?? 0];
 }
 
+// The sharp ring's unfilled orders: held, inside the ring, no mesh. Counted separately from
+// `dirty` because the interesting case is one without the other.
+function ringStuck() {
+  if (!store) return [0, 0];
+  let n = 0, q = 0;
+  for (const c of store.chunks.values()) {
+    if (!inDetailRing(c.cx, c.cz, 1)) continue;
+    const k = `${c.cx},${c.cz}`;
+    if (meshes.has(k)) continue;
+    n++; if (store.dirty.has(k)) q++;
+  }
+  return [n, q];
+}
+
 function atState(wx, wy, wz) {
   if (!store) return null;
   const c = store.get(Math.floor(wx / 16), Math.floor(wz / 16));
@@ -2894,6 +2930,10 @@ window.__world = {
       chunks: store ? store.loaded : 0, inflight: store ? store.inflight : -1,
       queued: store ? store.queue.length : -1, missing: store ? store.missing.size : -1,
       dirty: store ? store.dirty.size : -1, dist: rig.dist, dim: hud.dim.value,
+      // [held chunks inside the sharp ring with no mesh, how many of those are queued].
+      // `ringStuck[0] > 0 && ringStuck[1] === 0` is the failure, not a slow queue: work that
+      // nobody will ever ask for again.
+      ringStuck: ringStuck(),
       mesh: aggTotal, meshMs: +meshAvg.toFixed(2), meshMax: +meshMax.toFixed(2), meshed: meshN,
       // What the player actually waits for: request-accepted to mesh-landed, which includes queueing.
       meshWait: +meshWait.toFixed(2), workers: pool.length, workerReady, workerError, workerReadyMsgs, meshQueued: jobs.size,
@@ -3489,7 +3529,7 @@ function buildPanel() {
 
       { key: 'radius', label: 'close detail', min: 0, max: 24, step: 1, live: false,
         fmt: (v) => (v ? `${v * CH} m` : 'off'),
-        hint: 'The most terrain built block by block with real textures, around what you look at - a\nceiling, not a promise: zoom out and less of it is drawn, because far away those\ntriangles are smaller than a pixel. Bigger is prettier and slower. URL: ?radius',
+        hint: 'The most terrain built block by block with real textures, around what you look at - a\nceiling, not a promise: zoom out and less of it is drawn, because far away those\ntriangles are smaller than a pixel. Measured at a 257 m orbit: 5 chunks = 169 chunk meshes,\n2.2 M verts, 41 MB held; 8 = 361, 5.2 M, 68 MB; 16 = 1 081, 14 M, ~170 MB and 21 M verts on\nscreen. Bigger is prettier and slower. URL: ?radius',
         get: () => S.radius, set: (v) => { S.radius = Math.max(0, v | 0); applySettings('radius'); } },
 
       { key: 'farsharp', label: 'far detail', min: 1, max: 6, step: 0.25,
