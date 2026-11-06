@@ -7,7 +7,7 @@ import { meshChunk, tintOf, FACE_SHADE, NEIGH_COVERED } from './mesher.js';
 import { ChunkStore } from './store.js';
 import { ShellStore } from './shell-store.js';
 import { LodStore } from './lod-store.js';
-import { pickLodCell, LOD_CELL } from '../../shared/lod-format.mjs';
+import { pickLodRung, LOD_CELL } from '../../shared/lod-format.mjs';
 import { openOverview } from './payload.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
 import { mountPanel } from './ui.js';
@@ -1874,6 +1874,7 @@ const lodActive = () => !!lodStore && !!S.lod && !!S.shellOn && !lodPolicyBad;
 
 function makeLodStore(dim) {
 
+  lodSticky.clear();          // rungs belong to a dimension, and to the tiles this session asked for
   lodStore = new LodStore(dim, { policy: lodPolicy(), max: S.lodMax, log: (m) => { lodError = m; } });
 
   return lodStore;
@@ -1954,17 +1955,24 @@ function lodRequestRect() {
  *  but only ~13x in vertices (a flat field merges into fewer quads when the columns are wide), so
  *  guessing from columns over-bills the fine rung and starves it. */
 const lodCost = new Map();                       // cell -> {n, v}
+// What the rung chooser decided per tile on the last pass, for probes only: the flip this records
+// is the flip the eye sees, so print it instead of inferring it from rung totals.
+const lodPicks = [];
+// Last rung asked for at each region slot. Only ever read as `held` by pickLodCell, so a tile that
+// has not arrived yet still gets a sticky answer instead of whatever the pass happened to afford.
+const lodSticky = new Map();
 const lodAvg = (cell) => { const s = lodCost.get(cell); return s && s.n ? s.v / s.n : 0; };
 const lodCostFor = (cell) => lodAvg(cell)
   || (lodAvg(LOD_CELL) || 7300) * (LOD_CELL / cell) ** 1.15;   // fallback: 2.4 M verts / 327 tiles
 
+let lodPasses = 0, lodPassRuns = 0, lodSkipRect = 0;
+let passCand = 0, passZero = 0, passPick = 0;
 function requestLod() {
-
+  lodPasses++;
   if (!lodActive() || lodIndexPending) return;
-
+  lodPassRuns++;
   const r = lodRequestRect();
-
-  if (!r) return;
+  if (!r) { lodSkipRect++; return; }
 
   const [tcx, tcz] = centerChunk();
 
@@ -1973,32 +1981,37 @@ function requestLod() {
   // the budget is what stops a world-sized view from taking the fine rung everywhere, which would be
   // 13x the geometry of the coarse one for pixels the eye cannot tell apart.
   const eye = camera.position;
-  let spent = lodVerts;
+  // Bill the decision set, not the decision set plus what is already on hand. Seeding with the held total
+  // double-counted every held tile, so the vertex budget appeared spent about half-way through the
+  // pass - and the seed moves every time a tile streams in or retires. That slid the point where the
+  // budget starts refusing the fine rung back and forth between passes, and a handful of tiles near
+  // it swapped rungs (fetch the fine one, retire the coarse one, ask for the coarse one again) while
+  // the camera stood still: the flash reported at far detail 6.
+  let spent = 0;
+  lodPicks.length = 0;
+  passCand = 0; passZero = 0; passPick = 0;
   lodStore.request(r[0], r[1], r[2], r[3], [tcx >> 5, tcz >> 5], (rx, rz, held, have) => {
-    if (!have.length) return 0;
-    // The quality slider is a clamp on the coarsest column the far view may use, applied to the baked
-    // ladder as well as the live grid. Ask for finer than the baked rungs and the answer is "no baked
-    // tile here", which hands the ground to the live far grid rather than quietly serving the coarse
-    // tile the slider just refused.
+    passCand++;
+    if (!have.length) { passZero++; return 0; }
     const bx = (rx * 32 + 16) * CH, bz = (rz * 32 + 16) * CH;
     const d = Math.max(64, Math.hypot(bx - eye.x, bz - eye.z));
-    // The quality slider is a demand for *shape*, and shape only matters where a column measures
-    // something on screen. So refuse a coarse rung only when its columns would come out bigger than
-    // `lodCellMaxPx` pixels: at a distance where a 16-block column is already sub-pixel, insisting on
-    // the fine rung buys no shape and bills the vertex budget anyway - measured at a 1.2 km view,
-    // forcing cell 4 for every tile drew 23.8 M verts and ran at 3 fps. And when the refused rungs are
-    // the only ones baked for that ground, take the coarse tile rather than nothing: a missing far tile
-    // is a hole in the world, not a quality setting (q=25 used to drop the baked layer to 0 tiles).
-    let avail = have;
-    if ((pxPerRad() / d) * have[have.length - 1] > S.lodCellMaxPx) {
-      const fine = have.filter((c) => c <= S.lodMaxCell);
-      if (fine.length) avail = fine;
-    }
-    const coarsest = avail[avail.length - 1];
-    if (S.lodCellPx <= 0) return coarsest;              // ?lodcellpx=0: one rung, the previous build
-    let want = pickLodCell(avail, pxPerRad() / d, S.lodCellPx, held, S.lodCellMaxPx);
-    if (want < coarsest && spent + lodCostFor(want) > S.lodVerts) want = coarsest;
-    spent += lodCostFor(want);
+    const px1 = pxPerRad() / d;
+    // A rung change costs a fetch, an upload and a dispose, and the answer for a given region slot only
+    // has to be good, not newly optimal: remember what was asked here last time and hand that to the
+    // chooser as `held`, so a slot whose tile has not arrived yet still gets a sticky answer. The clamp,
+    // the blob rule and the vertex budget live in pickLodRung, whose comment explains why the bill must
+    // not start from what happens to be on screen right now.
+    const pk = `${rx},${rz}`;
+    const rung = pickLodRung(have, px1, {
+      minPx: S.lodCellPx, maxPx: S.lodCellMaxPx, maxCell: S.lodMaxCell,
+      held: held || lodSticky.get(pk) || 0, spent, budget: S.lodVerts, costFor: lodCostFor,
+    });
+    const want = rung.cell;
+    spent = rung.spent;
+    lodSticky.set(pk, want);
+    if (lodSticky.size > 20000) lodSticky.clear();   // a world-sized sweep; keep the map to one screenful
+    if (lodPicks.length < 40) lodPicks.push({ rx, rz, px: +px1.toFixed(3), held, want, avail: have.join('/'), spent: spent | 0 });
+    passPick++;
     return want;
   });
   for (const t of lodStore.tiles.values()) {
@@ -2747,6 +2760,8 @@ window.__world = {
     clipOn: lodClipOn, clip: lodClipRect.map((v) => (v > 1e8 ? 'off' : v)), cov: lodCovPatches,
     covDetail: lodCovDetail,
     held: lodStore ? lodStore.tiles.size : 0, drawn: lodTiles, verts: lodVerts,
+    loaded: lodStore ? lodStore.loaded : 0, dropped: lodStore ? lodStore.dropped : 0, refused: lodStore ? lodStore.badTiles : 0,
+    passes: [lodPasses, lodPassRuns, lodSkipRect], passInfo: [passCand, passZero, passPick], picks: lodPicks.slice(0, 14),
     cells: lodStore ? lodStore.cells : [], cellPx: S.lodCellPx, cellMaxPx: S.lodCellMaxPx, budget: S.lodVerts,
     rung: lodStore ? Object.fromEntries(lodStore.cells.map((c) =>
       [c, [...lodStore.tiles.values()].filter((t) => t.cell === c).length])) : {},

@@ -201,7 +201,55 @@ export function pickLodCell(cells, pxPerBlock, minPx, held = 0, maxPx = minPx * 
   return want;
 }
 
-/** Where a rung's tiles live under a dimension's LOD directory. */
+/**
+ * The whole per-tile rung decision: the quality clamp, the pixel/blob rule, and the vertex budget.
+ *
+ * This lives next to `pickLodCell` rather than inline in the viewer because the bug it prevents is a
+ * dependency on *state*: the budget used to start from the vertices currently on screen, so the point
+ * where the budget began refusing a fine rung slid every time a tile streamed in or was retired. A
+ * handful of region slots near that point then swapped rungs every pass - fetch the fine tile, retire
+ * the coarse one, ask for the coarse one again - which is the "far LODs flash between high and low
+ * LOD" report at a still camera. So the caller passes in `spent` and gets the next `spent` back: the
+ * answer for a pass depends only on geometry, the rung ladder, and the order the tiles are asked in.
+ *
+ * @param {number[]} have   rungs the server actually has for this region slot
+ * @param {number} px       device pixels one block of ground measures at this tile's distance
+ * @param {object} o
+ * @param {number} o.minPx    how wide a baked column has to be to be worth a triangle (<=0: coarse only)
+ * @param {number} o.maxPx    how wide a coarse column may get before finer is worth going to get
+ * @param {number} o.maxCell  the finest rung the quality setting allows (the `?lodquality` clamp)
+ * @param {number} [o.held]   rung already asked/held for this slot, 0 if none
+ * @param {number} [o.spent]  vertices billed by nearer tiles this pass
+ * @param {number} [o.budget] vertex budget for the pass
+ * @param {(cell:number)=>number} [o.costFor] vertices a tile of one rung costs
+ * @returns {{cell: number, spent: number}} the rung to ask for, and the bill including it
+ */
+export function pickLodRung(have, px, o = {}) {
+  const spent = +o.spent || 0;
+  const list = (have ?? []).filter((c) => c >= 1).sort((a, b) => a - b);
+  if (!list.length) return { cell: 0, spent };
+  const maxPx = o.maxPx ?? 8, minPx = o.minPx ?? 3;
+  // The quality slider is a demand for *shape*, and shape only matters where a column measures
+  // something on screen: refuse a coarse rung only once its columns would come out bigger than
+  // `maxPx`. Where a coarse column is already sub-pixel, insisting on a finer rung buys no shape and
+  // bills the budget anyway. And if the refused rungs are the only ones baked there, take the coarse
+  // tile anyway - a missing far tile is a hole in the world, not a quality setting.
+  let avail = list;
+  if (px * list[list.length - 1] > maxPx) {
+    const fine = list.filter((c) => c <= (o.maxCell ?? 16));
+    if (fine.length) avail = fine;
+  }
+  const coarsest = avail[avail.length - 1];
+  if (!(minPx > 0)) return { cell: coarsest, spent };     // one rung for every tile
+  const cost = o.costFor ?? (() => 0);
+  let cell = pickLodCell(avail, px, minPx, o.held ?? 0, maxPx);
+  if (cell < coarsest && spent + cost(cell) > (o.budget ?? Infinity)) cell = coarsest;
+  return { cell, spent: spent + cost(cell) };
+}
+
+/**
+ * Where a rung's tiles live under a dimension's LOD directory.
+ */
 export const lodCellDir = (cell) => `c${cell}`;
 
 /**
