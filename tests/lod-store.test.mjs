@@ -197,3 +197,17 @@ test('a terrain-rule change does drop them, because the ground itself disagrees'
   assert.equal(st.tiles.size, 0);
   assert.equal(st.mismatch, 'groundFar');
 });
+
+test('the index says what each tile costs, before it is ever fetched', () => {
+  // The rung chooser needs this: pricing a tile from the mean of the tiles already held makes the
+  // decision change the ruler it measures with, which is how a tile ends up cycling between rungs.
+  // The server reads the number out of each baked file's header, so it describes the tile, not the view.
+  const st = new LodStore('minecraft:overworld', { policy: POLICY, fetchFn: async () => ({ ok: false, status: 404 }) });
+  st.setIndex([[16, 3, 4, 6100], [4, 3, 4, 152000], [8, 9, 9]]);
+  assert.equal(st.costOf(4, 3, 4), 152000, "the tile's own vertex count");
+  assert.equal(st.costOf(16, 3, 4), 6100, 'and the same for a coarser rung at the same slot');
+  assert.equal(st.costOf(8, 9, 9), 0, 'an index entry without a cost is 0, not a guess');
+  assert.equal(st.costOf(4, 99, 99), 0, 'a slot with nothing baked there is 0');
+  st.setIndex([[16, 3, 4, 1]]);
+  assert.equal(st.costOf(4, 3, 4), 0, 'a new index replaces the old costs');
+});

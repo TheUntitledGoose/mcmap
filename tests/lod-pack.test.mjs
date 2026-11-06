@@ -161,7 +161,8 @@ test('a served tile inflates to an image the browser can open', () => {
     assert.equal(t.verts, 2);
     assert.deepEqual([...t.pos], [...pos]);
     assert.deepEqual([...t.col], [...col]);
-    assert.deepEqual(listLodTiles(dir), [{ cell: LOD_CELL, rx: 2, rz: -9 }], 'one file, and it says which rung');
+    assert.deepEqual(listLodTiles(dir), [{ cell: LOD_CELL, rx: 2, rz: -9, verts: 2 }],
+      'one file, and it says which rung and what it costs');
     assert.equal(loadLodTile(lodPath(dir, LOD_CELL, 0, 0), 1234), null, 'absent is absent, not an error');
     assert.throws(() => loadLodTile(f, 999), /stamp/);
   } finally {

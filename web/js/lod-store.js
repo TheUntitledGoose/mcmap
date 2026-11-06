@@ -51,6 +51,7 @@ export class LodStore {
     this.badTiles = 0;                            // tiles refused (bad stamp/policy/truncated)
     this.index = null;                            // region slots that have tiles, or null = probe the range
     this.indexList = [];                          // [{cell,rx,rz}] in the same order, for a cheap scan
+    this.cost = new Map();                        // "cell,rx,rz" -> that tile's vertex count, from the index
     this.cells = [];                              // rungs this dimension has, finest first
     this.at = new Map();                          // "rx,rz" -> the rungs held there, finest first
     this.posCells = new Map();                    // "rx,rz" -> the rungs the server has there
@@ -95,14 +96,16 @@ export class LodStore {
   setIndex(list) {
     this.index = null;
     this.indexList = [];
+    this.cost.clear();
     this.cells = [];
     this.at.clear();
     this.posCells.clear();
     if (!list) { this.missing.clear(); this.wanted.clear(); return; }
     const seen = new Set();
     for (const e of list) {
-      const [cell, rx, rz] = e.length >= 3 ? e : [LOD_CELL, e[0], e[1]];
+      const [cell, rx, rz, verts] = e.length >= 3 ? e : [LOD_CELL, e[0], e[1]];
       this.indexList.push({ cell, rx, rz });
+      if (verts > 0) this.cost.set(key(cell, rx, rz), verts);   // the served index carries each tile's own cost
       seen.add(key(cell, rx, rz));
       const pk = posKey(rx, rz);
       const rung = this.posCells.get(pk) ?? [];
@@ -123,6 +126,15 @@ export class LodStore {
 
   /** Which rungs exist for one region slot. */
   cellsAt(rx, rz) { return this.posCells.get(posKey(rx, rz)) ?? []; }
+
+  /**
+   * What fetching and drawing this tile costs, in vertices, straight from the index the server built
+   * off the baked files. The viewer budgets this layer per tile; if the only number it had was the
+   * mean cost of the tiles it currently holds, then the decision changed the ruler it measured with:
+   * fine tiles arrive -> the mean rises -> the budget line moves in -> those tiles are released ->
+   * the mean falls -> they are asked for again. That loop is a flash, not a policy.
+   */
+  costOf(cell, rx, rz) { return this.cost.get(key(cell, rx, rz)) ?? 0; }
 
   /** The rung held for one region slot, 0 if none. */
   heldCell(rx, rz) {

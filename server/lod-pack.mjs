@@ -76,7 +76,29 @@ export function listPackRegions(dir) {
   return out.sort((a, b) => a.rx - b.rx || a.rz - b.rz);
 }
 
-/** Every tile file in a dimension's LOD directory, as {cell,rx,rz}, coarsest rung first. */
+/**
+ * Vertex count from a tile's 24-byte header prefix, without inflating its body. The tile's own header
+ * keeps `verts` at offset 20 (offset 24 is repurposed as the deflated length), so the answer is exact
+ * and costs one small read.
+ *
+ * It is worth that read because the browser budgets the far layer per tile. When the only cost it had
+ * was "average verts of the tiles of that rung I happen to be holding", the number a decision was
+ * measured against was produced by that decision: fine tiles arrive, the average rises, the budget
+ * line slides inward, the tiles that just arrived are released, the average falls, they are asked for
+ * again. That is the flash the user saw - "they try to load the higher lods but the moment they finish,
+ * the lower lods immediately take over back".
+ */
+export function lodVertsOf(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const b = Buffer.alloc(24);
+    const n = fs.readSync(fd, b, 0, 24, 0);
+    return n >= 24 ? b.readUInt32LE(20) : 0;
+  } catch { return 0; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* gone */ } }
+}
+
+/** Every tile file in a dimension's LOD directory, as {cell,rx,rz,verts}, coarsest rung first. */
 export function listLodTiles(dir) {
   const out = [];
   for (const sub of listDirs(dir)) {
@@ -86,7 +108,10 @@ export function listLodTiles(dir) {
     try { names = fs.readdirSync(path.join(dir, sub)); } catch { continue; }
     for (const n of names) {
       const m = /^(-?\d+)_(-?\d+)\.bin$/.exec(n);
-      if (m) out.push({ cell, rx: +m[1], rz: +m[2] });
+      if (m) {
+        const file = path.join(dir, sub, n);
+        out.push({ cell, rx: +m[1], rz: +m[2], verts: lodVertsOf(file) });
+      }
     }
   }
   return out.sort((a, b) => b.cell - a.cell || a.rx - b.rx || a.rz - b.rz);

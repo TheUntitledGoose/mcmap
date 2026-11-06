@@ -2185,6 +2185,7 @@ const lodActive = () => !!lodStore && !!S.lod && !!S.shellOn && !lodPolicyBad;
 function makeLodStore(dim) {
 
   lodSticky.clear();          // rungs belong to a dimension, and to the tiles this session asked for
+  lodRelease = 0;             // so does the vertex budget
   lodStore = new LodStore(dim, { policy: lodPolicy(), max: S.lodMax, log: (m) => { lodError = m; } });
 
   return lodStore;
@@ -2261,19 +2262,40 @@ function lodRequestRect() {
 
 
 
-/** What a tile of one rung costs, from the tiles actually on hand. The rungs differ by 16x in columns
- *  but only ~13x in vertices (a flat field merges into fewer quads when the columns are wide), so
- *  guessing from columns over-bills the fine rung and starves it. */
-const lodCost = new Map();                       // cell -> {n, v}
+/** What a **single** tile costs, in vertices. The server's /lodindex carries this per tile, read out of
+ *  the baked file's own header, and the rung decision has to use that and not an average: an average
+ *  over the held tiles is computed from the tiles the decision put there, so the decision moves the
+ *  ruler it measures with. Measured (build/q_lodflip.js): 89 rung flips while the camera stood still,
+ *  123 at a closer view - each one a fetch, an upload, a dispose and ground that changed shape.
+ *
+ *  lodCost is the fallback for tiles the index does not describe (a blind request before the index
+ *  arrived). The rungs differ 16x in columns but only ~13x in vertices, because a flat field merges
+ *  into fewer quads when the columns are wide - so guessing from columns over-bills the fine rung. */
+const lodCost = new Map();                       // cell -> {n, v}, fallback only
 // What the rung chooser decided per tile on the last pass, for probes only: the flip this records
 // is the flip the eye sees, so print it instead of inferring it from rung totals.
 const lodPicks = [];
 // Last rung asked for at each region slot. Only ever read as `held` by pickLodCell, so a tile that
 // has not arrived yet still gets a sticky answer instead of whatever the pass happened to afford.
 const lodSticky = new Map();
+// Did the rung asked for one region slot change between two passes while the camera stood
+// still? That is the flash: a fetch, an upload, a dispose, and the ground changing shape.
+// Logged with the numbers the decision saw, because "it flashed" cannot be fixed from a
+// rung histogram - only from which slot changed, when, and against which bill.
+const lodLastAsk = new Map();
+let lodFlips = 0;
+const lodFlipLog = [];
 const lodAvg = (cell) => { const s = lodCost.get(cell); return s && s.n ? s.v / s.n : 0; };
-const lodCostFor = (cell) => lodAvg(cell)
-  || (lodAvg(LOD_CELL) || 7300) * (LOD_CELL / cell) ** 1.15;   // fallback: 2.4 M verts / 327 tiles
+const lodCostFor = (cell, rx, rz) => (cell >= 1 && lodStore ? lodStore.costOf(cell, rx, rz) : 0)
+  || lodAvg(cell)
+  || (lodAvg(LOD_CELL) || 7300) * (LOD_CELL / cell) ** 1.15;   // last fallback: 2.4 M verts / 327 tiles
+
+// Is the baked layer as a whole over its vertex budget? One latch for the pass, not a per-tile
+// argument, and it reads what is **drawn** rather than what this pass is billing. Deciding release per
+// tile from this pass's arithmetic made the answer depend on which tiles had happened to load, so a
+// fine tile that finished loading was the very thing that pushed the running bill past the line and
+// got it released, and then the bill fell back and it was fetched again.
+let lodRelease = 0;
 
 let lodPasses = 0, lodPassRuns = 0, lodSkipRect = 0;
 let passCand = 0, passZero = 0, passPick = 0;
@@ -2283,6 +2305,13 @@ function requestLod() {
   lodPassRuns++;
   const r = lodRequestRect();
   if (!r) { lodSkipRect++; return; }
+
+  // Enter release above 1.5x the budget, leave it below 1.2x: with a single line, a layer sitting
+  // exactly on the budget would toggle every pass.
+  if (S.lodVerts > 0) {
+    if (lodVerts > S.lodVerts * 1.5) lodRelease = 1;
+    else if (lodVerts < S.lodVerts * 1.2) lodRelease = 0;
+  }
 
   const [tcx, tcz] = centerChunk();
 
@@ -2316,12 +2345,21 @@ function requestLod() {
     // the blob rule and the vertex budget live in pickLodRung, whose comment explains why the bill must
     // not start from what happens to be on screen right now.
     const pk = `${rx},${rz}`;
+    const prevAsk = lodLastAsk.get(pk) ?? 0;
     const rung = pickLodRung(have, px1, {
       minPx: S.lodCellPx, maxPx: S.lodCellMaxPx, maxCell: S.lodMaxCell,
       held: held || lodSticky.get(pk) || 0, spent, budget: S.lodVerts, costFor: lodCostFor,
+      rx, rz, release: lodRelease,
     });
     const want = rung.cell;
     spent = rung.spent;
+    if (prevAsk && want && prevAsk !== want) {
+      lodFlips++;
+      if (lodFlipLog.length < 400) lodFlipLog.push({ rx, rz, from: prevAsk, to: want,
+        px: +px1.toFixed(3), spent: spent | 0, budget: S.lodVerts | 0, held: held || 0,
+        rel: lodRelease, cost: lodStore ? lodStore.costOf(want, rx, rz) | 0 : 0 });
+    }
+    if (want) lodLastAsk.set(pk, want);
     lodSticky.set(pk, want);
     if (lodSticky.size > 20000) lodSticky.clear();   // a world-sized sweep; keep the map to one screenful
     if (lodPicks.length < 40) lodPicks.push({ rx, rz, px: +px1.toFixed(3), held, want, avail: have.join('/'), spent: spent | 0 });
@@ -3121,6 +3159,11 @@ window.__world = {
     held: lodStore ? lodStore.tiles.size : 0, drawn: lodTiles, verts: lodVerts,
     loaded: lodStore ? lodStore.loaded : 0, dropped: lodStore ? lodStore.dropped : 0, refused: lodStore ? lodStore.badTiles : 0,
     passes: [lodPasses, lodPassRuns, lodSkipRect], passInfo: [passCand, passZero, passPick], picks: lodPicks.slice(0, 14),
+    flips: lodFlips, flipLog: lodFlipLog.slice(-10), release: lodRelease,
+    // What the rung chooser is asking for right now, per rung. Held/drawn say what is on screen; these
+    // say what the next download will be - and a gap between the two that keeps moving is the flash.
+    ask: (() => { const o = {}; for (const c of lodSticky.values()) o[c] = (o[c] || 0) + 1; return o; })(),
+    costFromIndex: lodStore ? lodStore.cost.size : 0,
     cells: lodStore ? lodStore.cells : [], cellPx: S.lodCellPx, cellMaxPx: S.lodCellMaxPx, budget: S.lodVerts,
     rung: lodStore ? Object.fromEntries(lodStore.cells.map((c) =>
       [c, [...lodStore.tiles.values()].filter((t) => t.cell === c).length])) : {},

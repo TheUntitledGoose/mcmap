@@ -219,12 +219,20 @@ export function pickLodCell(cells, pxPerBlock, minPx, held = 0, maxPx = minPx * 
  * @param {number} o.maxPx    how wide a coarse column may get before finer is worth going to get
  * @param {number} o.maxCell  the finest rung the quality setting allows (the `?lodquality` clamp)
  * @param {number} [o.held]   rung already asked/held for this slot, 0 if none
+ * @param {number} [o.rx]     which region slot this is, handed back to `costFor`
+ * @param {number} [o.rz]      (same)
+ * @param {number} [o.release] the layer as a whole is over the release margin, so a fine rung already
+ *   on screen is no longer exempt from the budget - see the note in the body
  * @param {number} [o.spent]  vertices billed by nearer tiles this pass
  * @param {number} [o.budget] vertex budget for the pass
  * @param {number} [o.hysteresis] how far past the budget a fine rung already on screen has to go
  *   before it is released (default 1.25); the budget is one line for taking a rung and a looser one
  *   for dropping one, because dropping one costs a re-fetch the next time the view comes back
- * @param {(cell:number)=>number} [o.costFor] vertices a tile of one rung costs
+ * @param {(cell:number, rx:number, rz:number)=>number} [o.costFor] what **that tile** costs, in
+ *   vertices. Pass the tile's own number (the server index carries it), not a mean over the tiles that
+ *   happen to be held: a cost drawn from the held set is a second feedback loop, and a feedback loop on
+ *   the release rule makes a tile oscillate between rungs, which is the far world flickering between
+ *   LODs. Measured with build/q_lodflip.js.
  * @returns {{cell: number, spent: number}} the rung to ask for, and the bill including it
  */
 export function pickLodRung(have, px, o = {}) {
@@ -245,20 +253,30 @@ export function pickLodRung(have, px, o = {}) {
   const coarsest = avail[avail.length - 1];
   if (!(minPx > 0)) return { cell: coarsest, spent };     // one rung for every tile
   const cost = o.costFor ?? (() => 0);
-  let cell = pickLodCell(avail, px, minPx, o.held ?? 0, maxPx);
+  const held = +o.held || 0;
+  const costOf = (cell) => (cell >= 1 ? cost(cell, o.rx, o.rz) : 0);
+  let cell = pickLodCell(avail, px, minPx, held, maxPx);
   const budget = o.budget ?? Infinity;
-  if (cell < coarsest && spent + cost(cell) > budget) {
-    // Releasing a fine rung that is already on screen is not free: fetch, decode, upload, dispose.
-    // And the cost-per-tile this test uses is an average over the tiles currently held, so the answer
-    // changes the very number it is measured against. Measured with build/q_lodrefill.js after a
-    // 1030-block pan: five region slots ping-ponged cell 8 <-> cell 16 for the whole 8 s trace
-    // (loaded and dropped both climbing ~10 per second, `held` pinned at 327, `gaps` stuck at 5 and
-    // never closing). So the budget has two lines: a fine rung you do not already have has to fit
-    // under it, and one you already have is only let go of once the bill passes it by the margin.
-    const keep = (o.held ?? 0) >= 1 && o.held < coarsest && avail.includes(o.held) ? o.held : 0;
-    cell = keep && spent + cost(keep) <= budget * (o.hysteresis ?? 1.25) ? keep : coarsest;
+  if (cell < coarsest && spent + costOf(cell) > budget) {
+    // Two different acts, so two lines.
+    //
+    // Buying a finer rung than the coarsest has to fit the budget: that is the download, the decode,
+    // the upload and the triangles. It does not fit, buy the coarse tile instead.
+    //
+    // Releasing a fine rung that is *already on screen* is not the same decision. It saves no fetch (it
+    // costs one, the next time the view comes back) and it repaints ground the eye is already looking
+    // at. So it happens only when the layer as a whole is over budget by a margin, which the caller
+    // reports in `release`, measured on what is actually drawn rather than on this pass's arithmetic.
+    // Deciding it per tile from a cost that itself came from the held tiles is a feedback loop, and a
+    // feedback loop on a release rule is a tile that oscillates between rungs: ask fine, receive fine,
+    // cost estimate rises, release, estimate falls, ask fine again. Measured with
+    // build/q_lodrefill.js (five slots ping-ponging cell 8 <-> 16 for a whole 8 s trace) and
+    // build/q_lodflip.js (89-123 rung flips while the camera stood still).
+    const keep = held >= 1 && held < coarsest && avail.includes(held) ? held : 0;
+    if (keep && (!o.release || spent + costOf(keep) <= budget * (o.hysteresis ?? 1.25))) cell = keep;
+    else cell = coarsest;
   }
-  return { cell, spent: spent + cost(cell) };
+  return { cell, spent: spent + costOf(cell) };
 }
 
 /**

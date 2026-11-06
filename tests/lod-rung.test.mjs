@@ -95,7 +95,10 @@ test('the budget takes a fine rung at its line but only releases one past a marg
     'nothing asked for yet and the bill would cross: take the coarse rung');
   assert.equal(pickLodRung(RUNGS, 0.5, o(190000, 8)).cell, 8,
     'cell 8 already asked for: a 6 % overrun is not worth a fetch, an upload and a dispose');
-  assert.equal(pickLodRung(RUNGS, 0.5, o(260000, 8)).cell, 16, 'a real overrun does release it');
+  assert.equal(pickLodRung(RUNGS, 0.5, o(260000, 8)).cell, 8,
+    'a big pass bill alone does not throw away a tile the eye is using');
+  assert.equal(pickLodRung(RUNGS, 0.5, { ...o(260000, 8), release: 1 }).cell, 16,
+    'the layer over its release margin does release it');
   // Twenty passes with the per-tile estimate wobbling the way a changing held mix makes it wobble.
   const seen = new Set();
   let held = 8;
@@ -104,4 +107,25 @@ test('the budget takes a fine rung at its line but only releases one past a marg
     seen.add(r.cell); held = r.cell;
   }
   assert.equal(seen.size, 1, `one answer for 20 passes, saw ${[...seen].join('/')}`);
+});
+
+test('costFor is told which tile it is pricing', () => {
+  // A mean over the held tiles cannot be per slot, and a per-slot number is what breaks the loop: the
+  // cost a decision is measured against must not come out of the tiles that decision put on screen.
+  const seen = [];
+  pickLodRung([16], 0.9, { minPx: 3, maxPx: 8, rx: -31, rz: 17, spent: 0, budget: 9e6,
+    costFor: (cell, rx, rz) => { seen.push([cell, rx, rz]); return 10; } });
+  assert.deepEqual(seen, [[16, -31, 17]]);
+});
+
+test('a fine rung already on screen is released by the layer, not by its own pass bill', () => {
+  const px = 0.6;                                   // 16-wide columns are 9.6 px: a blob, so finer is wanted
+  const o = { minPx: 3, maxPx: 8, spent: 11.1e6, budget: 9e6,
+    costFor: (c) => (c === 8 ? 2e5 : 2e4) };
+  // Over the budget line, but nobody pulled the release latch: keep what the eye is looking at.
+  assert.equal(pickLodRung([16, 8, 4], px, { ...o, held: 8, release: 0 }).cell, 8);
+  // Latch pulled, and the pass is far past even the margin: now it goes.
+  assert.equal(pickLodRung([16, 8, 4], px, { ...o, held: 8, release: 1 }).cell, 16);
+  // A fine rung that was never fetched is still refused at the plain budget line.
+  assert.equal(pickLodRung([16, 8, 4], px, { ...o, held: 0, release: 0 }).cell, 16);
 });

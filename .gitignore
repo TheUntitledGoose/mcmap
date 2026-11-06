@@ -5,7 +5,7 @@ node_modules/
 build/*
 !build/q_*.js
 !build/q-*.js
-!build/*_parse.cjs
+!build/*_parse*.cjs
 !build/mk_*.mjs
 !build/spec_*.json
 !build/*.mjs

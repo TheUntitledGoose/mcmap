@@ -95,6 +95,7 @@ export class WorldService {
     // Baked coarse LOD tiles (server/bake-lod.mjs): the whole world pre-meshed at 16 blocks per
     // column, so the far view costs a file read instead of meshing on every pan and zoom.
     this.lodDir = opts.lodDir ?? null;
+    this._lodIdx = new Map();              // dimKey -> {sig, list}: the served /lodindex body, cheap to redo
     this.lods = new Map();               // "key|rx,rz" -> tile image bytes (null = confirmed absent)
     this.stamp = opts.stamp ?? null;
     // Payload files hold global state ids, so they are only meaningful next to the state table they
@@ -354,19 +355,32 @@ export class WorldService {
    *  slot box spends its first seconds on 1 400 empty requests - then does it again for every rung. */
   lodIndex(dimId) {
     if (!this.lodDir) return [];
+    const dim = this.resolve(dimId);
+    const dir = path.join(this.lodDir, dim.key);
+    // [cell, rx, rz, verts]. The vertex count is in the index because the viewer budgets this layer
+    // per tile, and the cost it uses must not come from the tiles it currently happens to hold - see
+    // lodVertsOf in server/lod-pack.mjs for the failure that caused.
+    //
+    // Cached: building it reads a 24-byte header out of every tile file (~1 500 opens). The signature
+    // is the mtime of the dimension folder and its rung folders, which is what changes when tiles are
+    // baked or deleted; a rebake rewrites files inside a folder, so the folder mtime moves too.
+    let sig;
     try {
-      const dim = this.resolve(dimId);
-      return listLodTiles(path.join(this.lodDir, dim.key)).map((t) => [t.cell, t.rx, t.rz]);
+      const subs = fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+      sig = [fs.statSync(dir).mtimeMs, ...subs.map((s) => fs.statSync(path.join(dir, s)).mtimeMs)].join('|');
     } catch { return []; }
+    const hit = this._lodIdx.get(dim.key);
+    if (hit && hit.sig === sig) return hit.list;
+    const list = listLodTiles(dir).map((t) => [t.cell, t.rx, t.rz, t.verts]);
+    this._lodIdx.set(dim.key, { sig, list });
+    return list;
   }
 
   /** Any baked tiles at all for a dimension - what lets the browser turn the layer on by default. */
   hasLod(dimId) {
     if (!this.lodDir) return false;
-    try {
-      const dim = this.resolve(dimId);
-      return listLodTiles(path.join(this.lodDir, dim.key)).length > 0;
-    } catch { return false; }
+    // Same walk as the index, so /meta's "is anything baked" must not pay for a second one.
+    return this.lodIndex(dimId).length > 0;
   }
 
   /**
