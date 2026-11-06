@@ -138,6 +138,47 @@ test('dirty set covers a chunk and its neighbours, and eviction marks the seam',
   }
 });
 
+test('dirty marks say who made them', async () => {
+  // A dirty mark is a mesh job of tens of milliseconds, so "why is this chunk being meshed again" has
+  // to be answerable: arrivals, evictions, a cost-adaptive ring and settings changes all mark, and
+  // only the first two are the store's doing.
+  stubFetch();
+  const marks = [];
+  const store = new ChunkStore('minecraft:overworld', {
+    tile: 4, maxChunks: 9, onDirty: (k, w) => marks.push(w),
+  });
+  store.request(0, 0, 1);
+  await drain(store);
+  assert.ok(marks.includes('arrive'), 'a chunk and its neighbours are marked as arrivals');
+  store.takeDirty(1000);
+  marks.length = 0;
+  store.request(4, 4, 1);
+  await drain(store);
+  assert.ok(marks.includes('evict'), 'walking away flags the seam as an eviction, not an arrival');
+});
+
+test('a dirty pick takes the near keys first, in one pass', async () => {
+  // The page drains the dirty set every frame while a camera moves, and which keys come out first
+  // matters: a far key taken before a near one meshes scenery nobody is looking at. The pick used to
+  // keep a small sorted array and re-sort it per candidate, and the page asked for exactly one key at a
+  // time, so a frame that processed 50 keys re-scanned a 1.4k-key set 50 times. Now: one pass, one sort.
+  stubFetch();
+  const store = new ChunkStore('minecraft:overworld', { tile: 4, maxChunks: 64 });
+  store.request(0, 0, 0);
+  await drain(store);                       // request() is what gives the pick a centre
+  store.takeDirty(1000);
+  // dirty is the queue itself: markDirty() is not public, and the page only ever reaches it through
+  // arrivals and evictions. Marking it directly here is how the pick gets a fixed, known set to sort.
+  for (const k of ['7,0', '-7,0', '0,6', '0,-6', '1,0', '0,1']) store.dirty.add(k);
+  const first = store.takeDirty(2);
+  assert.equal(first.length, 2, 'the limit is honoured');
+  assert.ok(first.includes('1,0') && first.includes('0,1'), `the two nearest come out first, got ${first}`);
+  const rest = store.takeDirty(Infinity);
+  assert.equal(rest.length, 4, 'everything else is still queued');
+  assert.ok(rest.includes('7,0') && rest.includes('-7,0') && rest.includes('0,6') && rest.includes('0,-6'));
+  assert.equal(store.dirty.size, 0, 'a pick removes exactly what it returns');
+});
+
 test('dirty set never holds a key for a chunk nobody has', async () => {
   // A stale key here is not just bookkeeping noise: the mesh loop takes one key per frame and stops
   // on the first refusal, so a set full of ghosts starves the chunks that do need meshing.

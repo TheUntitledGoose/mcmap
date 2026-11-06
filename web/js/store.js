@@ -38,6 +38,11 @@ export class ChunkStore {
     this.busy = 0;
     this.queue = [];
     this.dirty = new Set();
+    // Who marked a chunk dirty, for the page's benefit. A dirty mark is a mesh job waiting to happen
+    // (tens of ms), so "why is this chunk being meshed again" has to be answerable: an arrival marks
+    // four neighbours, an eviction marks five, a cost-adaptive ring marks a whole band, and only one
+    // of those three is work that actually changes the triangles.
+    this.onDirty = opts.onDirty ?? null;
     this.center = null;
     this.missing = new Set();              // confirmed-empty coordinates, so we stop asking
     this.listeners = [];
@@ -51,10 +56,15 @@ export class ChunkStore {
    * Only held neighbours: a key for a chunk nobody has would sit in the set until that chunk
    * arrives, and a chunk that is later evicted would leave its neighbours' keys behind forever.
    */
-  #touch(cx, cz) {
-    this.dirty.add(key(cx, cz));
+  #touch(cx, cz, why = 'arrive') {
+    const mark = (x, z) => {
+      const k = key(x, z);
+      if (!this.dirty.has(k)) { try { this.onDirty?.(k, why); } catch { /* diagnostics must not break loading */ } }
+      this.dirty.add(k);
+    };
+    mark(cx, cz);
     for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      if (this.chunks.has(key(cx + dx, cz + dz))) this.dirty.add(key(cx + dx, cz + dz));
+      if (this.chunks.has(key(cx + dx, cz + dz))) mark(cx + dx, cz + dz);
     }
   }
 
@@ -125,7 +135,7 @@ export class ChunkStore {
       if (this.chunks.has(k)) continue;
       this.chunks.set(k, c);
       this.bytesHeld += chunkBytes(c);
-      this.#touch(c.cx, c.cz);
+      this.#touch(c.cx, c.cz, 'arrive');
       added++;
     }
     // remember the holes so a stationary camera does not hammer the same empty tiles
@@ -148,7 +158,7 @@ export class ChunkStore {
       if (Math.abs(c.cx - cx) > limit || Math.abs(c.cz - cz) > limit) {
         this.chunks.delete(k);
         this.bytesHeld -= chunkBytes(c);
-        this.#touch(c.cx, c.cz);
+        this.#touch(c.cx, c.cz, 'evict');
       }
     }
     if (this.bytesHeld < 0) this.bytesHeld = 0;      // counters must never drift negative
@@ -205,15 +215,19 @@ export class ChunkStore {
       return out;
     }
     const [cx, cz] = this.center;
-    const best = [];                        // [distance, key], kept sorted, length <= limit
+    // One pass, one sort. This used to keep a small sorted array and re-sort it for every key it
+    // considered, and the page asked for exactly one key at a time: with 1.4k dirty keys a frame took
+    // ~50 of them and re-scanned the whole set 50 times (1.4k `split(',')` + two Number parses each).
+    // That bookkeeping is what the drag's `mesh` bucket was spending 14 ms a frame on - not meshing.
+    const near = [];
     for (const k of this.dirty) {
-      const [x, z] = k.split(',').map(Number);
-      const d = Math.max(Math.abs(x - cx), Math.abs(z - cz));
-      if (best.length < limit) { best.push([d, k]); best.sort((a, b) => a[0] - b[0]); }
-      else if (d < best[limit - 1][0]) { best[limit - 1] = [d, k]; best.sort((a, b) => a[0] - b[0]); }
+      const c = k.indexOf(',');
+      const d = Math.max(Math.abs(+k.slice(0, c) - cx), Math.abs(+k.slice(c + 1) - cz));
+      near.push([d, k]);
     }
+    near.sort((a, b) => a[0] - b[0]);
     const out = [];
-    for (const [, k] of best) { out.push(k); this.dirty.delete(k); }
+    for (let i = 0; i < limit && i < near.length; i++) { out.push(near[i][1]); this.dirty.delete(near[i][1]); }
     return out;
   }
 

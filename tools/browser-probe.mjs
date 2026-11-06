@@ -19,7 +19,7 @@ const flag = (name) => argv.includes(`--${name}`);
 // "http://...&lodclip=0"` silently loaded the *default* URL instead: every A/B in that run measured
 // the same page twice and reported a 1% difference as if it were a finding.
 const VALUED = ['url', 'out', 'wait', 'port', 'width', 'height', 'edge', 'profile', 'goto', 'orbit',
-  'eval', 'eval-file', 'shot', 'click', 'keys'];
+  'eval', 'eval-file', 'shot', 'click', 'keys', 'cpu'];
 const pos = [];
 for (let i = 0; i < argv.length; i++) {
   if (argv[i].startsWith('--')) { if (VALUED.includes(argv[i].slice(2))) i++; continue; }
@@ -34,12 +34,21 @@ const PORT = +arg('port', 9223);
 // --shot takes a size (480x270) or a path (build/x.png); one value, no silent fallbacks. A path used to
 // be swallowed as a size spec, which produced W=NaN, wrote to build/probe.png, and left every A/B diff
 // comparing files from an earlier run - numbers that looked like measurements.
-const SHOT = arg('shot', null);
-const SHOT_SIZE = SHOT && /^\d+x\d+$/.test(SHOT) ? SHOT : null;
-if (SHOT && !SHOT_SIZE && !path.extname(SHOT)) {
-  throw new Error(`--shot ${JSON.stringify(SHOT)} is neither WxH nor a file path - use --shot 900x500 --out build/x.png`);
+//
+// The other way the same trap came back: `--shot 900x506 --shot build/x.png` (the spelling the docs and
+// muscle memory use) has arg() take the *first*, so the named file was never written and every A/B in
+// the run compared an old build/probe.png against itself. So all --shot values are collected: exactly
+// one size and/or exactly one path, and anything else is an error rather than a silent default.
+const shots = [];
+for (let i = 0; i < argv.length; i++) if (argv[i] === '--shot') shots.push(argv[i + 1]);
+const sizes = shots.filter((s) => /^\d+x\d+$/.test(s ?? ''));
+const paths = shots.filter((s) => s && !/^\d+x\d+$/.test(s));
+if (shots.length > 2 || sizes.length > 1 || paths.length > 1) {
+  throw new Error(`--shot given ${JSON.stringify(shots)}: use --shot 900x500 --out build/x.png, or one --shot that is either`);
 }
-const OUT = path.resolve(arg('out') || (SHOT && !SHOT_SIZE ? SHOT : 'build/probe.png'));
+for (const s of paths) if (!path.extname(s)) throw new Error(`--shot ${JSON.stringify(s)} is neither WxH nor a file path - use --shot 900x500 --out build/x.png`);
+const SHOT_SIZE = sizes[0] ?? null;
+const OUT = path.resolve(arg('out') || paths[0] || 'build/probe.png');
 const W = +arg('width', SHOT_SIZE ? +SHOT_SIZE.split('x')[0] : 1280);
 const H = +arg('height', SHOT_SIZE ? +SHOT_SIZE.split('x')[1] : 800);
 if (!Number.isFinite(W) || !Number.isFinite(H) || W < 1 || H < 1) throw new Error(`bad screenshot size ${W}x${H}`);
@@ -172,6 +181,19 @@ for (let i = 0; i < argv.length; i++) {
   // Long page-side probes do not survive shell quoting; keep them in a file and paste them in.
   else if (argv[i] === '--eval-file') evals.push(fs.readFileSync(argv[++i], 'utf8'));
 }
+// --cpu build/cpu.json profiles the evals. The frame-cost buckets can say "meshing costs 14 ms a
+// frame" without saying what those 14 ms are; a CPU profile says exactly which function they are.
+const CPU = arg('cpu') ? path.resolve(arg('cpu')) : null;
+if (CPU) {
+  try {
+    await send('Profiler.enable');
+    // Default sampling is coarse enough that a 4 s drag yields a handful of samples and every
+    // percentage in the table is noise. 200 us gives a few thousand.
+    await send('Profiler.setSamplingInterval', { interval: 200 });
+    await send('Profiler.start');
+  }
+  catch (e) { console.log('probe: profiler unavailable -', e.message); }
+}
 for (const [n, expr] of evals.entries()) {
   // A file-sized eval echoed back is noise; name it and keep the result readable.
   const label = expr.length > 70 ? `eval #${n + 1} (${expr.length} chars)` : `eval ${expr}`;
@@ -180,6 +202,29 @@ for (const [n, expr] of evals.entries()) {
   // Settle after *every* eval, not just at the end: a camera eval only says "I want this view",
   // and the frame loop has to run before the next eval (or the screenshot) sees that view.
   if (flag('post')) await sleep(+arg('post'));
+}
+
+if (CPU) {
+  try {
+    const { profile } = await send('Profiler.stop');
+    fs.mkdirSync(path.dirname(CPU), { recursive: true });
+    fs.writeFileSync(CPU, JSON.stringify(profile));
+    const byName = new Map();
+    let total = 0;
+    for (const nd of profile.nodes) {
+      const h = nd.hitCount || 0;
+      if (!h) continue;
+      total += h;
+      const f = nd.callFrame || {};
+      const key = `${f.functionName || '(anon)'} @${(f.url || '(native)').split('/').pop()}:${f.lineNumber ?? '?'}`;
+      byName.set(key, (byName.get(key) || 0) + h);
+    }
+    // CDP timestamps are microseconds.
+    console.log(`cpu: ${total} samples over ${((profile.endTime - profile.startTime) / 1000).toFixed(0)} ms wall, ${CPU}`);
+    for (const [k, v] of [...byName.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20)) {
+      console.log(`  ${(100 * v / total).toFixed(1).padStart(5)}%  ${v}  ${k}`);
+    }
+  } catch (e) { console.log('probe: profiler stop failed -', e.message); }
 }
 
 try {

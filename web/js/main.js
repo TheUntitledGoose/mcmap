@@ -10,7 +10,8 @@ import { LodStore } from './lod-store.js';
 import { pickLodRung, LOD_CELL } from '../../shared/lod-format.mjs';
 import { openOverview } from './payload.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
-import { PATCH_REACH, packPatchFrames, packPatchPolicy } from './shell-batch.js';
+import { PATCH_REACH, packPatchFrames, packPatchPolicy, patchFrameGetter, patchPolicy } from './shell-batch.js';
+import { meshKeyTool } from './mesh-key.js';
 import { mountPanel } from './ui.js';
 import { HEIGHT_BIAS } from '../../shared/chunk-format.mjs';
 import { layerAlpha, stackOver, over, dmax } from '../../shared/composite.mjs';
@@ -71,7 +72,7 @@ const S = {
   // How long a block of far terrain waits after new ground arrives under it before it is drawn again.
   shellQuiesce: Math.max(0, num('quiesce', 250)),
   workers: num('workers', -1),
-  patchWorkers: Math.max(0, Math.min(6, num('patchworkers', 2))),
+  patchWorkers: Math.max(0, Math.min(6, num('patchworkers', 6))),
   mipmax: num('mipmax', 4),
   ao: !params.has('noao'),
   aoMin: num('ao', 0.42),
@@ -105,6 +106,10 @@ const S = {
   // read as dug-out. `buried`/`buriedSky` keeps the deep dark instead; this takes the caves.
   // ?surface=1 asks for the skin. URL: ?surface=
   surface: params.has('nosurface') ? 0 : (num('surface', 0) ? 1 : 0),
+  // 9.6's two rules together, for A/B: skip a mesh whose payload and known border already answer it,
+  // and hold a chunk while a neighbour is still in flight. 0 = mesh on every dirty mark (?meshkey=0).
+  meshKey: num('meshkey', 1) ? 1 : 0,
+  bytesKeep: num('byteskeep', 1) ? 1 : 0,          // keep parked triangles across a payload eviction
   // A face pointing at a chunk whose voxels are not held, but whose ground the heightmap skin paints,
   // is behind that skin. Drawing it is the wall of dirt a hole grows when a neighbour never arrived.
   // ?cullcovered=0 puts the walls back to compare.
@@ -447,7 +452,7 @@ function stepKeys(dt) {
 let assets = null, atlasTex = null, atlasPixels = null, materials = null, shellMat = null,
   shellTexMat = null,
   store = null, shellStore = null, mipCap = null;
-const meshes = new Map();   // "cx,cz" -> [{ pass, mesh }]
+const meshes = new Map();   // "cx,cz" -> {list, stats, mk}
 const stateOf = (id) => (id === 0 || id > assets.states.length ? -1 : id - 1);
 let assetSource = null;     // {json, geo} as fetched, for handing to the mesh workers
 
@@ -638,11 +643,72 @@ function buildChunkGeometries(chunk) {
  */
 const meshBytes = new Map();          // "cx,cz" -> { passes, stats, bytes, sig }, oldest first
 let meshBytesTotal = 0, cachedInstalls = 0, meshBytesDropped = 0, lastBytesSweep = 0;
+let meshBytesGhost = 0;                // parked bytes whose voxels the store has let go
 
 const detailSig = () => `A${S.ao ? 1 : 0}/${S.aoMin}L${S.light ? 1 : 0}/${S.darkFloor}/${S.darkGamma}` +
   `/${S.skyScale}D${S.caves ? -1 : S.darkcut}B${S.caves ? 0 : S.buried}S${S.buriedSky}U${S.caves ? 0 : S.surface}` +
   `C${S.shellOn && S.cullCovered ? 1 : 0}` +
   `G${dimGen}`;
+
+// ---- one mesh per (payload + the border the mesher reads) ----------------------------------------
+// A chunk arrives, is meshed, and then every neighbour that arrives marks it dirty again: in a
+// streaming wave one chunk answers to five mesh jobs (itself plus four neighbours) to build five
+// identical meshes, and a parked camera paid for 33 of them in five idle seconds. What can legitimately
+// change a chunk's triangles is exactly: its own payload, one of the eight neighbours appearing,
+// disappearing or being re-fetched, whether the far skin owns a neighbour's ground, or a mesh setting.
+// So a mesh carries a key made of those, and a dirty mark whose key already matches installs nothing.
+//
+// A payload held by the store is immutable - a re-fetch replaces the object - so object identity is a
+// sound payload stamp. An unheld neighbour has no stamp, which is why "unknown" can never read as air
+// here: the moment it is known the key changes and the wall is built against real voxels.
+const meshDone = new Map();                 // "cx,cz" -> key of the mesh currently installed
+const PARK_THEN_BUILD_MS = 10000;           // a re-cut this soon after an install means the install was wasted
+const meshUnchanged = { count: 0 };         // dirty marks that needed no work at all
+const meshUnsettled = { count: 0 };         // meshes actually built against a border with a hole in it
+
+// The key itself lives in web/js/mesh-key.js, which is DOM-free and three-free so a test can hold it:
+// same payload and same known border must not re-mesh, and a neighbour that turns up must.
+const meshKeys = meshKeyTool(
+  (cx, cz) => (store ? store.get(cx, cz) : null),
+  (cx, cz) => !!(store && store.missing.has(`${cx},${cz}`)));
+const stampOf = meshKeys.stampOf;
+
+const coveredKey = (cx, cz) => {
+  const c = coveredNeighbours(cx, cz);
+  return c ? c.map(([x, z]) => x + ':' + z).join(',') : '';
+};
+
+const meshKeyFor = (cx, cz) => meshKeys.key(cx, cz, detailSig(), coveredKey(cx, cz));
+const settledNeighbours = (cx, cz) => meshKeys.settled(cx, cz);
+
+/** Why a key is dirty and how long it has waited, so "skip the work" never means "never do it". */
+const dirtyTag = new Map();
+
+const dirtyWhy = new Map();
+const meshWhy = new Map();
+function tagDirty(k, why) {
+  if (!dirtyTag.has(k)) dirtyWhy.set(why, (dirtyWhy.get(why) || 0) + 1);
+  dirtyTag.set(k, why);
+}
+function markChunk(k, why, keepTag = false) {
+  if (!store) return;
+  if (!keepTag || !dirtyTag.has(k)) tagDirty(k, why);
+  store.dirty.add(k);
+}
+let meshBuilds = 0;                         // mesher runs actually started, worker or inline
+function countMesh(k) {
+  meshBuilds++;
+  const t0 = parkedAt.get(k);
+  if (t0 !== undefined) { parkedAt.delete(k); if (performance.now() - t0 <= PARK_THEN_BUILD_MS) parkThenBuild++; }
+  const why = dirtyTag.get(k);
+  if (why) meshWhy.set(why, (meshWhy.get(why) || 0) + 1);
+  dirtyTag.delete(k);
+}
+
+// Was a parked set installed and then thrown away by a real rebuild? Parking that only buys a few
+// frames of use is not parking: `reused` alone counts the install, this counts the waste after it.
+const parkedAt = new Map();                 // key -> ms, when its bytes last came back
+let parkThenBuild = 0;
 
 function dropBytes(key) {
   const e = meshBytes.get(key);
@@ -686,30 +752,44 @@ function stashMeshBytes(key, entry) {
   }
   if (!passes.length) return;
   dropBytes(key);
-  meshBytes.set(key, { passes, stats: entry.stats, bytes, sig: detailSig() });
+  meshBytes.set(key, { passes, stats: entry.stats, bytes, mk: entry.mk, sig: detailSig() });
   meshBytesTotal += bytes;
   trimMeshBytes();
 }
 
 /** Parked bytes for a chunk the store itself dropped can never be installed again: they are RAM
- * for a voxel payload that no longer exists. The byte cap alone would keep them until something
- * else pushed them out, which is how a long session slowly accumulates a second, unreachable copy
- * of every chunk it ever visited. */
+ * for a voxel payload that no longer exists.
+ *
+ * That held when the key stamped a payload by *object identity*, and it cost the round trip: a
+ * 400-block pan at a 1.2 km pull-back evicts every chunk it leaves behind, this sweep deleted their
+ * parked triangles with them, and coming back rebuilt 66-83 chunks from scratch with `reused 0` in
+ * every run. The fingerprint now carried by `openChunk` changes the premise: parked bytes say which
+ * voxels and which border they were cut against, so they stay useful until either the ground under
+ * them changes (a different fingerprint at install time) or the byte cap wants the room. The cap is
+ * still the only bound, and it evicts farthest-from-camera first. ?byteskeep=0 restores the old
+ * delete-on-eviction rule for an A/B. */
 function sweepMeshBytes() {
   if (!store) return;
-  for (const k of [...meshBytes.keys()]) {
-    if (store.has(...k.split(',').map(Number))) continue;
-    meshBytesDropped++;
-    dropBytes(k);
+  if (!S.bytesKeep) {
+    for (const k of [...meshBytes.keys()]) {
+      if (store.has(...k.split(',').map(Number))) continue;
+      meshBytesDropped++;
+      dropBytes(k);
+    }
   }
   trimMeshBytes();
+  meshBytesGhost = 0;
+  for (const k of meshBytes.keys()) if (!store.has(...k.split(',').map(Number))) meshBytesGhost++;
 }
 
 /** Rebuild a chunk from parked bytes. False means nothing usable was parked: mesh it normally. */
-function installCached(cx, cz) {
+function installCached(cx, cz, mk) {
   const key = `${cx},${cz}`, e = meshBytes.get(key);
   if (!e) return false;
-  if (e.sig !== detailSig()) { dropBytes(key); return false; }
+  // The key, not just the settings: bytes parked while a neighbour was still unknown must not be
+  // installed once that neighbour is here, or the wall against its ground is missing. With ?meshkey=0
+  // the old settings-only rule is back, so an A/B of 9.6 compares behaviour, not the byte cache.
+  if (S.meshKey ? e.mk !== mk : e.sig !== detailSig()) { dropBytes(key); return false; }
   dropBytes(key);
   const wasCovered = dropChunkMesh(cx, cz);
   const geos = e.passes.map(({ pass, position, uv, color }) => {
@@ -720,8 +800,9 @@ function installCached(cx, cz) {
     g.computeBoundingSphere();
     return { pass, geometry: g };
   });
-  attachChunkMesh(cx, cz, geos, e.stats, wasCovered);
+  attachChunkMesh(cx, cz, geos, e.stats, wasCovered, mk);
   cachedInstalls++;
+  parkedAt.set(`${cx},${cz}`, performance.now());
   return true;
 }
 
@@ -731,6 +812,7 @@ function dropChunkMesh(cx, cz, stash = false) {
   const old = meshes.get(key);
   if (!old) return false;
   meshes.delete(key);
+  meshDone.delete(key);
   if (stash) stashMeshBytes(key, old);
   for (const { pass, mesh } of old.list) { groups[pass].remove(mesh); mesh.geometry.dispose(); }
   return true;
@@ -738,7 +820,7 @@ function dropChunkMesh(cx, cz, stash = false) {
 
 // The skin has to stop drawing under anything the detail pass picks up, otherwise two surfaces sit
 // at the same height and z-fight. `wasCovered` is the state before this mesh landed.
-function attachChunkMesh(cx, cz, geos, stats, wasCovered) {
+function attachChunkMesh(cx, cz, geos, stats, wasCovered, mk = null) {
   if (!geos.length) return;
   // A worker can finish a chunk after the ring has already moved past it. Installing that result would
   // put full-res geometry back exactly where the far grid is supposed to paint it (the demote pass had
@@ -762,17 +844,20 @@ function attachChunkMesh(cx, cz, geos, stats, wasCovered) {
     groups[pass].add(mesh);
     return { pass, mesh };
   });
-  meshes.set(`${cx},${cz}`, { list, stats });
+  meshes.set(`${cx},${cz}`, { list, stats, mk });
+  meshDone.set(`${cx},${cz}`, mk);
 }
 
-function rebuild(cx, cz) {
+function rebuild(cx, cz, mk) {
   const wasCovered = dropChunkMesh(cx, cz);
   const chunk = store.get(cx, cz);
   if (!chunk) return;
+  if (!mk) mk = meshKeyFor(cx, cz);
+  countMesh(`${cx},${cz}`);
   const t0 = performance.now();
   const { geos, stats } = buildChunkGeometries(chunk);
   meshStat(performance.now() - t0);
-  attachChunkMesh(cx, cz, geos, stats, wasCovered);
+  attachChunkMesh(cx, cz, geos, stats, wasCovered, mk);
 }
 
 // ---- mesh workers ------------------------------------------------------------
@@ -845,7 +930,7 @@ function startWorkers() {
       });
       meshStat(m.ms ?? 0);
       meshWait = Math.max(meshWait, performance.now() - job.t0);
-      attachChunkMesh(m.cx, m.cz, geos, m.stats, job.wasCovered);
+      attachChunkMesh(m.cx, m.cz, geos, m.stats, job.wasCovered, job.mk);
     };
     // A worker that dies takes a chunk of the meshing capacity with it, and "0 workers" in the HUD
     // with everything meshing on the render thread is otherwise invisible: the world just loads slowly
@@ -874,21 +959,22 @@ function resetWorkers() {
   pool.length = 0; workerReady = 0;
   for (const [seq, job] of [...jobs]) {
     jobs.delete(seq); jobForKey.delete(job.key);
-    if (store) store.dirty.add(job.key);
+    if (store) markChunk(job.key, 'worker-reset');
   }
   for (const [seq, job] of [...patchJobs]) { patchJobs.delete(seq); patchJobForKey.delete(job.pk); }
   patchInflight = 0;
   startWorkers();
 }
 
-function meshAsync(cx, cz) {
+function meshAsync(cx, cz, mk) {
   const key = `${cx},${cz}`;
   if (jobForKey.has(key)) return true;
+  if (!mk) mk = meshKeyFor(cx, cz);
   // A pan wants two kinds of work at once: chunk meshes for the middle of the view and far patch cuts
   // for everything around it. If the chunk queue takes every worker, the patch cut falls back to the
   // render thread - a 20 ms hitch, which is the whole reason the cut has workers now - so while patches
   // are waiting, some slots stay free for them.
-  const reserve = S.patchWorkers && dirtyPatches.size ? Math.min(S.patchWorkers, pool.length - 1) : 0;
+  const reserve = patchCap() && dirtyPatches.size ? Math.min(patchCap(), pool.length - 1) : 0;
   let free = 0;
   for (const x of pool) if (!x.busy) free++;
   if (free <= reserve) return false;
@@ -904,7 +990,8 @@ function meshAsync(cx, cz) {
     }
   }
   const seq = ++meshSeq;
-  jobs.set(seq, { cx, cz, key, wasCovered, t0: performance.now(), gen: dimGen });
+  countMesh(key);
+  jobs.set(seq, { cx, cz, key, wasCovered, t0: performance.now(), gen: dimGen, mk });
   jobForKey.set(key, seq);
   w.busy = true;
   w.postMessage({ key, cx, cz, seq, chunks, opts: meshOpts(), covered: coveredNeighbours(cx, cz) });
@@ -914,32 +1001,45 @@ function meshAsync(cx, cz) {
 // Drain the dirty set: hand work to free workers when they are up, otherwise pay for it here so the
 // page still renders on browsers or probes that forced ?workers=0.
 function drainMeshes(now) {
-  if (!workersUsable()) {
-    for (;;) {
-      const keys = store.takeDirty(1);
-      if (!keys.length) break;
-      const [cx, cz] = keys[0].split(',').map(Number);
-      if (!store.has(cx, cz)) continue;        // a neighbour of a chunk that has left the store
-      if (!inDetailRing(cx, cz, 1)) continue;  // demoted: markDetailRing re-dirties it on the way back
-      // Parked triangles cost a buffer upload; the mesher costs ~51 ms. Ask the cache first.
-      if (!installCached(cx, cz)) rebuild(cx, cz);
-      if (performance.now() > now + S.budget) break;
-    }
-    return;
-  }
-  for (;;) {
-    const keys = store.takeDirty(1);
-    if (!keys.length) break;
-    const [cx, cz] = keys[0].split(',').map(Number);
+  const inline = !workersUsable();
+  // One nearest-first pick for the whole frame, then walk it. takeDirty() is a full pass over the dirty
+  // set, and this loop used to ask it for exactly one key at a time: a frame that processed 50 keys paid
+  // 50 scans of a 1.4k-key set. Whatever the mesher costs, this part cost 14 ms a frame in a drag.
+  const keys = store.takeDirty(Infinity);
+  const requeue = (from) => { for (let j = from; j < keys.length; j++) store.dirty.add(keys[j]); };
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const [cx, cz] = k.split(',').map(Number);
     // A dirty key whose chunk is gone must be dropped, not put back. It used to go back, and since
     // the loop stops on the first refusal, one stale key throttled the whole mesh queue: 35 of them
     // sat in the set and every frame burned its one allowed take on a chunk that no longer existed.
-    if (!store.has(cx, cz)) continue;
-    if (!inDetailRing(cx, cz, 1)) continue;    // outside the live ring: nothing to mesh here
-    // Same rule with workers: reuse parked bytes instead of queueing a 51 ms job behind everyone else.
-    if (installCached(cx, cz)) continue;
-    if (meshAsync(cx, cz)) continue;
-    store.dirty.add(keys[0]);          // no free worker: the chunk stays queued for the next frame
+    if (!store.has(cx, cz)) { dirtyTag.delete(k); continue; }
+    if (!inDetailRing(cx, cz, 1)) { dirtyTag.delete(k); continue; }
+    const mk = meshKeyFor(cx, cz);
+    // The triangles on screen already answer this payload and this border, so there is nothing to do.
+    // Measured honestly: this fires 0 times on a pan (every dirty mark at a 5-chunk ring really did have
+    // a changed border), and it is the guard that makes the parked bytes below safe to install.
+    if (S.meshKey) {
+      const have = meshes.get(k);
+      if (have && have.mk === mk) { meshUnchanged.count++; dirtyTag.delete(k); continue; }
+    }
+    const parked = meshBytes.get(k);
+    if (parked && parked.mk === mk) { installCached(cx, cz, mk); dirtyTag.delete(k); continue; }
+    // Meshing against a border that is not settled is the expensive case: whatever is built now has a
+    // wall against the unknown in it, and the arrival forces a second mesh of the same chunk. Counted
+    // because it is the number that says whether the payload ring is wide enough. Waiting it out was
+    // tried and measured dead - 0 deferrals across four A/B runs and eight pan legs - because that ring
+    // already settles the border before a chunk reaches the mesh ring.
+    if (S.meshKey && !settledNeighbours(cx, cz)) meshUnsettled.count++;
+    if (inline) {
+      rebuild(cx, cz, mk);
+      // Over budget: stop for the frame, and put everything still unvisited back in the queue.
+      if (performance.now() > now + S.budget) { requeue(i + 1); break; }
+      continue;
+    }
+    if (meshAsync(cx, cz, mk)) continue;
+    requeue(i);                         // no free worker: the rest stays queued for the next frame
+    markChunk(k, 'no-worker', true);
     break;
   }
 }
@@ -1047,7 +1147,13 @@ function applyDetailBudget() {
   // what the camera looks at: at a 26 km pull-back that is 169 chunks (~17 MB) parked under a target
   // a few pixels wide, and it is what turns zooming back in into a re-mesh instead of another
   // 289-chunk download. The ring is what shrinks to nothing; the payload only ever trails it.
-  payloadR = Math.min(S.radius, detailR + S.payloadLead);
+  // The payload trails the *mesh ring*, not the user's ceiling. It used to be
+  // min(S.radius, detailR + lead), and since the mesh ring is at or under that ceiling, the lead was
+  // clamped to nothing exactly when it mattered: panning 25 chunks at a 1.2 km pull-back pushed a
+  // chunk's voxels out of the store in the same instant its mesh was demoted, the parked triangles were
+  // swept with them, and coming back cost a full re-mesh. Measured: 60 detail builds per warm pan leg,
+  // meshReused 0, meshCacheDropped 275.
+  payloadR = detailR + S.payloadLead;
   if (!store) return;
   const cap = +(params.get('maxchunks') ?? 0) || Math.max(64, (2 * payloadR + 5) ** 2);
   store.maxChunks = cap;
@@ -1062,7 +1168,7 @@ function applyDetailBudget() {
 function markDetailRing() {
   if (!store) return;
   for (const c of store.chunks.values()) {
-    if (inDetailRing(c.cx, c.cz, 1) && !meshes.has(`${c.cx},${c.cz}`)) store.dirty.add(`${c.cx},${c.cz}`);
+    if (inDetailRing(c.cx, c.cz, 1) && !meshes.has(`${c.cx},${c.cz}`)) markChunk(`${c.cx},${c.cz}`, 'ring');
   }
 }
 
@@ -1280,7 +1386,12 @@ function retierPatches_tiers() {
 // a patch border.
 const patchJobs = new Map();          // seq -> {pk, gen, tier, mode, sig, t0}
 const patchJobForKey = new Map();     // patch key -> seq: one cut per patch at a time
-let patchSeq = 0, patchInflight = 0, patchPosted = 0, patchDropped = 0, patchOutside = 0;
+let patchSeq = 0, patchInflight = 0, patchPosted = 0, patchDropped = 0, patchOutside = 0, patchWide = 0;
+// How many of the mesh threads may take a far patch cut. Measured across a 5 s drag, peak frame cost:
+// 0 threads 60 ms, 2 threads 29 ms, 4 threads 22 ms, 6 threads 15.7 ms (dist 400) and 23 -> 14.5 ms
+// (dist 150). But the same threads are the only thing meshing chunk detail, so the pool keeps two:
+// asking for 6 on a machine that started 4 workers gets 2, and a 2-worker pool cuts its own patches.
+const patchCap = () => Math.max(0, Math.min(S.patchWorkers, pool.length - 2));
 
 /**
  * Decide a patch cut without paying for it: tier, paint mode, the frames, and the two per-chunk
@@ -1420,9 +1531,27 @@ function rebuildPatch(pk) {
   // The cut goes to a worker when one is free, and the previous mesh stays on screen until the new one
   // arrives: that is also what stops a re-cut from blanking a patch for a frame, which is what far
   // terrain flickering during a drag used to mean.
-  if (S.patchWorkers > 0 && patchInflight < S.patchWorkers && postPatchJob(pk, plan)) return;
+  if (patchInflight < patchCap() && postPatchJob(pk, plan)) return;
+  // No worker free, so this one is cut here - but with the same packed answers the worker gets, not the
+  // live closures. `cellForChunk`/`detailHere` are asked once per column, which at cell 1 is 4096 asks
+  // per patch, each building a chunk key string and walking two Maps and the tier table: 14% of a drag's
+  // sampled main-thread time was that, and the frame-cost profile named meshColumns, tiers, cellOfTier
+  // and patchKey as its callers. The arrays planPatch already built answer all of it by index.
   const t0 = performance.now();
-  const { stream, stats } = meshShellPatch(assets, shellAt, plan.x0, plan.z0, plan.w, plan.h, plan.opts);
+  const get = patchFrameGetter(plan.pack);
+  const pol = patchPolicy(plan.pack, plan.cells, plan.skips);
+  const { stream, stats } = meshShellPatch(assets, get, plan.x0, plan.z0, plan.w, plan.h,
+    { ...plan.opts, cellFor: pol.cellFor, skip: pol.skip });
+  // A cut that asked for a chunk outside the packed window would be missing its border wall, and the
+  // mesher is allowed to reach further than PATCH_REACH at tiers we have not sampled. Re-cut it against
+  // the store: rare, and the only way this can be wrong is a way we would otherwise never see.
+  if (get.outside) {
+    patchWide++;
+    const t1 = performance.now();
+    const again = meshShellPatch(assets, shellAt, plan.x0, plan.z0, plan.w, plan.h, plan.opts);
+    installPatch(pk, plan, again.stream, again.stats, performance.now() - t1);
+    return;
+  }
   installPatch(pk, plan, stream, stats, performance.now() - t0);
 }
 
@@ -2717,7 +2846,7 @@ window.__world = {
       ovBands: ovBands.size, ovBandsTotal: ovBandTotal(), ovBandRows: ovBandRows(),
       shellMissing: shellStore ? shellStore.missing.size : 0,
       shellMs: +shellMs.toFixed(2), shellMsMax: +shellMsMax.toFixed(2),
-      shellJobs: patchJobs.size, patchOutside, patchPosted, patchDropped,
+      shellJobs: patchJobs.size, patchOutside, patchWide, patchPosted, patchDropped,
       shellCells: tiers().slice(), shellTiers: tierLabel(),
       shellTiersLive: [...patchTier.values()],
       skinRadius: skinR, skinCap: S.skinCap, skinFloor: S.skinFloor,
@@ -2734,6 +2863,11 @@ window.__world = {
       // The zoom-back budget: what is parked, what it costs, how often it was reused.
       meshCacheMB: +(meshBytesTotal / 1048576).toFixed(1), meshCachedChunks: meshBytes.size,
       meshReused: cachedInstalls, meshCacheDropped: meshBytesDropped,
+      meshBuilds, meshKeyOn: S.meshKey, meshUnchanged: meshUnchanged.count,
+      meshUnsettled: meshUnsettled.count, meshBytesGhost, parkThenBuild,
+      parkedWaiting: parkedAt.size,
+      payloadLead: S.payloadLead, bytesKeep: S.bytesKeep,
+      dirtyWhy: Object.fromEntries(dirtyWhy), meshByWhy: Object.fromEntries(meshWhy),
       farCostScale: +costScale.toFixed(2), farFloorBoost: floorBoost, cpuRenderMs: +cpuRenderMs.toFixed(2),
       shellPatch: S.patch, maxZoom: S.maxZoom, worldSpan: S.worldSpan,
       near: camera.near, far: camera.far,
@@ -3150,7 +3284,7 @@ function applySettings(what) {
     // Occlusion and light are both baked into vertex colours, so the only honest way to see either
     // change is to re-mesh. The far layer bakes light into its colours too, so its patches re-cut
     // with them; the overview does it itself, since the light settings are in its band signature.
-    if (store) for (const k of [...meshes.keys()]) store.dirty.add(k);
+    if (store) for (const k of [...meshes.keys()]) markChunk(k, 'settings');
     if (what === 'light') for (const [pk] of shellMeshes) dirtyAdd(pk, 'apply');
   }
 }
@@ -3184,6 +3318,9 @@ const storeOpts = () => ({
   // Evicting chunks the camera is about to look at again is how a view starts popping: keep
   // room for the whole requested radius plus a margin, and let ?maxchunks override for tests.
   maxChunks: +(params.get('maxchunks') ?? Math.max(400, (2 * S.radius + 5) ** 2)),
+  // A dirty mark the store makes is a mesh job (tens of ms) waiting to happen, so the view box can
+  // say which marks became work and which did not.
+  onDirty: (k, why) => tagDirty(k, why),
 });
 
 function makeShellStore(dim) {
@@ -3562,8 +3699,8 @@ function buildPanel() {
         get: () => S.targetFps, set: (v) => { S.targetFps = Math.max(20, Math.min(120, v | 0)); } },
 
       { key: 'patchthreads', label: 'far cut threads', min: 0, max: 6, step: 1, live: true,
-        hint: 'How many far patches may be cut at once off the render thread. A patch cut is 20-25 ms\nand a frame is 16, so the cut runs on these instead: measured 21.2 -> 0.2 ms of shell work a\nframe, and the far grid settles in 20 s instead of 95. 0 cuts them here, on this thread.\nRaising it competes with chunk meshing for the same threads. URL: ?patchworkers',
-        get: () => S.patchWorkers,
+        hint: 'How many of the meshing threads may take a far patch cut at once. A cut is 20-25 ms and a\nframe is 16, so it runs there instead of here. Across a 5 s drag the worst frame measured 60 ms\nwith 0 of these, 29 ms with 2 and 18 ms with 6; the settled view is the same either way (598\npatches, 6 309 216 verts). The pool keeps two threads for chunk detail, so a machine that started\n4 workers gets 2. URL: ?patchworkers',
+        get: () => patchCap(),
         set: (v) => { S.patchWorkers = Math.max(0, Math.min(6, v | 0)); } },
       { key: 'workers', label: 'meshing threads', min: 0, max: 8, step: 1, live: false,
         hint: 'Background threads that build chunk meshes. Changing this restarts them (a moment of stutter).\n0 meshes on the render thread instead. URL: ?workers',
