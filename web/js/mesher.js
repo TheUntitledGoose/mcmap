@@ -264,11 +264,53 @@ export function meshChunk(assets, chunk, at, opts = {}) {
   // a smooth cave wall into floating scraps. 0 (the old behaviour) demands total darkness.
   const SKYMAX = Math.max(0, Math.min(15, +(opts.buriedSky ?? 0)));
   const sky = BURIED > 0 && opts.sky ? (lx, yy, lz) => opts.sky(chunk.cx, chunk.cz, lx, yy, lz) : null;
-  const buried = BURIED > 0 && HMAP && sky
+
+  /**
+   * A surface-only skin has to ask a taller question than "is this under the heightmap": WORLD_SURFACE
+   * counts leaves and water, so that question erases the floor under a tree canopy and the bed of a
+   * lake, and you see the sky through the gaps in the leaves. The honest question is "is there an
+   * *opaque* block above the air this face looks into", and its answer is one number per column: the
+   * highest opaque block. Walking for it is cheap because a chunk is mostly one state repeated - a
+   * uniform section answers every column at once, and a mixed section stops at the first hit per
+   * column, top down.
+   */
+  const SURF = opts.surfaceOnly ? 1 : 0;
+  let OPQ = null;
+  if (SURF) {
+    const opq = new Int8Array(chunk.palette.length);
+    for (let i = 0; i < opq.length; i++) {
+      const st = chunk.palette[i] === 0 ? -1 : chunk.palette[i] - 1;
+      opq[i] = st >= 0 && st < assets.states.length && assets.stateOpaque[st] === 1 ? 1 : 0;
+    }
+    OPQ = new Int16Array(256).fill(-0x7fff);
+    const done = new Uint8Array(256);
+    const secs = chunk.sections.slice().sort((a, b) => b.y - a.y);
+    for (const s of secs) {
+      const y0 = s.y << 4;
+      if (s.single) {
+        if (!opq[s.single - 1]) continue;                     // air, or glass: nothing hides anything
+        for (let col = 0; col < 256; col++) if (!done[col]) { OPQ[col] = y0 + 15; done[col] = 1; }
+        break;                                                // and that answers every column
+      }
+      for (let col = 0; col < 256; col++) {
+        if (done[col]) continue;
+        const x = col & 15, z = col >> 4;
+        for (let k = 15; k >= 0; k--) {
+          if (opq[s.vox[(k << 8) | (z << 4) | x]]) { OPQ[col] = y0 + k; done[col] = 1; break; }
+        }
+      }
+    }
+  }
+
+  const buried = (BURIED > 0 || SURF)
     ? (nx, ny, nz) => {
-      // Only this chunk's own heightmap: the wrapped column of a neighbour would answer for the
-      // wrong piece of ground, and an unknown column must never cull a face.
+      // Only this chunk's own column: the wrapped column of a neighbour would answer for the wrong
+      // piece of ground, and an unknown column must never cull a face.
       if (nx < 0 || nx > 15 || nz < 0 || nz > 15) return false;
+      // The skin answers first, and asks no light question at all: rock over the air cell means the
+      // face is not on the surface, whatever the light down there says.
+      if (SURF && OPQ[(nz << 4) | nx] > ny) return true;
+      if (!HMAP || BURIED <= 0 || !sky) return false;
       const surf = HMAP[(nz << 4) | nx] - HEIGHT_BIAS;
       if (!(surf > -2000) || surf - ny < BURIED) return false;
       const sk = sky(nx, ny, nz);

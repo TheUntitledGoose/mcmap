@@ -94,6 +94,12 @@ const S = {
   // between the face's air cell and that column's surface skin before the skylight is asked, and a
   // face in sky-dark air under that much rock is not drawn. 0 = only the dark test. URL: ?buried=
   buried: Math.min(64, Math.max(0, num('buried', 4))),
+  // The same question without the light probe: is there rock over the air a face looks into? If yes
+  // it is not on the surface, so it is not meshed at all. Measured over 24 sampled chunks
+  // (tools/dbg-surfacecost.mjs): 16,184 verts and 26.2 ms per chunk today, 4,008 verts and 16.5 ms
+  // as a skin - 75% fewer vertices, 37% less meshing, because two thirds of the cost is walking the
+  // chunk rather than emitting faces. ?nosurface puts every face above the rock back (A/B control).
+  surface: params.has('nosurface') ? 0 : (num('surface', 1) ? 1 : 0),
   // A face pointing at a chunk whose voxels are not held, but whose ground the heightmap skin paints,
   // is behind that skin. Drawing it is the wall of dirt a hole grows when a neighbour never arrived.
   // ?cullcovered=0 puts the walls back to compare.
@@ -560,6 +566,8 @@ const meshOpts = () => ({
   darkcut: S.caves ? -1 : S.darkcut,
   buried: S.caves ? 0 : S.buried,
   buriedSky: S.buriedSky,
+  // Wants the whole map as a surface skin, and the underground only when asked for.
+  surfaceOnly: S.caves ? 0 : S.surface,
 });
 
 /**
@@ -627,7 +635,8 @@ const meshBytes = new Map();          // "cx,cz" -> { passes, stats, bytes, sig 
 let meshBytesTotal = 0, cachedInstalls = 0, meshBytesDropped = 0, lastBytesSweep = 0;
 
 const detailSig = () => `A${S.ao ? 1 : 0}/${S.aoMin}L${S.light ? 1 : 0}/${S.darkFloor}/${S.darkGamma}` +
-  `/${S.skyScale}D${S.caves ? -1 : S.darkcut}B${S.caves ? 0 : S.buried}S${S.buriedSky}C${S.shellOn && S.cullCovered ? 1 : 0}` +
+  `/${S.skyScale}D${S.caves ? -1 : S.darkcut}B${S.caves ? 0 : S.buried}S${S.buriedSky}U${S.caves ? 0 : S.surface}` +
+  `C${S.shellOn && S.cullCovered ? 1 : 0}` +
   `G${dimGen}`;
 
 function dropBytes(key) {
@@ -2610,6 +2619,7 @@ window.__world = {
       detailLod: S.detailLod, detailReachBlocks: Math.round(detailReach(pxPerRad(), S.detailPx)),
       lightOn: S.light ? 1 : 0, darkFloor: S.darkFloor, darkGamma: S.darkGamma, skyScale: S.skyScale, ao: S.ao ? 1 : 0,
       cavesOn: S.caves, darkcut: S.caves ? -1 : S.darkcut,
+      surfaceOn: S.caves ? 0 : S.surface,
       // The zoom-back budget: what is parked, what it costs, how often it was reused.
       meshCacheMB: +(meshBytesTotal / 1048576).toFixed(1), meshCachedChunks: meshBytes.size,
       meshReused: cachedInstalls, meshCacheDropped: meshBytesDropped,
@@ -3232,6 +3242,11 @@ function buildPanel() {
         hint: 'A lava pool 30 m down is lit - by the lava - and still invisible from above ground. A face\nwhose air cell sits this many blocks under the surface of its own column, and gets no skylight\nthere, is not drawn. A ravine keeps its walls: its air has skylight. 0 turns it off. URL: ?buried=',
         get: () => S.buried,
         set: (v) => { S.buried = Math.min(64, Math.max(0, v | 0)); applySettings('light'); } },
+
+      { key: 'surface', label: 'mesh the surface only', kind: 'check', live: false,
+        hint: 'On (default) a detail face is drawn only if rock does not sit above the air it looks into:\nthe world is meshed as a skin, not as a block of rock. 24 sampled chunks: 16,184 verts and 26.2 ms\nper chunk with the underground, 4,008 verts and 16.5 ms as a skin. The skylight rule above stays on\nas well, so a ravine or a cave mouth is never a hole. Off is the A/B control. URL: ?nosurface',
+        get: () => S.surface,
+        set: (v) => { S.surface = v ? 1 : 0; applySettings('light'); } },
 
       { key: 'buriedsky', label: 'skylight that still counts as open sky', min: 0, max: 15, step: 1,
         fmt: (v) => (v | 0),

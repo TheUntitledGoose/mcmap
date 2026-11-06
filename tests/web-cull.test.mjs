@@ -49,19 +49,23 @@ const lightArr = (v) => {
  * what the buried test reads, and it arrives through the payload like any other chunk field), and
  * `sky`/`blk` are the light the save would carry.
  */
-function makeChunk({ holes = [], surface = 16, sky = 0, blk = 15 } = {}) {
+function makeChunk({ holes = [], leaves = [], surface = 16, sky = 0, blk = 15 } = {}) {
   const bits = 4;
   const data = new BigUint64Array(Math.ceil(4096 * bits / 64));
   const skip = new Set(holes.map(([x, y, z]) => cellIdx(x, y, z)));
+  const cap = new Set(leaves.map(([x, y, z]) => cellIdx(x, y, z)));
   for (let i = 0; i < 4096; i++) if (!skip.has(i)) {
     const bit = i * bits;
-    data[bit >> 6] |= 1n << BigInt(bit & 63);
+    data[bit >> 6] |= BigInt(cap.has(i) ? 2 : 1) << BigInt(bit & 63);
   }
   const nbt = {
     xPos: 0, zPos: 0, yPos: 0, DataVersion: 3465,
     sections: [{
       Y: 0,
-      block_states: { palette: [air, stone], data },
+      block_states: {
+        palette: cap.size ? [air, stone, { Name: 'minecraft:oak_leaves', Properties: { distance: '1', persistent: 'false', waterlogged: 'false' } }] : [air, stone],
+        data,
+      },
       SkyLight: lightArr(sky), BlockLight: lightArr(blk),
     }],
   };
@@ -99,6 +103,10 @@ function probes(ch, { covered = false } = {}) {
 }
 
 const litOpts = (extra = {}) => ({ lightOn: 1, darkFloor: 0.32, darkGamma: 1, skyScale: 1, ...extra });
+
+// A fixture slab that fills its whole section always pays the same faces first: its 256-cell
+// underside. Naming it once keeps the interesting numbers visible.
+const UNDERSIDE = 256;
 
 test('buried: a lava-lit cavern is lit, so only the skylight test removes it', () => {
   // One air cell 11 blocks under the surface, block light 15 (a lava pool), skylight 0.
@@ -183,4 +191,53 @@ test('covered: unknown is still unknown, and faces there are kept', () => {
   const out = meshChunk(assets, ch, open.at, litOpts({ light: open.light, darkcut: -1 }));
   assert.equal(out.stats.unknown, 0);
   assert.ok(out.stats.faces > 256, 'a chunk that may yet grow a neighbour keeps its faces');
+});
+
+test('skin: rock over the air cell takes the face, and so does a face the light happens to like', () => {
+  // A solid 16-high slab, lit. The skin rule has one thing to say about it: the underside is not a
+  // surface, so 256 faces of a chunk nobody can ever look at from below are not worth building.
+  const opts = (p) => litOpts({ light: p.light, sky: p.sky, darkcut: 0, buried: 0 });
+  const solid = makeChunk({ surface: 16, sky: 15, blk: 0 });
+  const s = probes(solid);
+  const bare = meshChunk(assets, solid, s.at, opts(s));
+  assert.equal(bare.stats.buried, 0, 'with the light rule off nothing is culled');
+  assert.equal(bare.stats.darkCulled, 0, 'and skylight 15 everywhere means the dark rule is blind too');
+  const slab = meshChunk(assets, solid, s.at, { ...opts(s), surfaceOnly: 1 });
+  assert.equal(slab.stats.buried, UNDERSIDE, 'the underside of a slab of rock is not a surface');
+  assert.equal(slab.stats.faces, bare.stats.faces - UNDERSIDE, 'the top and the four walls are kept');
+
+  // The cavern of the first test, but sunlit: the buried rule cannot call it underground, while the
+  // skin rule can. That is the difference between "no light down there" and "nobody can see it".
+  const ch = makeChunk({ holes: [[8, 5, 8]], surface: 16, sky: 15, blk: 0 });
+  const p = probes(ch);
+  const lit = meshChunk(assets, ch, p.at, opts(p));
+  const skin = meshChunk(assets, ch, p.at, { ...opts(p), surfaceOnly: 1 });
+  assert.equal(skin.stats.buried - lit.stats.buried, UNDERSIDE + 6, 'six faces of the cavern sit under 11 blocks of rock');
+
+  // The surface itself pays nothing: the air above a top face is not under the skin.
+  const top = makeChunk({ holes: [[8, 15, 8]], surface: 16, sky: 15, blk: 0 });
+  const q = probes(top);
+  assert.equal(meshChunk(assets, top, q.at, { ...opts(q), surfaceOnly: 1 }).stats.buried, slab.stats.buried,
+    'a face open to the sky is a surface face, whatever the skin says');
+});
+
+test('skin: a canopy does not count as cover, so the forest floor keeps its faces', () => {
+  // Stone to y 9, air y 10..12, leaves y 13..15 in one column. WORLD_SURFACE puts that column at 15,
+  // so a heightmap-only skin would call the floor of the gap eleven blocks underground and delete the
+  // top face of the stone - which is exactly what you see through the gaps in a canopy.
+  const opts = (p) => litOpts({ light: p.light, sky: p.sky, darkcut: 0, buried: 0 });
+  const col = [[8, 13, 8], [8, 14, 8], [8, 15, 8]];
+  const ch = makeChunk({ holes: [[8, 10, 8], [8, 11, 8], [8, 12, 8]], leaves: col, surface: 16, sky: 15, blk: 0 });
+  const p = probes(ch);
+  const bare = meshChunk(assets, ch, p.at, opts(p));
+  const skin = meshChunk(assets, ch, p.at, { ...opts(p), surfaceOnly: 1 });
+  assert.equal(skin.stats.buried - bare.stats.buried, UNDERSIDE,
+    'leaves are cutout, so the only faces the skin takes here are the slab of its own underside');
+  assert.equal(skin.stats.faces, bare.stats.faces - UNDERSIDE, 'and the skin removes no face from a forest floor');
+
+  // Under a *solid* lid the same gap is rock-bound, and the skin takes the gap too.
+  const lid = makeChunk({ holes: [[8, 10, 8], [8, 11, 8], [8, 12, 8]], surface: 16, sky: 15, blk: 0 });
+  const r = probes(lid);
+  const sunk = meshChunk(assets, lid, r.at, { ...opts(r), surfaceOnly: 1 });
+  assert.equal(sunk.stats.buried - skin.stats.buried, 14, 'a lid of stone does count: 14 faces line a 1x3 shaft');
 });
