@@ -53,6 +53,14 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
       continue;
     }
 
+    if (it.kind === 'note') {
+      // One line of prose, for the things the page does with a gesture rather than a control.
+      const n = el('div', 'panel-note', it.text);
+      if (it.hint) n.title = it.hint;
+      slot.append(n);
+      continue;
+    }
+
     const row = el('label', `panel-row panel-${it.kind ?? 'range'}`);
     const lab = el('span', 'panel-label', it.label);
     if (it.hint) lab.title = it.hint;
@@ -134,11 +142,13 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
     root.classList.toggle('collapsed', !on);
     collapse.textContent = on ? '—' : '+';
   };
-  collapse.addEventListener('click', () => setOpen(root.classList.contains('collapsed')));
+  // The whole header toggles, not just the small button in its corner.
+  head.addEventListener('click', () => setOpen(root.classList.contains('collapsed')));
 
   document.body.append(root);
   return {
     refresh,
+    keys: () => [...rows.keys()],
     busy: () => busy,
     toggle: (on) => setOpen(on === undefined ? root.classList.contains('collapsed') : !!on),
     set: (key, v) => {

@@ -227,6 +227,26 @@ const hud = {
   cpu: $('cpu'),
   mesh: $('mesh'), shell: $('shell'), pos: $('campos'), dim: $('dim'), msg: $('msg'),
 };
+// What the page says unprompted is one number - frames per second - plus a status line when there
+// is something to say. Everything else on screen is the world. The instrument block under the pill
+// (verts, tris, mesh timings, worker counts, the frame-cost buckets) sits behind H, and is on by
+// default only for ?debug=1 or the flat atlas view: every headless probe loads ?debug=1, so hiding
+// it from a person looking at the map costs the tooling nothing. Same condition as DEBUG twelve
+// lines down, spelled out because DEBUG does not exist yet when this has to run.
+let readouts = 0, helpFade = 0;
+function setReadouts(on) {
+  readouts = on ? 1 : 0;
+  document.body.classList.toggle('hidehud', !readouts);
+  showHelp();
+}
+// The line of keys is not part of the instruments: a first visit needs it whether or not the
+// numbers are up. It fades on its own once you have clearly started driving, and H brings it back.
+function showHelp() {
+  document.body.classList.remove('helpgone');
+  clearTimeout(helpFade);
+  helpFade = setTimeout(() => document.body.classList.add('helpgone'), 20000);
+}
+setReadouts(params.has('debug') || params.get('view') === 'flat' ? 1 : 0);
 
 // The dimension table from /meta, kept at module scope: the panel offers every world, and switching
 // one happens live. It used to be `location.search = ?dim=...`, which reloaded the page (throwing
@@ -458,7 +478,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyP' && panel) panel.toggle();
   if (e.code === 'KeyF') fitWorld();
   if (e.code === 'KeyX') groups.forEach((g) => g.traverse((o) => { if (o.material) o.material.wireframe = !o.material.wireframe; }));
-  if (e.code === 'KeyH') document.body.classList.toggle('hidehud');
+  if (e.code === 'KeyH') setReadouts(!readouts);   // instruments and the key line, together
   if (e.code === 'BracketLeft') rig.target.y -= 4;
   if (e.code === 'BracketRight') rig.target.y += 4;
 });
@@ -3321,7 +3341,18 @@ window.__world = {
     verts: [...shellMeshes.values()].reduce((a, e) => a + (e.verts || 0), 0),
     tiers: [...shellMeshes.values()].map((e) => e.tier).sort() }),
   tick: (n = 1, dt = 16) => { const t = performance.now(); for (let i = 0; i < n; i++) frameBody(t + (i + 1) * dt); return loopFrames; },
-  set: (k, v) => { const key = { dist: 'distance', far: 'skinCap', detail: 'radius', world: 'dim' }[k] ?? k; return panel ? panel.set(key, v) : undefined; },
+  // The panel owns the settings, but the camera is not a setting: the zoom slider was removed (the
+  // wheel does it) so 'dist' has to be answered here or a probe asking for a zoom gets a shrug.
+  // A probe must be able to check that a control survived a rewrite of the panel: the panel is DOM,
+  // so no Node test can import it, and a silently missing control is the failure mode of every
+  // find-and-replace over the settings list.
+  panelKeys: () => (panel ? panel.keys() : []),
+  presets: () => Object.keys(PRESETS),
+  set: (k, v) => {
+    if (k === 'dist') { rig.dist = Math.max(2, Math.min(S.maxZoom, +v)); updateView(); requestAround(); return rig.dist; }
+    const key = { far: 'skinCap', detail: 'radius', world: 'dim' }[k] ?? k;
+    return panel ? panel.set(key, v) : undefined;
+  },
   fit: () => fitWorld(),
   switchDim,
   dims: () => (meta?.dims ?? []).map((d) => d.id),
@@ -3546,6 +3577,25 @@ function switchDim(id) {
   if (panel) panel.refresh();
 }
 
+// Four combinations, named the way people ask for them. Every key here is a control in the panel,
+// and the panel is what applies them, so a preset cannot name a setting that no longer exists and
+// quietly do nothing - it names a control, and the control knows what else has to be invalidated.
+// `dist: 0` means "fit the world", which is a runtime number rather than a stored one.
+const PRESETS = {
+  'whole world': { dist: 0, s: {
+    radius: 8, farsharp: 1.5, lodtiles: true, lodquality: 100, shellon: true, overview: false,
+    lodcap: 8, maxradius: 96, vertbudget: 12000000, fog: 0, caves: false } },
+  'walk around': { dist: 110, s: {
+    radius: 10, farsharp: 1, lodtiles: true, lodquality: 50, lodcap: 8, caves: true,
+    shadow: 0.58, cave: 0.32, daylight: 1, clarity: 0.5, fog: 0 } },
+  'caves': { dist: 150, s: {
+    caves: true, darkcut: 0, buried: 0, surface: false, underfar: false, cave: 0.45,
+    daylight: 0.6, radius: 12, farsharp: 1, lodtiles: true } },
+  'fast': { s: {
+    radius: 6, farsharp: 2, lodquality: 100, lodtiles: true, res: 0.7, resAuto: 1,
+    budget: 6, sbudget: 8, caves: false, fog: 0 } },
+};
+
 // Sliders over the page's own settings object. Only the handful a person actually reaches for are
 // out in the open; everything else lives in a collapsed group, because "cliff skirt" and "tier slack"
 // are not phrases anyone who did not write the mesher should have to decode. Each control keeps its
@@ -3557,30 +3607,25 @@ function buildPanel() {
     return { value: d.id, label: `${dimLabel(d.id)}${km}` };
   });
   const mfmt = (v) => `${Math.round(v)} m`;
-  panel = mountPanel({
-    title: 'view  (p)',
-    items: [
+  // Nine controls are out in the open, because that is what people reach for: which world, how much
+  // of it is built block by block, how far that reaches, how coarse the cheap world may get, whether
+  // the unlit underground is drawn, and three numbers about how it is shaded. Everything else lives
+  // in three closed groups - a group only shows its name until you open it - and a further twenty
+  // tuning knobs left the panel altogether (see HANDOFF.md for their URL names). The zoom slider is
+  // gone: the wheel, or a drag on empty sky, already does it.
+  const items = [
       { key: 'dim', label: 'world', kind: 'select', options: dims,
         hint: 'Which world to look at. Switching keeps every setting and drops nothing but the loaded chunks.',
         get: () => currentDim(), set: (v) => switchDim(v) },
-
-      { key: 'distance', label: 'zoom', min: 20, max: 1200, step: 1, maxFn: () => Math.max(40, Math.round(S.maxZoom)),
-        fmt: mfmt,
-        hint: 'How far the camera sits from what it looks at - the mouse wheel does the same. It runs up\nto the point where the whole world fits in the frame. Press F to jump straight there.',
-        get: () => rig.dist,
-        set: (v) => { rig.dist = Math.max(2, Math.min(S.maxZoom, v)); updateView(); requestAround(); } },
-
       { key: 'radius', label: 'close detail', min: 0, max: 24, step: 1, live: false,
         fmt: (v) => (v ? `${v * CH} m` : 'off'),
         hint: 'The most terrain built block by block with real textures, around what you look at - a\nceiling, not a promise: zoom out and less of it is drawn, because far away those\ntriangles are smaller than a pixel. Measured at a 257 m orbit: 5 chunks = 169 chunk meshes,\n2.2 M verts, 41 MB held; 8 = 361, 5.2 M, 68 MB; 16 = 1 081, 14 M, ~170 MB and 21 M verts on\nscreen. Bigger is prettier and slower. URL: ?radius',
         get: () => S.radius, set: (v) => { S.radius = Math.max(0, v | 0); applySettings('radius'); } },
-
       { key: 'farsharp', label: 'far detail', min: 1, max: 6, step: 0.25,
         fmt: (v) => `${v} px`,
         hint: 'How small a block may get in the cheap far terrain before it is merged with its\nneighbours. Lower is sharper and costs more. URL: ?cellpx',
         get: () => S.cellPx, set: (v) => { S.cellPx = Math.max(0.5, v); applySettings('lod'); } },
-
-      { key: 'lodtiles', label: 'baked far world (whole dimension)', kind: 'check', live: false,
+      { key: 'lodtiles', label: 'baked far world', kind: 'check', live: false,
         hint: 'The whole world below 16 blocks per column, pre-meshed on the server\n(npm run bake:lod) and streamed as region tiles, instead of being meshed in the browser on\nevery pan and zoom. Off restores live far meshing. URL: ?nolod',
         get: () => !!S.lod && lodAvail ? 1 : 0,
         set: (v) => {
@@ -3589,83 +3634,46 @@ function buildPanel() {
           if (!S.lod) { clearLodMeshes(); }
           applySettings('lodtiles');
         } },
-
-{ kind: 'section', key: 'sec_look', label: 'look (light, water, shadow)', open: false,
-        hint: 'How the world is shaded. None of it changes what is drawn, only how it reads.' },
-
+      { key: 'lodquality', label: 'far world quality', min: 0, max: 100, step: 5, live: false,
+        fmt: (v) => `${[1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(v / 10)]} blk max`,
+        hint: 'How far the LOD is allowed to drop in quality: the coarsest column the far view may use,\napplied where a coarse column would really be a blob on screen. 100 is today: 16-block columns at the\nhorizon, which is why a distant tree is one column and a distant house is a slab. Pull it in for shape\nand pay vertices: finer than the baked rungs (4 blocks) the live far grid has to draw that ground itself,\nand the baked tiles keep their rung instead of leaving a hole. URL: ?lodquality',
+        get: () => S.lodQuality,
+        set: (v) => { S.lodQuality = Math.max(0, Math.min(100, v | 0));
+          S.lodMaxCell = [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(S.lodQuality / 10)];
+          applySettings('lod'); } },
+      { key: 'caves', label: 'mesh unlit caves', kind: 'check', live: false,
+        hint: 'Off (default) does not draw faces no light touches - the rock deep in a cave, the back of\n a tunnel. They were the majority of the vertex and mesh-time budget for something no\n camera can see. On draws every face, which is the old behaviour. URL: ?caves=1',
+        get: () => S.caves, set: (v) => { S.caves = v ? 1 : 0; applySettings('light'); } },
       { key: 'shadow', label: 'shadow depth', min: 0, max: 1, step: 0.02, live: false,
         fmt: (v) => `${Math.round(v * 100)}%`,
         hint: 'How dark the crevices between blocks get, on top of the light field the save stores.\nApplies to terrain re-drawn after you move it. URL: ?ao',
         get: () => 1 - S.aoMin,
         set: (v) => { S.aoMin = Math.min(1, Math.max(0, 1 - v)); applySettings('ao'); } },
-
       { key: 'cave', label: 'cave brightness', min: 0, max: 1, step: 0.02, live: false,
         fmt: (v) => `${Math.round(v * 100)}%`,
         hint: 'How bright an unlit cell is drawn. The save really does put light 0 down there; this is\nhow much of that darkness you keep. 0 is in-game dark (caves go black), 0.32 is the default,\n1 switches lighting off. URL: ?darkfloor=',
         get: () => S.darkFloor,
         set: (v) => { S.darkFloor = Math.min(1, Math.max(0, v)); applySettings('light'); } },
-
-      { key: 'daylight', label: 'daylight', min: 0, max: 1, step: 0.05, live: false,
-        fmt: (v) => v < 0.02 ? 'torches only' : `${Math.round(v * 100)}%`,
-        hint: 'How much of the sky channel counts. Lower it to read torch/cave light on the surface\nwithout the daylight flattening it. Block light is always full. URL: ?skyscale=',
-        get: () => S.skyScale,
-        set: (v) => { S.skyScale = Math.min(1, Math.max(0, v)); applySettings('light'); } },
-
       { key: 'clarity', label: 'water clarity', min: 0, max: 0.8, step: 0.02,
         fmt: (v) => `${Math.round(v * 100)}%`,
         hint: 'How much you can see through water and ice. URL: ?water',
         get: () => 1 - S.water, set: (v) => { S.water = 1 - v; applySettings('water'); } },
-
-      { key: 'aofar', label: 'far brightness match', min: 0.6, max: 1.1, step: 0.01, live: false,
-        fmt: (v) => v.toFixed(3),
-        hint: 'How much darker the far terrain is painted, to match the close-up pass: that\npass darkens corners with ambient occlusion and the far layer has no corners to darken.\n0.949 is that pass\'s measured mean over 2.7 M sampled vertices (tools/dbg-aohist.mjs). Raise it\nif far ground reads paler than near ground, lower it if it reads darker. URL: ?aofar=',
-        get: () => S.aoFar, set: (v) => { S.aoFar = v; applySettings('aofar'); } },
-
-{ kind: 'section', key: 'sec_hidden', label: 'what is left out (caves, underground, overlap)', open: false,
-        hint: 'The renderer skips geometry you cannot see to afford the whole world. Each row is one of\nthose rules, off by default where it cost visible ground.' },
-
-      { key: 'caves', label: 'mesh unlit caves', kind: 'check', live: false,
-        hint: 'Off (default) does not draw faces no light touches - the rock deep in a cave, the back of\n a tunnel. They were the majority of the vertex and mesh-time budget for something no\n camera can see. On draws every face, which is the old behaviour. URL: ?caves=1',
-        get: () => S.caves, set: (v) => { S.caves = v ? 1 : 0; applySettings('light'); } },
-
-      { key: 'darkcut', label: 'what counts as unlit', min: 0, max: 15, step: 1, live: false,
-        fmt: (v) => S.caves ? 'caves drawn anyway' : (v <= 0 ? 'pitch dark only' : `light <= ${v}`),
-        hint: 'The save stores light on a 0-15 scale. 0 (default) drops only faces in total darkness;\n raise it and the dim fringe of a torch pool goes too, which saves more and eats cave\n mouths. Faces whose light is unknown (neighbour chunk not loaded) are always kept. URL: ?darkcut=',
-        get: () => S.darkcut,
-        set: (v) => { S.darkcut = Math.min(15, Math.max(0, v | 0)); applySettings('light'); } },
-
-      { key: 'buried', label: 'what counts as underground', min: 0, max: 32, step: 1, live: false,
-        fmt: (v) => S.caves ? 'caves drawn anyway' : (v <= 0 ? 'only pitch dark' : `${v}+ blocks of rock`),
-        hint: 'A lava pool 30 m down is lit - by the lava - and still invisible from above ground. A face\nwhose air cell sits this many blocks under the surface of its own column, and gets no skylight\nthere, is not drawn. A ravine keeps its walls: its air has skylight. 0 turns it off. URL: ?buried=',
-        get: () => S.buried,
-        set: (v) => { S.buried = Math.min(64, Math.max(0, v | 0)); applySettings('light'); } },
-
-      { key: 'surface', label: 'mesh the surface only', kind: 'check', live: false,
-        hint: 'Off (default). On, a detail face is drawn only if opaque rock does not sit above the air it\nlooks into: the world is meshed as a skin, not as a block of rock. 24 sampled chunks: 16,184 verts\nand 25.9 ms per chunk as it runs, 13,659 verts and 19.9 ms as a skin (-16 % / -23 %). It is off\nbecause that saving is smaller than the dark and buried rules already give, and it eats the shallow\ncaves - mine entrances and galleries under a thin lid stop being drawn. Leaves and water are not\ncover, so a forest floor and a lake bed do survive. URL: ?surface=1',
-        get: () => S.surface,
-        set: (v) => { S.surface = v ? 1 : 0; applySettings('light'); } },
-
-      { key: 'buriedsky', label: 'skylight that still counts as open sky', min: 0, max: 15, step: 1,
-        fmt: (v) => (v | 0),
-        hint: 'A face under the surface skin is dropped only if the air in front of it gets no more \nthan this much skylight. Modded and Starlight light fields are not tidy: a sealed cavern reads \nskylight 1-2 in places, and demanding total darkness leaves floating scraps on cave walls. \nAt 15 nothing is ever dropped for being underground. URL: ?buriedsky',
-        get: () => S.buriedSky,
-        set: (v) => { S.buriedSky = Math.max(0, Math.min(15, v | 0)); applySettings('light'); } },
-
-      { key: 'underfar', label: 'hide the surface layer underground', kind: 'check', live: true,
-        hint: 'Down in a cavern the far layers are not a far view, they are the *surface*: their coarse \nplates and skirt walls hang around you as floating scraps, and cost verts and frames for nothing. \nWhen the block you stand in gets no skylight those layers stand down, until you are back under open \nskylight. A ravine keeps its walls - its floor sees the sky. URL: ?nounderfar',
-        get: () => S.underFar,
-        set: (v) => { S.underFar = v ? 1 : 0; } },
-
-      { key: 'underdepth', label: 'blocks underground before the far view returns', min: 0, max: 24, step: 1,
-        fmt: (v) => (v | 0),
-        hint: 'How far below the surface skin the eye has to be before the far layers stand down. Small \nkeeps the ground painted around a shallow hole; large means the plates vanish the moment you \ndip under a canopy. URL: ?underdepth',
-        get: () => S.underDepth,
-        set: (v) => { S.underDepth = Math.max(0, v | 0); } },
-
-      { key: 'cullcovered', label: 'drop walls the far view already paints', kind: 'check', live: false,
-        hint: 'The edge of the loaded area is a full-depth wall of dirt down to the void. When the \nfar layer paints that ground the wall is hidden behind it, so it is not meshed at all - \nfewer trixels and no black band while chunks stream in. Where the save has no chunk there \n(a world frontier) the wall stays: it is the only thing painting that ground. Off restores \nevery wall. URL: ?nocullcovered',
-        get: () => S.cullCovered, set: (v) => { S.cullCovered = v ? 1 : 0; applySettings('light'); } },
-      { key: 'caps', label: 'draw canopies as skin, not as towers', kind: 'check', live: false,
+      { kind: 'note', key: 'note_zoom', text: 'zoom with the mouse wheel - drag on empty sky to look around' },
+      { kind: 'section', key: 'sec_far', label: 'the far world', open: false,
+        hint: 'The ground outside the close ring: how it is drawn, how coarse it is allowed to get, and\n'
+          + 'what that costs in triangles.' },
+      { key: 'shellon', label: 'live far terrain', kind: 'check', live: false,
+        hint: 'Off shows only the close detail ring - useful for seeing what the far pass is doing. URL: ?noshell',
+        get: () => S.shellOn, set: (v) => { S.shellOn = v; applySettings('shellOn'); } },
+      { key: 'overview', label: 'world layer', kind: 'check',
+        hint: 'One request that paints the whole dimension as a coarse heightmap - what you see when zoomed\nfar out, without streaming 37 000 chunk shells. Needs `node server/bake-shells.mjs`.\nURL: ?nooverview',
+        get: () => S.overview,
+        set: (v) => { S.overview = v; recomputeZoom(); ovGroup.visible = S.shellOn && v; if (!v) clearOverview(); else loadOverview(currentDim()); } },
+      { key: 'farshape', label: 'far terrain stands at', min: 0, max: 1, step: 1,
+        fmt: (v) => ['treetops', 'the ground'][v],
+        hint: 'What the coarse far terrain stands at. Trees, flowers and lake water are not a floor: a\ncell of grass under a 12 m spruce used to hang a 12 m dirt cliff under the treetops, and a cell of\nsand under 20 m of lake water drew a blue sheet. Default stands the cell on the solid ground and\nkeeps the lake skin. URL: ?groundfar',
+        get: () => S.groundFar, set: (v) => { S.groundFar = Math.max(0, Math.min(1, v | 0)); applySettings('lod'); } },
+      { key: 'caps', label: 'canopies as skin, not towers', kind: 'check', live: false,
         hint: 'The far layer carries a second number per column besides its height: how thick the solid\n'
           + 'skin at the surface is. With this on, a cell paints its ground and draws that skin where the\n'
           + 'skin actually stands: a canopy gets a roof at the leaves and four walls across the thickness\n'
@@ -3675,194 +3683,205 @@ function buildPanel() {
           + 'not worth a roof and four walls: 4 by default. A cap is a box as wide as the cell, so past\n?capcell blocks per column it is refused: a cap on a 16-block column is a plateau with a lid, which is\nhow a distant tree became a monolith again. URL: ?caps, ?nocaps, ?capdrop, ?capcell',
         get: () => !!S.caps,
         set: (v) => { S.caps = v ? 1 : 0; applySettings('caps'); } },
-
-      { key: 'capcell', label: 'biggest cell that gets a canopy cap', min: 0, max: 4, step: 1, live: false,
-        fmt: (v) => (v === 0 ? 'no cap, any cell' : `${[1, 2, 4, 8, 16][v]} blk columns`),
+      { key: 'capcell', label: 'canopy cap up to cell', min: 0, max: 4, step: 1, live: false,
+        fmt: (v) => (v === 0 ? 'any cell' : `${[1, 2, 4, 8, 16][v]} blk`),
         hint: 'How coarse a far column may be and still get its surface drawn as its own skin. A cap is a\nbox as wide as the cell, so 4 means caps only on 1, 2 and 4-block columns; at 16 a cap is a plateau\nwith a lid. 0 refuses caps at every cell size. Baked tiles carry their own answer. URL: ?capcell',
         get: () => [1, 2, 4, 8, 16].indexOf(S.capCell),
         set: (v) => { S.capCell = [1, 2, 4, 8, 16][v] || 255; applySettings('caps'); } },
-
-      { key: 'lodclip', label: 'hide baked tiles under the close view', kind: 'check', live: true,
+      { key: 'lodclip', label: 'hide baked tiles up close', kind: 'check', live: true,
         hint: 'A baked tile is one mesh over 512x512 blocks, so it cannot be unloaded near the camera -\nit is clipped there instead, or its 16 block columns stand over the close terrain as flat slabs\nwith straight cliff walls. Off draws them everywhere. URL: ?nolodclip',
         get: () => S.lodClip, set: (v) => { S.lodClip = v ? 1 : 0; updateLodClip(); } },
-
-{ key: 'flatback', label: 'paint the underside of far ground', kind: 'check', live: true,
+      { key: 'flatback', label: 'paint far ground from below', kind: 'check', live: true,
         hint: 'The far layers are a height field: a top quad and skirt walls, with no bottom cap. From\nbelow - in a cave, under an overhang, orbiting under the plateau - the back of that plate was\nculled, so you looked straight through the ground at the sky. On paints the same quads from behind:\ncosts fill, not geometry. Off is the old see-through behaviour. URL: ?noflatback',
         get: () => S.flatBack, set: (v) => { S.flatBack = v ? 1 : 0; setCoarseSide(); } },
-
-{ kind: 'section', key: 'sec_lod', label: 'how far the detail reaches (LOD)', open: false,
-        hint: 'Which ground is built block by block, which is a cheap height field, and what that costs.' },
-
-{ key: 'lodanchor', label: 'keep the sharp ground in the middle of the view', kind: 'check', live: false,
-        hint: 'How far a patch of far terrain sits from the middle of the view decides how coarse it gets,\nso the ground under the crosshair stays sharp at any zoom and only the rim of the view goes\ncoarse. The other rule asks how close the orbiting eye can get instead, which is a function of\nthe zoom: pull back and the middle of the frame goes to coarse plates too, and the whole skin\nunloads and reloads on the way. URL: ?lodanchor=approach',
-        get: () => S.lodAnchor === 'center',
-        set: (v) => { S.lodAnchor = v ? 'center' : 'approach'; retierPatches(); } },
-
-      { key: 'farshape', label: 'far terrain stands at', min: 0, max: 1, step: 1,
-        fmt: (v) => ['treetops', 'the ground'][v],
-        hint: 'What the coarse far terrain stands at. Trees, flowers and lake water are not a floor: a\ncell of grass under a 12 m spruce used to hang a 12 m dirt cliff under the treetops, and a cell of\nsand under 20 m of lake water drew a blue sheet. Default stands the cell on the solid ground and\nkeeps the lake skin. URL: ?groundfar',
-        get: () => S.groundFar, set: (v) => { S.groundFar = Math.max(0, Math.min(1, v | 0)); applySettings('lod'); } },
-
       { key: 'lodcap', label: 'live far grid stops at', min: 0, max: 16, step: 1,
         fmt: (v) => (v ? `${v} blocks` : 'never (mesh it all)'),
         hint: 'How coarse the browser-meshed far terrain is allowed to get before the baked tiles take\nover. Its only job is to not leave a gap where the tiles are already painting the same ground.\nURL: ?lodcap',
         get: () => S.lodCap,
         set: (v) => { S.lodCap = Math.max(0, Math.min(16, v | 0)); applySettings('lodtiles'); } },
-
-      { key: 'detailsharp', label: 'detail sharpness', min: 0.5, max: 12, step: 0.25,
-        fmt: (v) => `${v} px`,
-        hint: 'How close you have to be before a block is worth its own triangles - one block must still\ncover this many pixels. Zoom out past that and the cheap far terrain paints it instead: a 26 km\npull-back used to keep every full-res chunk of the spawn area on the GPU. URL: ?detailpx',
-        get: () => S.detailPx, set: (v) => { S.detailPx = Math.max(0.25, v); applySettings('detailpx'); } },
-
-      { key: 'detaillod', label: 'voxel detail regardless of zoom', kind: 'check', live: false,
-        hint: 'Off keeps every loaded chunk built block by block even from kilometres out - the old\nbehaviour, and the honest way to compare what the LOD is buying you. URL: ?nodetaillod',
-        get: () => S.detailLod, set: (v) => { S.detailLod = v; applySettings('detailpx'); } },
-
       { key: 'maxradius', label: 'detail skin radius', min: 8, max: 160, step: 8, live: false,
         fmt: (v) => `${v * CH} m`,
         hint: 'Radius of the per-chunk heightmap skin. Beyond it the whole-world overview takes over, so\nthis only changes how much of the near-ish world is at full column resolution. URL: ?maxradius',
         get: () => S.skinCap, set: (v) => { S.skinCap = clampInt(v, 8, 160); applySettings('skin'); } },
-
-      { key: 'meshcache', label: 'keep meshes when zoomed out', min: 0, max: 2048, step: 64, live: false,
-        fmt: (v) => (v ? `${v | 0} MB` : 'off, re-mesh instead'),
-        hint: 'Zooming out throws a chunk\'s triangles away, and zooming back in used to rebuild them\nat ~51 ms a chunk - the hitch when you come back. This keeps the vertex bytes of the\nchunks you left behind (the payload ring already keeps their voxels), so returning is a\nGPU upload. RAM, not disk: 256 MB is about 350 chunks. 0 disables it. URL: ?meshcache=',
-        get: () => S.meshCacheMb,
-        set: (v) => { S.meshCacheMb = Math.max(0, v); trimMeshBytes(); } },
-
-      { key: 'shellon', label: 'draw far terrain', kind: 'check', live: false,
-        hint: 'Off shows only the close detail ring - useful for seeing what the far pass is doing. URL: ?noshell',
-        get: () => S.shellOn, set: (v) => { S.shellOn = v; applySettings('shellOn'); } },
-
-      { key: 'overview', label: 'world layer', kind: 'check',
-        hint: 'One request that paints the whole dimension as a coarse heightmap - what you see when zoomed\nfar out, without streaming 37 000 chunk shells. Needs `node server/bake-shells.mjs`.\nURL: ?nooverview',
-        get: () => S.overview,
-        set: (v) => { S.overview = v; recomputeZoom(); ovGroup.visible = S.shellOn && v; if (!v) clearOverview(); else loadOverview(currentDim()); } },
-
-      { key: 'ovstep', label: 'world layer cliff step', min: 0, max: 32, step: 1,
-        fmt: (v) => (v ? `${v} m` : 'every step'),
-        hint: 'Height difference before the coarse layer draws a cliff wall; 0 draws every one. URL: ?ovstep',
-        get: () => S.ovStep, set: (v) => { S.ovStep = Math.max(0, v | 0); } },
-
-      { key: 'fog', label: 'fog', min: 0, max: 3, step: 0.05,
-        fmt: (v) => (v ? `${Math.round(fogFor(rig.dist, skinR, { scale: v }).far)} m` : 'off'),
-        hint: 'How fast distance fades into the sky colour; 0 is no fog. URL: ?fog',
-        get: () => S.fog, set: (v) => { S.fog = Math.max(0, v); applySettings('fog'); } },
-
-      { key: 'minradius', label: 'far view floor', min: 4, max: 128, step: 4, live: false,
-        fmt: (v) => `${v * CH} m`, hint: 'Far view kept even when zoomed right in. URL: ?minradius',
-        get: () => S.skinFloor, set: (v) => { S.skinFloor = Math.max(4, v | 0); applySettings('skin'); } },
-
-      { key: 'lodquality', label: 'far world quality', min: 0, max: 100, step: 5, live: false,
-        fmt: (v) => (v >= 100 ? 'as coarse as it likes (16 blk)' : `never coarser than ${[1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(v / 10)]} blk`),
-        hint: 'How far the LOD is allowed to drop in quality: the coarsest column the far view may use,\napplied where a coarse column would really be a blob on screen. 100 is today: 16-block columns at the\nhorizon, which is why a distant tree is one column and a distant house is a slab. Pull it in for shape\nand pay vertices: finer than the baked rungs (4 blocks) the live far grid has to draw that ground itself,\nand the baked tiles keep their rung instead of leaving a hole. URL: ?lodquality',
-        get: () => S.lodQuality,
-        set: (v) => { S.lodQuality = Math.max(0, Math.min(100, v | 0));
-          S.lodMaxCell = [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(S.lodQuality / 10)];
-          applySettings('lod'); } },
-
-      { key: 'cellmax', label: 'coarsest far grid', min: 0, max: 4, step: 1, live: false,
-        fmt: (v) => `${CELLS16[v]} blk`,
-        hint: 'Ceiling on how coarse the far grid may get, however small it is on screen. URL: ?cellmax',
-        get: () => CELLS16.indexOf(S.cellMax), set: (v) => { S.cellMax = CELLS16[v]; applySettings('lod'); } },
-
       { key: 'vertbudget', label: 'far terrain verts', min: 500000, max: 40000000, step: 500000, live: false,
         fmt: (v) => `${(v / 1e6).toFixed(1)} M`,
         hint: 'How much heightmap terrain the page may hold, in vertices - memory, not taste. Over\nthis, the far grid merges more (and its cliff walls shrink) until it fits. URL: ?vertbudget',
         get: () => S.vertBudget,
         set: (v) => { S.vertBudget = Math.max(200000, v | 0); applySettings('lod'); } },
-
-      { key: 'colbudget', label: 'far grid columns', min: 50000, max: 2000000, step: 50000, live: false,
-        fmt: (v) => `${(v / 1e6).toFixed(2)} M`,
-        hint: 'How many heightmap columns the far terrain may hold. This, not distance, decides how\nfar away the grid starts merging. URL: ?colbudget',
-        get: () => S.cellBudget, set: (v) => { S.cellBudget = Math.max(20000, v | 0); applySettings('lod'); } },
-
-      { key: 'patch', label: 'batch size', min: 1, max: 32, step: 1, live: false,
-        hint: 'Chunks per far-terrain batch; one batch is one draw call. URL: ?patch',
-        get: () => S.patch, set: (v) => { S.patch = Math.max(1, v | 0); applySettings('patch'); } },
-
-      { key: 'skirt', label: 'cliff wall height', min: 0, max: 96, step: 4, live: false,
-        hint: 'How far down the side of a cliff is drawn in the far view, in blocks. 0 shows cliff tops\nonly, which reads as floating terrain from the side. URL: ?skirt',
-        get: () => S.skirt, set: (v) => { S.skirt = Math.max(0, v | 0); applySettings('skirt'); } },
-
-      { key: 'blend', label: 'far colour blending', min: 0, max: 1, step: 0.05, live: false,
-        hint: 'How much a coarse far cell borrows the colour around it. Too high and a stone field next\nto a forest turns green. URL: ?blend',
-        get: () => S.blend, set: (v) => { S.blend = Math.min(1, Math.max(0, v)); applySettings('blend'); } },
-
-      { kind: 'section', key: 'adv', label: 'advanced (how the renderer works)', open: false,
-        hint: 'How the far terrain is decimated, batched and meshed. Nothing here is needed to look at\nthe world; the URL name of each control is in its tooltip.' },
-
-      { key: 'invert', label: 'invert orbit drag', kind: 'check',
-        hint: 'Off (default) is mouse-look: drag right and the view turns right. On grabs the world and\nspins it with the cursor, like right-drag pan. URL: ?invert',
-        get: () => S.invert, set: (v) => { S.invert = v; } },
-
-      { key: 'mipmax', label: 'texture blur limit', min: 0, max: 10, step: 1, live: false,
-        hint: 'How deep the texture mip chain goes. Deep levels average neighbouring sprites together\nand read as grey mush, which is why this is capped. URL: ?mipmax',
-        get: () => S.mipmax, set: (v) => { S.mipmax = v; if (atlasTex) mipCap = capAtlasMipLevel(atlasTex, v); } },
-
-      { key: 'alphatest', label: 'leaf cutout', min: 0, max: 1, step: 0.01,
-        hint: 'How much of a leaf/grass sprite has to be solid to be drawn. URL: ?alphatest',
-        get: () => S.alphaTest, set: (v) => { S.alphaTest = v; applySettings('alphaTest'); } },
-
+      { key: 'meshcache', label: 'keep meshes when zoomed out', min: 0, max: 2048, step: 64, live: false,
+        fmt: (v) => (v ? `${v | 0} MB` : 'off, re-mesh instead'),
+        hint: 'Zooming out throws a chunk\'s triangles away, and zooming back in used to rebuild them\nat ~51 ms a chunk - the hitch when you come back. This keeps the vertex bytes of the\nchunks you left behind (the payload ring already keeps their voxels), so returning is a\nGPU upload. RAM, not disk: 256 MB is about 350 chunks. 0 disables it. URL: ?meshcache=',
+        get: () => S.meshCacheMb,
+        set: (v) => { S.meshCacheMb = Math.max(0, v); trimMeshBytes(); } },
+      { key: 'fog', label: 'fog', min: 0, max: 3, step: 0.05,
+        fmt: (v) => (v ? `${Math.round(fogFor(rig.dist, skinR, { scale: v }).far)} m` : 'off'),
+        hint: 'How fast distance fades into the sky colour; 0 is no fog. URL: ?fog',
+        get: () => S.fog, set: (v) => { S.fog = Math.max(0, v); applySettings('fog'); } },
+      { kind: 'section', key: 'sec_light', label: 'light, and what is left out', open: false,
+        hint: 'How the world is shaded, and the rules that skip geometry you cannot see to afford the\n'
+          + 'whole save. Each row says what it drops.' },
       { key: 'aoon', label: 'corner shadows', kind: 'check', live: false,
         hint: 'On/off for the whole ambient-occlusion pass. URL: ?noao',
         get: () => S.ao, set: (v) => { S.ao = v; applySettings('ao'); } },
-
       { key: 'lighton', label: 'light from the save', kind: 'check', live: false,
         hint: 'Sky and block light decoded from the chunk data. Off is the old flat shading, kept for\ncomparison. URL: ?nolight',
         get: () => !!S.light, set: (v) => { S.light = !!v; applySettings('light'); } },
-
-      { key: 'shelltex', label: 'texture far terrain', kind: 'check', live: false,
-        hint: 'Off by default: at far distances the texture of a block is squeezed under a single screen pixel, which rings and reads as noise. auto textures a patch once its cells are texpx across, ?shelltex=2 always, ?texpx= sets the crossover.',
-        get: () => !!S.shellTex, set: (v) => { S.shellTex = v ? 1 : 0; applySettings('shelltex'); } },
-
-      { key: 'texpx', label: 'far paint switches at', min: 0, max: 6, step: 0.2, live: false,
-        fmt: (v) => `${v.toFixed(1)} px`,
-        hint: 'How many pixels across a far quad has to be before it is worth drawing the real sprite\ninstead of a flat plate of its mean colour. Under a pixel a sprite samples one texel and reads as\nflickering noise, which is why the far horizon stays flat. URL: ?texpx',
-        get: () => S.texPx, set: (v) => { S.texPx = Math.max(0, v); applySettings('texpx'); } },
-
-      { key: 'budget', label: 'meshing ms per frame', min: 0, max: 40, step: 1,
-        hint: 'Time per frame spent building close-up chunk meshes. Higher loads faster but hitches. URL: ?budget',
-        get: () => S.budget, set: (v) => { S.budget = v; } },
-
-      { key: 'sbudget', label: 'far meshing ms per frame', min: 0, max: 60, step: 1,
-        hint: 'Same, for far-terrain batches. URL: ?sbudget',
-        get: () => S.shellBudget, set: (v) => { S.shellBudget = v; } },
-
-      { key: 'shellQuiesce', label: 'far redraw wait (ms)', min: 0, max: 1000, step: 50, live: false,
-        hint: 'How long a block of far terrain waits after new ground arrives under it before it is drawn again. Short fills in sooner but redraws the same area many times while a load is still arriving. URL: ?quiesce',
-        get: () => S.shellQuiesce, set: (v) => { S.shellQuiesce = Math.max(0, v); } },
-
+      { key: 'daylight', label: 'daylight', min: 0, max: 1, step: 0.05, live: false,
+        fmt: (v) => v < 0.02 ? 'torches only' : `${Math.round(v * 100)}%`,
+        hint: 'How much of the sky channel counts. Lower it to read torch/cave light on the surface\nwithout the daylight flattening it. Block light is always full. URL: ?skyscale=',
+        get: () => S.skyScale,
+        set: (v) => { S.skyScale = Math.min(1, Math.max(0, v)); applySettings('light'); } },
+      { key: 'aofar', label: 'far brightness match', min: 0.6, max: 1.1, step: 0.01, live: false,
+        fmt: (v) => v.toFixed(3),
+        hint: 'How much darker the far terrain is painted, to match the close-up pass: that\npass darkens corners with ambient occlusion and the far layer has no corners to darken.\n0.949 is that pass\'s measured mean over 2.7 M sampled vertices (tools/dbg-aohist.mjs). Raise it\nif far ground reads paler than near ground, lower it if it reads darker. URL: ?aofar=',
+        get: () => S.aoFar, set: (v) => { S.aoFar = v; applySettings('aofar'); } },
+      { key: 'darkcut', label: 'what counts as unlit', min: 0, max: 15, step: 1, live: false,
+        fmt: (v) => S.caves ? 'caves drawn anyway' : (v <= 0 ? 'pitch dark only' : `light <= ${v}`),
+        hint: 'The save stores light on a 0-15 scale. 0 (default) drops only faces in total darkness;\n raise it and the dim fringe of a torch pool goes too, which saves more and eats cave\n mouths. Faces whose light is unknown (neighbour chunk not loaded) are always kept. URL: ?darkcut=',
+        get: () => S.darkcut,
+        set: (v) => { S.darkcut = Math.min(15, Math.max(0, v | 0)); applySettings('light'); } },
+      { key: 'buried', label: 'what counts as underground', min: 0, max: 32, step: 1, live: false,
+        fmt: (v) => S.caves ? 'caves drawn anyway' : (v <= 0 ? 'only pitch dark' : `${v}+ blocks of rock`),
+        hint: 'A lava pool 30 m down is lit - by the lava - and still invisible from above ground. A face\nwhose air cell sits this many blocks under the surface of its own column, and gets no skylight\nthere, is not drawn. A ravine keeps its walls: its air has skylight. 0 turns it off. URL: ?buried=',
+        get: () => S.buried,
+        set: (v) => { S.buried = Math.min(64, Math.max(0, v | 0)); applySettings('light'); } },
+      { key: 'surface', label: 'mesh the surface only', kind: 'check', live: false,
+        hint: 'Off (default). On, a detail face is drawn only if opaque rock does not sit above the air it\nlooks into: the world is meshed as a skin, not as a block of rock. 24 sampled chunks: 16,184 verts\nand 25.9 ms per chunk as it runs, 13,659 verts and 19.9 ms as a skin (-16 % / -23 %). It is off\nbecause that saving is smaller than the dark and buried rules already give, and it eats the shallow\ncaves - mine entrances and galleries under a thin lid stop being drawn. Leaves and water are not\ncover, so a forest floor and a lake bed do survive. URL: ?surface=1',
+        get: () => S.surface,
+        set: (v) => { S.surface = v ? 1 : 0; applySettings('light'); } },
+      { key: 'underfar', label: 'hide the surface layer underground', kind: 'check', live: true,
+        hint: 'Down in a cavern the far layers are not a far view, they are the *surface*: their coarse \nplates and skirt walls hang around you as floating scraps, and cost verts and frames for nothing. \nWhen the block you stand in gets no skylight those layers stand down, until you are back under open \nskylight. A ravine keeps its walls - its floor sees the sky. URL: ?nounderfar',
+        get: () => S.underFar,
+        set: (v) => { S.underFar = v ? 1 : 0; } },
+      { key: 'underdepth', label: 'far view returns after (blocks)', min: 0, max: 24, step: 1,
+        fmt: (v) => (v | 0),
+        hint: 'How far below the surface skin the eye has to be before the far layers stand down. Small \nkeeps the ground painted around a shallow hole; large means the plates vanish the moment you \ndip under a canopy. URL: ?underdepth',
+        get: () => S.underDepth,
+        set: (v) => { S.underDepth = Math.max(0, v | 0); } },
+      { key: 'mipmax', label: 'texture blur limit', min: 0, max: 10, step: 1, live: false,
+        hint: 'How deep the texture mip chain goes. Deep levels average neighbouring sprites together\nand read as grey mush, which is why this is capped. URL: ?mipmax',
+        get: () => S.mipmax, set: (v) => { S.mipmax = v; if (atlasTex) mipCap = capAtlasMipLevel(atlasTex, v); } },
+      { key: 'alphatest', label: 'leaf cutout', min: 0, max: 1, step: 0.01,
+        hint: 'How much of a leaf/grass sprite has to be solid to be drawn. URL: ?alphatest',
+        get: () => S.alphaTest, set: (v) => { S.alphaTest = v; applySettings('alphaTest'); } },
+      { kind: 'section', key: 'sec_perf', label: 'speed and controls', open: false,
+        hint: 'How much work and how many pixels a frame may spend, and which threads do it.' },
       { key: 'res', label: 'draw resolution', min: 0.4, max: 1, step: 0.05, live: true,
         hint: 'How many pixels are drawn, as a fraction of the screen. Below 1 the image is rendered smaller\nand stretched, which is the cheapest way to gain frame rate. Auto mode only lowers it when the GPU\nitself is the limit and the terrain is fully loaded. URL: ?res=0.75 ?noautores',
         get: () => S.res,
         set: (v) => { S.res = Math.max(0.4, Math.min(2, v)); resAuto = 1; applyRes(); } },
-
       { key: 'resAuto', label: 'auto resolution', min: 0, max: 1, step: 1, live: true,
         labels: ['manual', 'auto'],
         hint: 'Shrink the drawn resolution only when the graphics card is the limit, the view is fully\nloaded, and the frame is still slower than the target. Needs a browser that reports GPU time. URL: ?noautores',
         get: () => S.resAuto, set: (v) => { S.resAuto = v | 0; applyRes(); } },
-
       { key: 'targetFps', label: 'target frame rate', min: 20, max: 120, step: 5, live: true,
         hint: 'What auto resolution aims at. URL: ?targetfps',
         get: () => S.targetFps, set: (v) => { S.targetFps = Math.max(20, Math.min(120, v | 0)); } },
-
-      { key: 'patchthreads', label: 'far cut threads', min: 0, max: 6, step: 1, live: true,
-        hint: 'How many of the meshing threads may take a far patch cut at once. A cut is 20-25 ms and a\nframe is 16, so it runs there instead of here. Across a 5 s drag the worst frame measured 60 ms\nwith 0 of these, 29 ms with 2 and 18 ms with 6; the settled view is the same either way (598\npatches, 6 309 216 verts). Cuts are only ever posted up to this many at a time, so the pool keeps\nthe rest for chunk detail: reserving 7 of 8 for a queue that can hold 6 left detail chunks unmeshed\nfor 13 s after a pan. A machine that started 4 workers gets 2 cut threads. URL: ?patchworkers',
-        get: () => patchCap(),
-        set: (v) => { S.patchWorkers = Math.max(0, Math.min(6, v | 0)); } },
+      { key: 'budget', label: 'meshing ms per frame', min: 0, max: 40, step: 1,
+        hint: 'Time per frame spent building close-up chunk meshes. Higher loads faster but hitches. URL: ?budget',
+        get: () => S.budget, set: (v) => { S.budget = v; } },
+      { key: 'sbudget', label: 'far meshing ms per frame', min: 0, max: 60, step: 1,
+        hint: 'Same, for far-terrain batches. URL: ?sbudget',
+        get: () => S.shellBudget, set: (v) => { S.shellBudget = v; } },
       { key: 'workers', label: 'meshing threads', min: 0, max: 8, step: 1, live: false,
         hint: 'Background threads that build chunk meshes. Changing this restarts them (a moment of stutter).\n0 meshes on the render thread instead. URL: ?workers',
         get: () => workerCount(),
         set: (v) => { S.workers = Math.max(0, Math.min(8, v | 0)); resetWorkers(); } },
-  ],
+      { key: 'patchthreads', label: 'far cut threads', min: 0, max: 6, step: 1, live: true,
+        hint: 'How many of the meshing threads may take a far patch cut at once. A cut is 20-25 ms and a\nframe is 16, so it runs there instead of here. Across a 5 s drag the worst frame measured 60 ms\nwith 0 of these, 29 ms with 2 and 18 ms with 6; the settled view is the same either way (598\npatches, 6 309 216 verts). Cuts are only ever posted up to this many at a time, so the pool keeps\nthe rest for chunk detail: reserving 7 of 8 for a queue that can hold 6 left detail chunks unmeshed\nfor 13 s after a pan. A machine that started 4 workers gets 2 cut threads. URL: ?patchworkers',
+        get: () => patchCap(),
+        set: (v) => { S.patchWorkers = Math.max(0, Math.min(6, v | 0)); } },
+      { key: 'invert', label: 'invert orbit drag', kind: 'check',
+        hint: 'Off (default) is mouse-look: drag right and the view turns right. On grabs the world and\nspins it with the cursor, like right-drag pan. URL: ?invert',
+        get: () => S.invert, set: (v) => { S.invert = v; } },
+  ];
+  panel = mountPanel({ title: 'settings  (P)', items,
     actions: [
-      { label: 'see the whole world', hint: 'pull back until the entire loaded extent fits the frame',
-        run: () => { rig.pitch = 0.72; rig.dist = S.maxZoom; updateView(); requestAround(); } },
-      { label: 'fit world', hint: 'zoom out to the whole loaded extent (f)', run: () => fitWorld() },
-      { label: 'spawn', hint: 'back to the world spawn (r)',
-        run: () => { rig.target.set(SPAWN[0], SPAWN[1], SPAWN[2]); rig.dist = 40; } },
+      { label: 'whole world', run: () => preset('whole world'),
+        hint: 'the whole save in the frame, at the coarsest far setting that still holds shape:\nbaked far tiles on, live far grid capped, the close ring kept' },
+      { label: 'walk around', run: () => preset('walk around'),
+        hint: 'close in and everything real: a wide close ring around the middle of the view,\nunlit ground drawn, the coarse world turned down' },
+      { label: 'caves', run: () => preset('caves'),
+        hint: 'draw the unlit underground, and stop hiding ground that is merely buried\nor in the dark' },
+      { label: 'fast', run: () => preset('fast'),
+        hint: 'fewer pixels, fewer threads, less drawn: for a machine that is struggling' },
+      { label: 'undo', run: undoPreset, hint: 'back to what the panel said before the last preset' },
+      { label: 'fit world', run: () => fitWorld(), hint: 'zoom out to the whole loaded extent (f)' },
+      { label: 'spawn', run: () => { rig.target.set(SPAWN[0], SPAWN[1], SPAWN[2]); rig.dist = 40; },
+        hint: 'back to the world spawn (r)' },
     ],
   });
+
+  // What the panel is pointed at, by name, so a preset can be checked against it instead of against
+  // a copy of the settings that would drift. Presets only name these keys, and every one of them has
+  // a control: that is what makes 'caves' mean caves instead of leaving the dark rule half on.
+  const byKey = new Map(items.filter((it) => it.key).map((it) => [it.key, it]));
+  let presetBack = null, presetCam = null;
+  function preset(name) {
+    const p = PRESETS[name];
+    if (!p) return;
+    presetBack = {};
+    for (const k of Object.keys(p.s)) if (byKey.has(k)) presetBack[k] = byKey.get(k).get();
+    // A preset moves the camera as well, and undo that means the camera too: "undo" on a
+    // "whole world" click should put you back where you were looking, not leave you at the sky.
+    presetCam = { dist: rig.dist, pitch: rig.pitch, x: rig.target.x, y: rig.target.y, z: rig.target.z };
+    for (const [k, v] of Object.entries(p.s)) if (byKey.has(k)) byKey.get(k).set(v);
+    if (p.dist !== undefined) {
+      rig.dist = p.dist || S.maxZoom;
+      rig.pitch = 0.72;
+      updateView();
+      requestAround();
+    }
+    panel.refresh();
+  }
+  function undoPreset() {
+    if (!presetBack) return;
+    for (const [k, v] of Object.entries(presetBack)) if (byKey.has(k)) byKey.get(k).set(v);
+    presetBack = null;
+    if (presetCam) {
+      rig.dist = presetCam.dist; rig.pitch = presetCam.pitch;
+      rig.target.set(presetCam.x, presetCam.y, presetCam.z);
+      presetCam = null;
+      updateView();
+      requestAround();
+    }
+    panel.refresh();
+  }
+
+  // Remember what this viewer was tuned to. Every control writes through the wrapper below, so the
+  // stored values are read back off the controls themselves - not from a snapshot of S that would
+  // disagree with the display units the panel uses (shadow depth is 1 - aoMin, cap cells are an
+  // index). A URL that names anything at all wins outright: a probe link, a copied link or a
+  // ?debug=1 measurement must land on the settings it asks for, not on whatever was last stored.
+  const STORE_KEY = 'darkrpg.viewer.settings.v1';
+  const storedUrl = [...params.keys()].some((k) => k !== 'dim');
+  const storedKeys = items.filter((it) => it.key && it.get && it.set && !it.key.startsWith('sec_'));
+  function remember() {
+    if (storedUrl) return;
+    try {
+      const o = {};
+      for (const it of storedKeys) o[it.key] = it.get();
+      localStorage.setItem(STORE_KEY, JSON.stringify(o));
+    } catch { /* private mode, no room: a remembered view is not worth an error over */ }
+  }
+  function restoreStored() {
+    if (storedUrl) return 0;
+    let o = null;
+    try { o = JSON.parse(localStorage.getItem(STORE_KEY) ?? 'null'); } catch { o = null; }
+    if (!o || typeof o !== 'object') return 0;
+    let n = 0;
+    for (const it of storedKeys) {
+      const v = o[it.key];
+      // Which world was open is not stored either: switching it tears down every store the boot has
+      // just filled. A type that no longer matches means the control changed meaning since the save.
+      if (v === undefined || it.key === 'dim' || typeof it.get() !== typeof v) continue;
+      it.set(v);
+      n++;
+    }
+    return n;
+  }
+  for (const it of items) if (it.set) { const inner = it.set; it.set = (v) => { inner(v); remember(); }; }
+  if (restoreStored()) panel.refresh();
 }
 
 // ---- boot ------------------------------------------------------------------
@@ -3909,10 +3928,9 @@ function buildPanel() {
     requestAround();
     buildPanel();
     requestAnimationFrame(frame);
-    hud.msg.textContent = `${assets.states.length} block states, ${assets.textures.length} textures` +
-      (shellStore ? ` / far terrain to ${S.skinCap * CH} m (grid ${tiers().join('/')})`
-        : ' / far terrain off') +
-      ` / zoom out to ${Math.round(S.maxZoom)} m - p opens settings, f fits the world`;
+    // The pill is quiet unless something is wrong or something is arriving. What the save contains
+    // is a fact for ?debug=1, not a caption over the world.
+    hud.msg.textContent = '';
     hud.dim.addEventListener('change', () => switchDim(hud.dim.value));
   } catch (e) {
     bootError = e;

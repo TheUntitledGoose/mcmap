@@ -7,8 +7,12 @@ build/*
 !build/q-*.js
 !build/*_parse*.cjs
 !build/mk_*.mjs
+!build/mk_*.cjs
+!build/panel_layout.txt
 !build/spec_*.json
 !build/*.mjs
 .cache/
 *.log
 .DS_Store
+
+logs/

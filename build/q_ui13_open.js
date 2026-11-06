@@ -1,0 +1,1 @@
+(() => { const d = [...document.querySelectorAll('.panel-section')]; d.forEach((x) => { x.open = true; }); return d.map((x) => [x.querySelector('summary').textContent, x.querySelectorAll('.panel-row').length]); })()
