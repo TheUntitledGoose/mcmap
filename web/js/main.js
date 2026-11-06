@@ -3617,9 +3617,16 @@ function buildPanel() {
       { key: 'dim', label: 'world', kind: 'select', options: dims,
         hint: 'Which world to look at. Switching keeps every setting and drops nothing but the loaded chunks.',
         get: () => currentDim(), set: (v) => switchDim(v) },
-      { key: 'radius', label: 'close detail', min: 0, max: 24, step: 1, live: false,
-        fmt: (v) => (v ? `${v * CH} m` : 'off'),
-        hint: 'The most terrain built block by block with real textures, around what you look at - a\nceiling, not a promise: zoom out and less of it is drawn, because far away those\ntriangles are smaller than a pixel. Measured at a 257 m orbit: 5 chunks = 169 chunk meshes,\n2.2 M verts, 41 MB held; 8 = 361, 5.2 M, 68 MB; 16 = 1 081, 14 M, ~170 MB and 21 M verts on\nscreen. Bigger is prettier and slower. URL: ?radius',
+      // The useful range is small (a handful of chunks) and the reach is long (the whole view), which a
+      // linear 0..24 bar cannot do: it crowded 4, 8, 12, 16 and 24 into a quarter of the track and made
+      // 64 unreachable. The stops are the values the measurements actually land on.
+      { key: 'radius', label: 'close detail', live: false,
+        // The whole bar reaches 32 chunks (512 m). Not further: at a 300 m orbit the ring also
+        // decides how much voxel data the tab holds, and 32 was already 5 076 chunks and 418 MB of
+        // payload. Beyond that the URL (?radius) is the escape hatch, not the thumb.
+        stops: [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 32],
+        fmt: (v) => (v ? `${v * CH} m - ${v}c` : 'off'),
+        hint: 'The most terrain built block by block with real textures, around what you look at - a\nceiling, not a promise: zoom out and less of it is drawn, because far away those triangles are\nsmaller than a pixel, and the far view takes over. Priced at a 300 m orbit, whole frame:\n8 chunks = 12 M verts and 840 chunks of world data; 12 = 21 M, 1 400; 16 = 32 M, 2 000;\n24 = 58 M, 3 700 and 310 MB; 32 = 79 M, 5 000 and 420 MB, which stops being a frame rate. The\nwheel costs nothing, so pull in before raising this. URL: ?radius',
         get: () => S.radius, set: (v) => { S.radius = Math.max(0, v | 0); applySettings('radius'); } },
       { key: 'farsharp', label: 'far detail', min: 1, max: 6, step: 0.25,
         fmt: (v) => `${v} px`,

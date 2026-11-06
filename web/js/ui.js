@@ -16,6 +16,7 @@ const el = (tag, cls, text) => {
  * @param {object} opts
  *   title   header text
  *   items   [{ key, label, kind: 'range'|'check'|'select'|'section', get, set, min, max, maxFn, step,
+   *             stops,
  *             fmt, hint, live, options, open }]
  *           `live` (default) applies on every input event; otherwise on release only.
  *           A `section` item opens a collapsible group: every item after it lives inside, until the
@@ -40,6 +41,15 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
   // section until one is opened, so the top of the panel stays short.
   let slot = body;
   const fmtDefault = (v, step) => (step >= 1 ? String(Math.round(v)) : v.toFixed(2));
+  // A `stops` row is an index over named values. Both directions of that mapping live here so
+  // a preset or a probe can still speak in real values, and a value that is not on the list
+  // (URL-seeded) lands on the nearest stop instead of being snapped away.
+  const atStop = (stops, i) => stops[Math.max(0, Math.min(stops.length - 1, Math.round(i)))];
+  const stopIndex = (stops, v) => {
+    let best = 0, bd = Infinity;
+    for (let i = 0; i < stops.length; i++) { const d = Math.abs(stops[i] - v); if (d < bd) { bd = d; best = i; } }
+    return best;
+  };
 
   for (const it of items) {
     if (it.kind === 'section') {
@@ -65,6 +75,9 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
     const lab = el('span', 'panel-label', it.label);
     if (it.hint) lab.title = it.hint;
     const out = el('b', 'panel-val');
+    // `stops` lets one row cover a small useful range and a long reach: 0..64 chunks in 19 named
+    // steps, where a linear 0..64 bar would put every sensible value in its first tenth.
+    const stops = Array.isArray(it.stops) ? it.stops : null;
     let input;
     if (it.kind === 'check') {
       input = el('input');
@@ -81,10 +94,10 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
     } else {
       input = el('input');
       input.type = 'range';
-      input.min = it.min ?? 0;
-      input.max = it.max ?? 1;
-      input.step = it.step ?? 0.01;
-      const commit = () => it.set(+input.value);
+      input.min = stops ? 0 : (it.min ?? 0);
+      input.max = String(stops ? stops.length - 1 : (it.max ?? 1));
+      input.step = stops ? 1 : (it.step ?? 0.01);
+      const commit = () => it.set(stops ? atStop(stops, +input.value) : +input.value);
       if (it.live !== false) input.addEventListener('input', commit);
       input.addEventListener('change', commit);      // release, for the controls that re-mesh
     }
@@ -92,11 +105,12 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
     else row.append(lab, input, out);
     slot.append(row);
     rows.set(it.key, {
-      it, input, out,
+      it, input, out, stops,
       fmt: it.fmt ?? ((v) => fmtDefault(v, it.step ?? 1)),
       // A range with no explicit `kind` is still a range - checking `it.kind === 'range'` here was
       // how the zoom slider kept its stale ceiling.
-      max: (it.kind ?? 'range') === 'range' ? (it.maxFn ?? (() => it.max ?? 1)) : null,
+      // a stops row owns its own reach, so the ceiling re-computation must not overwrite it
+      max: (it.kind ?? 'range') === 'range' ? (it.maxFn ?? (stops ? null : (() => it.max ?? 1))) : null,
     });
   }
 
@@ -112,14 +126,14 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
   }
 
   const refresh = () => {
-    for (const { it, input, out, fmt, max } of rows.values()) {      const v = it.get();
+    for (const { it, input, out, fmt, max, stops } of rows.values()) {      const v = it.get();
       if (it.kind === 'check') input.checked = !!v;
       else if (it.kind === 'select') { if (input.value !== String(v)) input.value = v; }
       else {
         // A slider whose reach depends on other settings (the zoom slider tops out where the far
         // view runs out) gets its ceiling here, so it cannot be dragged into empty sky.
         if (max) input.max = max();
-        if (document.activeElement !== input) input.value = v;
+        if (document.activeElement !== input) input.value = stops ? stopIndex(stops, v) : v;
         out.textContent = fmt(v, it.step ?? 1);
       }
     }
