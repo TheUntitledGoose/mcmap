@@ -127,7 +127,12 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
 
   const refresh = () => {
     for (const { it, input, out, fmt, max, stops } of rows.values()) {      const v = it.get();
-      if (it.kind === 'check') input.checked = !!v;
+      if (it.kind === 'check') {
+        input.checked = !!v;
+        // A tick can still be worth a sentence: a check row that declares `fmt` says what it is on
+        // about ("on - to 739 m"), which is the part a tick cannot show. Rows without one stay bare.
+        if (it.fmt) out.textContent = fmt(v);
+      }
       else if (it.kind === 'select') { if (input.value !== String(v)) input.value = v; }
       else {
         // A slider whose reach depends on other settings (the zoom slider tops out where the far

@@ -46,11 +46,14 @@ const S = {
   // ground, ~290 chunk meshes, ~4 M verts. The panel row goes to 24 for people with the GPU for it.
   detailPx: num('detailpx', 1),            // a 1-block column must cover this many px to earn triangles
   detailLod: !params.has('nodetaillod'),   // off = the old behaviour: full res whatever the zoom
-  // Should the sharp ring shrink when the zoom makes its one-block columns sub-pixel?
-  // URL: ?detailpixels=1. Off by default: the stated policy is that the sharp region stays
-  // near the middle of the view at any zoom (?lodanchor=center), and this row is the A/B that
-  // prices that preference rather than silently reversing it.
-  detailPixels: params.has('nodetailpixels') ? 0 : (num('detailpixels', 0) ? 1 : 0),
+  // Should the sharp ring shrink when the zoom makes its one-block columns sub-pixel? ON by default.
+  // Priced at a 1 200 m orbit (radius 8, `build/q_pancount.js`): the sharp ring is 361 chunks,
+  // 5.19 M verts and 727 chunk meshes per pan - 19 s of worker CPU, 3 s of settling, 57 fps after
+  // the pan. Pixel-limited it is 0 chunks, 9.4 M verts, 102 meshes, 2.7 s, 1 s, 240 fps - and
+  // 2.7 % of the pixels change (`build/shot_dp_off.png` / `shot_dp_on.png`). The limit is not a
+  // distance: it is "a one-block column must cover a pixel", so at this window the sharp ring
+  // reaches 739 m out and nothing changes closer in than that. URL: ?detailpixels=0 / ?nodetailpixels
+  detailPixels: params.has('nodetailpixels') ? 0 : (num('detailpixels', 1) ? 1 : 0),
   payloadLead: num('payloadlead', 6),
   // Re-mark the sharp ring when the view centre moves (URL: ?noringscan). A pan slides the
   // ring over payloads that were pre-fetched and already dropped from the mesh queue.
@@ -3595,7 +3598,7 @@ function switchDim(id) {
 const PRESETS = {
   'whole world': { dist: 0, s: {
     radius: 8, farsharp: 1.5, lodtiles: true, lodquality: 100, shellon: true, overview: false,
-    lodcap: 8, maxradius: 96, vertbudget: 12000000, fog: 0, caves: false } },
+    detailPixels: true, lodcap: 8, maxradius: 96, vertbudget: 12000000, fog: 0, caves: false } },
   'walk around': { dist: 110, s: {
     radius: 10, farsharp: 1, lodtiles: true, lodquality: 50, lodcap: 8, caves: true,
     shadow: 0.58, cave: 0.32, daylight: 1, clarity: 0.5, fog: 0 } },
@@ -3636,9 +3639,20 @@ function buildPanel() {
         // decides how much voxel data the tab holds, and 32 was already 5 076 chunks and 418 MB of
         // payload. Beyond that the URL (?radius) is the escape hatch, not the thumb.
         stops: [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 32],
-        fmt: (v) => (v ? `${v * CH} m - ${v}c` : 'off'),
+        fmt: (v) => (!v ? 'off' : (S.detailPixels && detailR < v ? `now ${detailR}c of ${v}c` : `${v * CH} m - ${v}c`)),
         hint: 'The most terrain built block by block with real textures, around what you look at - a\nceiling, not a promise: zoom out and less of it is drawn, because far away those triangles are\nsmaller than a pixel, and the far view takes over. Priced at a 300 m orbit, whole frame:\n8 chunks = 12 M verts and 840 chunks of world data; 12 = 21 M, 1 400; 16 = 32 M, 2 000;\n24 = 58 M, 3 700 and 310 MB; 32 = 79 M, 5 000 and 420 MB, which stops being a frame rate. The\nwheel costs nothing, so pull in before raising this. URL: ?radius',
         get: () => S.radius, set: (v) => { S.radius = Math.max(0, v | 0); applySettings('radius'); } },
+      { key: 'detailPixels', label: 'sharp far centre', kind: 'check', live: false,
+        // The row says the distance the pixels allow, because that is the number a slider cannot
+        // reach: past it, "close detail" is simply not honoured at that zoom.
+        fmt: () => (S.detailPixels ? `on - to ${Math.round(detailReach(pxPerRad()))} m` : 'off - any zoom'),
+        hint: `Whether the block-by-block ground is worth building where one block is smaller than a
+pixel. On, the sharp ring stops at that point and the far world paints the rest: at a 1 200 m
+orbit that is 727 chunk meshes and 19 s of worker CPU per pan becoming 102 and 2.7 s, settling in
+1 s instead of 3, 57 fps after the pan becoming 240 - for 2.7 % of the pixels. Off, the sharp
+island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, ?nodetailpixels`,
+        get: () => !!S.detailPixels,
+        set: (v) => { S.detailPixels = v ? 1 : 0; applySettings('detailpx'); } },
       { key: 'farsharp', label: 'far detail', min: 1, max: 6, step: 0.25,
         fmt: (v) => `${v} px`,
         hint: 'How small a block may get in the cheap far terrain before it is merged with its\nneighbours. Lower is sharper and costs more. URL: ?cellpx',
