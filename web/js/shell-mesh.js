@@ -69,7 +69,7 @@ function paintFor(assets, coverId, groundId) {
  * cell hangs under itself is geometry the eye reads, and a 30 block dirt cliff under a spruce tree is
  * a lie. Cell 1 never hangs a skirt, so it keeps the real silhouette.
  */
-function colHeight(assets, sh, k, cell, groundFar) {
+function colHeight(assets, sh, k, cell, groundFar, ctx) {
   const h = sh.height[k];
   if (!h || !sh.ground || !groundFar) return h;
   const cov = sh.cover ? sh.cover[k] : 0;
@@ -78,9 +78,35 @@ function colHeight(assets, sh, k, cell, groundFar) {
   // standing a 16-block-wide column on its treetops is what made a forest read as a pile of solid
   // towers: past one block per cell the cell's body is the ground, and the canopy survives as colour.
   if (isFilm(assets, cov)) return h;
-  if (cell === 1 && isFullBlock(assets, cov)) return h;
+  // One block per cell keeps the real silhouette: a cliff face, a castle wall, a house. The exception is
+  // a skin that stands *clear of the ground*, which is what a canopy is: air under the leaves. Standing
+  // every column under a canopy at leaf height makes a solid tower out of it - a 5x5 canopy is 25 columns
+  // and 15 blocks of wall - so there the body is the ground and the skin is drawn where it is.
+  if (cell === 1 && isFullBlock(assets, cov) && !floatsAbove(sh, k, ctx)) return h;
   const g = sh.ground[k];
   return g > 0 && g < h ? g : h;
+}
+
+/** How many blocks of skin a column needs before the skin gets its own geometry. At one block per cell
+ *  the geometry is one quad and three walls, so a thinner skin is worth drawing there than at cell 4. */
+function capDropFor(cell, ctx) {
+  return cell === 1 ? Math.min(ctx.capDrop, 2) : ctx.capDrop;
+}
+
+/**
+ * Does this column's skin stand clear of the ground its cell is painted with?
+ *
+ * A canopy's does: leaves at the top, air below, forest floor at the bottom. A house's does not, because
+ * its skin runs from the roof down through the walls into the floor, and a house at one block per cell
+ * has to keep its walls or it stops being a house. That is the whole difference, and the band byte carries
+ * it: a canopy's band is the leaf thickness, a house's band is the height of the building.
+ */
+function floatsAbove(sh, k, ctx) {
+  if (!ctx || !ctx.caps || !sh.band) return false;
+  const bd = sh.band[k];
+  if (!bd || bd < capDropFor(1, ctx)) return false;
+  const g = sh.ground[k], h = sh.height[k];
+  return g > 0 && h - bd + 1 > g;
 }
 // face index, and the horizontal step toward the neighbour that would hide this wall
 const WALLS = [[2, 0, -1], [3, 0, 1], [4, -1, 0], [5, 1, 0]];
@@ -97,15 +123,16 @@ const WALLS = [[2, 0, -1], [3, 0, 1], [4, -1, 0], [5, 1, 0]];
  */
 function colCap(assets, sh, k, cell, ctx) {
   if (!ctx.caps || !sh.band) return 0;
+  if (cell > ctx.capCell) return 0;      // a cap wider than the object it stands for is a slab, not a canopy
   const bd = sh.band[k];
-  if (!bd || bd < ctx.capDrop) return 0;
+  if (!bd || bd < capDropFor(cell, ctx)) return 0;
   const ht = sh.height[k];
   if (!ht) return 0;
   // A film's surface is the water line, not a skin standing over ground: the film rule already puts it
   // exactly where it belongs and does not extrude it.
   const cov = sh.cover ? sh.cover[k] : 0;
   if (!cov || isFilm(assets, cov)) return 0;
-  const body = colHeight(assets, sh, k, cell, ctx.groundFar);
+  const body = colHeight(assets, sh, k, cell, ctx.groundFar, ctx);
   // The band has to clear the body, or the roof would sit inside the ground it is drawn over. At cell 1
   // the body already *is* the canopy top, so this is also what keeps caps off the one-block grid.
   if (!body || ht - bd + 1 <= body) return 0;
@@ -272,6 +299,11 @@ function patchCtx(assets, opts) {
     // and flowers flat, and gives a canopy, a hedge or a player's tower its real silhouette.
     caps: opts.caps === undefined ? 1 : +opts.caps,
     capDrop: Math.max(1, +(opts.capDrop ?? 3) || 3),
+    // A cap is a box `cell` blocks wide and as thick as the skin, so it can only read as a canopy while
+    // the cell is smaller than the thing it stands for. Past `capCell` the cap is a slab - a 16-block
+    // cap over a forest is a plateau with a lid on it, which is the monolith the far view kept making.
+    // Refusing it there leaves the cell on its ground and the canopy as colour, the old correct answer.
+    capCell: Math.max(1, +(opts.capCell ?? 4) || 4),
     cs: new Int32Array(256),      // scratch: cap tops of one cell
     sprites: new Map(),
     colors: new Map(),
@@ -396,7 +428,7 @@ function meshColumns(assets, shell, ctx, topAt, capAt) {
       for (let j = 0; j < cell; j++) {
         for (let i = 0; i < cell; i++) {
           const k = ((z0 + j) << 4) + (x0 + i);
-          hs[n++] = colHeight(assets, shell, k, cell, ctx.groundFar);
+          hs[n++] = colHeight(assets, shell, k, cell, ctx.groundFar, ctx);
           // How much of this cell is actually water, and how deep is the deepest part of it? One
           // column cannot answer either question for a 16x16 cell: a lake cell whose lucky sample
           // column happens to be a reef used to paint a sand square in the middle of the lake.
@@ -414,7 +446,7 @@ function meshColumns(assets, shell, ctx, topAt, capAt) {
       for (let j = 0; j < cell; j++) {
         for (let i = 0; i < cell; i++) {
           const k = ((z0 + j) << 4) + (x0 + i);
-          const hk = colHeight(assets, shell, k, cell, ctx.groundFar);
+          const hk = colHeight(assets, shell, k, cell, ctx.groundFar, ctx);
           const g = Math.abs(hk - want);
           if (g < gap) { gap = g; bestH = hk; bestI = k; }
         }
@@ -468,7 +500,7 @@ function meshColumns(assets, shell, ctx, topAt, capAt) {
         for (let j = 0; j < cell; j++) {
           for (let i = 0; i < cell; i++) {
             const k = ((z0 + j) << 4) + (x0 + i);
-            if (k === bestI || colHeight(assets, shell, k, cell, ctx.groundFar) < band) continue;
+            if (k === bestI || colHeight(assets, shell, k, cell, ctx.groundFar, ctx) < band) continue;
             const cid = shell.state[k];
             const cs = cid ? assets.states[cid - 1] : null;
             if (!cs) continue;
@@ -557,7 +589,7 @@ export function meshShell(assets, shell, opts = {}) {
     const sh = (cx === shell.cx && cz === shell.cz) ? shell : (nb ? nb(cx, cz) : null);
     return sh ? colHeight(assets, sh, ((wz & 15) << 4) | (wx & 15),
       (cx === shell.cx && cz === shell.cz) ? ctx.cell : ctx.cellFor(cx, cz),
-      ctx.groundFar) - HEIGHT_BIAS : null;
+      ctx.groundFar, ctx) - HEIGHT_BIAS : null;
   };
   const capAt = (wx, wz) => {
     const cx = Math.floor(wx / 16), cz = Math.floor(wz / 16);
@@ -566,7 +598,7 @@ export function meshShell(assets, shell, opts = {}) {
     const cn = (cx === shell.cx && cz === shell.cz) ? ctx.cell : ctx.cellFor(cx, cz);
     const k = ((wz & 15) << 4) | (wx & 15);
     // What that cell paints on top: its skin if it has one, its ground if it does not.
-    return (colCap(assets, sh, k, cn, ctx) || colHeight(assets, sh, k, cn, ctx.groundFar)) - HEIGHT_BIAS;
+    return (colCap(assets, sh, k, cn, ctx) || colHeight(assets, sh, k, cn, ctx.groundFar, ctx)) - HEIGHT_BIAS;
   };
   meshColumns(assets, shell, ctx, topAt, ctx.caps ? capAt : undefined);
   return finish(ctx);
@@ -584,7 +616,7 @@ export function meshShellPatch(assets, get, cx0, cz0, w, h, opts = {}) {
     const cx = Math.floor(wx / 16), cz = Math.floor(wz / 16);
     const sh = get(cx, cz);
     return sh ? colHeight(assets, sh, ((wz & 15) << 4) | (wx & 15),
-      ctx.cellFor(cx, cz), ctx.groundFar) - HEIGHT_BIAS : null;
+      ctx.cellFor(cx, cz), ctx.groundFar, ctx) - HEIGHT_BIAS : null;
   };
   const capAt = (wx, wz) => {
     const cx = Math.floor(wx / 16), cz = Math.floor(wz / 16);
@@ -592,7 +624,7 @@ export function meshShellPatch(assets, get, cx0, cz0, w, h, opts = {}) {
     if (!sh) return null;
     const cn = ctx.cellFor(cx, cz);
     const k = ((wz & 15) << 4) | (wx & 15);
-    return (colCap(assets, sh, k, cn, ctx) || colHeight(assets, sh, k, cn, ctx.groundFar)) - HEIGHT_BIAS;
+    return (colCap(assets, sh, k, cn, ctx) || colHeight(assets, sh, k, cn, ctx.groundFar, ctx)) - HEIGHT_BIAS;
   };
   for (let cz = cz0; cz < cz0 + h; cz++) {
     for (let cx = cx0; cx < cx0 + w; cx++) {

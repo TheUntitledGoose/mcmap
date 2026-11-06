@@ -148,15 +148,38 @@ test('far mesh: caps are a switch, and off means the old flat cell', () => {
   assert.ok(on.stream.count > off.stream.count, 'caps cost geometry');
 });
 
-test('far mesh: flat ground never gets a cap, and neither does one block per cell', () => {
+test('far mesh: flat ground never gets a cap, and one block per cell caps only a floating skin', () => {
   // Only the tree cell can cap; the fifteen grass cells around it are the ground itself.
   const { stream, stats } = meshCell4();
   assert.equal(stats.caps, 1, `${stats.caps} capped cells`);
-  // At one block per cell the column already is the real silhouette, so a second plate would be a
-  // duplicate surface in exactly the place the detail pass takes over.
+  // At one block per cell a cliff or a house keeps its silhouette, because its skin runs into the ground.
+  // A canopy is the exception: leaves over air, so the column stands on the forest floor and the leaves
+  // are drawn as a slab. That is the difference between a tree and a solid tower of 25 columns.
   const get = (cx, cz) => (cx === 0 && cz === 0 ? shell : null);
   const fine = meshShellPatch(assets, get, 0, 0, 1, 1, { cell: 1 });
-  assert.equal(fine.stats.caps, 0, 'cell 1 keeps the silhouette instead of stacking a skin on it');
+  assert.ok(fine.stats.caps >= 8, `cell 1 caps every column of a skin that stands clear of the ground (${fine.stats.caps})`);
+  const q = quads(fine.stream);
+  // Only walls inside the canopy count: the patch edge hangs a skirt into missing neighbours, and that is
+  // a different rule (and a different test). A canopy wall may be no taller than the leaves are.
+  const cx0 = 6, cx1 = 12, cz0 = 6, cz1 = 12;
+  const tall = q.filter((x) => !x.roof && x.x >= cx0 && x.x <= cx1 && x.z >= cz0 && x.z <= cz1 && x.tall > 6);
+  assert.equal(tall.length, 0, `no canopy column extrudes to the treetops (${tall.length} do, tallest ${Math.max(0, ...tall.map((x) => x.tall))})`);
+  assert.ok(q.some((x) => x.roof && x.y === 76), 'the canopy still closes at its own top');
+  assert.ok(q.some((x) => x.roof && x.y <= 65), 'and the forest floor is still painted under it');
+});
+
+test('far mesh: a cap is refused once the cell is wider than the skin it draws', () => {
+  // A cap is a box as wide as the cell. At cell 8 that canopy becomes an 8x8 slab with a lid on it, which
+  // is the monolith all over again, so the mesher refuses it and the cell goes back to standing on its
+  // ground with the canopy surviving as colour. `?capcell` is what moves the line.
+  const get = (cx, cz) => (cx === 0 && cz === 0 ? shell : null);
+  const wide = meshShellPatch(assets, get, 0, 0, 1, 1, { cell: 8, trackStates: true });
+  assert.equal(wide.stats.caps, 0, 'an 8-block column does not get a canopy box');
+  assert.equal(wide.stats.capWalls, 0, 'and no cap walls either');
+  assert.ok(quads(wide.stream).every((x) => !x.roof || x.y < 71),
+    'nothing in that patch stands up at the leaves');
+  const raised = meshShellPatch(assets, get, 0, 0, 1, 1, { cell: 8, capCell: 8, trackStates: true });
+  assert.equal(raised.stats.caps, 1, 'the knob still allows it when asked');
 });
 
 test('far mesh: a thin skin does not earn geometry', () => {

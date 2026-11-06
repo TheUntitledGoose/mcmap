@@ -31,7 +31,7 @@
 //   28 u8  groundFar            29 u8  waterOpacity*100
 //   30 u8  darkFloor*100       31 u8  darkGamma*100
 //   32 u8  skyScale*100        33 u8  lightOn
-//   34 u16 aoFar*1000     36 u8 caps     37 u8 capDrop     38 u16 reserved (0)
+//   34 u16 aoFar*1000     36 u8 caps     37 u8 capDrop     38 u8 capCell   39 u8 reserved (0)
 //   40 body: pos f32*3 (verts*12 bytes), then col u8*4 (verts*4 bytes) - block layout, exactly the
 //      two attribute arrays three wants, so the browser can view them over the buffer without a copy
 //
@@ -45,7 +45,7 @@ export const LOD_MAGIC = 'DVDXLOD1';
 // interchangeable even though the layout never changed - say so in the version.
 // v3: the geometry now depends on the surface skin (SHELL_VERSION 4's band byte). A tile baked
 // without caps paints every canopy as a tower, so it is refused rather than shown.
-export const LOD_VERSION = 4;   // v4: caps are meshed from the v5 skin byte, which stops at films
+export const LOD_VERSION = 5;   // v5: caps are refused past `capCell`, because a cap on a 16-block column is a slab
 export const LOD_HEADER = 40;
 export const LOD_CELL = 16;            // the coarsest rung, and the floor of the whole renderer
 /** The rungs this build can bake and draw, coarsest first. */
@@ -68,6 +68,10 @@ export function policyBits(p) {
     aoFar: Math.round(Math.min(4, Math.max(0, +p.aoFar ?? 1)) * 1000),
     caps: p.caps === undefined || p.caps ? 1 : 0,
     capDrop: Math.max(1, Math.min(255, Math.round(p.capDrop ?? 4))),
+    // Caps are geometry, and geometry has a size limit: a cap is a box `cell` blocks wide and as tall
+    // as the skin, so past a few blocks it stops reading as a canopy and reads as a slab. A tile baked
+    // with a different limit is a different world, hence a policy field.
+    capCell: Math.max(1, Math.min(255, Math.round(p.capCell ?? 4))),
   };
 }
 
@@ -97,6 +101,7 @@ export function encodeLodTile({ rx, rz, stamp, cell = LOD_CELL, pos, col, count,
   head.setUint16(34, p.aoFar, true);
   head.setUint8(36, p.caps);
   head.setUint8(37, p.capDrop);
+  head.setUint8(38, p.capCell);
   const body = new Uint8Array(count * LOD_BYTES_PER_VERT);
   body.set(new Uint8Array(pos.buffer, pos.byteOffset, count * 12), 0);
   body.set(new Uint8Array(col.buffer, col.byteOffset, count * 4), count * 12);
@@ -146,7 +151,7 @@ export function openLodTile(buf, off = 0, len = buf.byteLength - off, wantStamp 
       skyScale: dv.getUint8(32) / 100,
       lightOn: dv.getUint8(33),
       aoFar: dv.getUint16(34, true) / 1000,
-      caps: dv.getUint8(36) ? 1 : 0, capDrop: dv.getUint8(37) || 4,
+      caps: dv.getUint8(36) ? 1 : 0, capDrop: dv.getUint8(37) || 4, capCell: dv.getUint8(38) || 4,
     },
   };
 }

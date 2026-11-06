@@ -51,6 +51,9 @@ const POLICY = {
   skyScale: +arg('skyscale', 1),
   caps: arg('caps', '1') !== '0',
   capDrop: +arg('capdrop', 4),
+  // A cap is a box as wide as the cell: on a 16-block column it is a plateau with a lid, so the bake
+  // refuses caps past this rung. Baked rungs above it stay flat-painted and stand on their ground.
+  capCell: +arg('capcell', 4),
 };
 
 const atlasStat = fs.statSync(path.join(ASSETS, 'atlas.json'));

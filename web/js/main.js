@@ -149,6 +149,10 @@ lodCellMaxPx: Math.max(1, num('lodcellmax', 8)),
   // per column, extruded to the neighbours, which is what made a distant tree a solid brown tower.
   caps: params.has('nocaps') ? 0 : (num('caps', 1) ? 1 : 0),
   capDrop: Math.max(1, Math.min(255, num('capdrop', 4))),
+  // A cap is a box `cell` blocks wide, so it stops reading as a canopy once the cell is wider than the
+  // skin it draws: a 16-block cap over a forest is a plateau with a lid. Caps therefore stop at this cell
+  // size, and the cell goes back to standing on its ground with the canopy surviving as colour.
+  capCell: Math.max(1, Math.min(255, num('capcell', 4))),
   // How far the far world is allowed to drop in quality, in blocks per column. 100 = as coarse as it
   // likes (today's behaviour, 16-block columns at the horizon). Pull it to 50 and nothing coarser than
   // 8-block columns is ever accepted *where a coarse column would actually be a visible blob*, so a
@@ -1275,7 +1279,7 @@ function rebuildPatch(pk) {
     cell: cellOfTier(tier), cellFor: cellForChunk, maxSkirt: S.skirt, skip: detailHere,
     blend: S.blend, trackStates: true, groundFar: S.groundFar, waterOpacity: S.water,
     aoFar: S.aoFar, tex: mode === 1, ...farLightOpts(),
-    caps: S.caps, capDrop: S.capDrop,
+    caps: S.caps, capDrop: S.capDrop, capCell: S.capCell,
   });
   const ms = performance.now() - t0;
   shellN++;
@@ -1377,7 +1381,7 @@ function patchSig(pk) {
   let s = String(patchTier.get(pk) ?? patchTierFor(pk, 0));
   // Meshing policy belongs in the signature too: a patch marked dirty because the user moved a far
   // grid or water slider must not be skipped as "already matches".
-  s += `|g${S.groundFar}w${S.water.toFixed(2)}t${patchTexMode(px, pz, patchTier.get(pk) ?? patchTierFor(pk, 0))}a${S.aoFar}c${S.caps}d${S.capDrop}${lightSigBit()}`;
+  s += `|g${S.groundFar}w${S.water.toFixed(2)}t${patchTexMode(px, pz, patchTier.get(pk) ?? patchTierFor(pk, 0))}a${S.aoFar}c${S.caps}d${S.capDrop}C${S.capCell}${lightSigBit()}`;
   for (let dz = -1; dz <= 1; dz++) {
     for (let dx = -1; dx <= 1; dx++) {
       if (!dx && !dz) continue;
@@ -1858,7 +1862,7 @@ const lodMeshes = new Map();                     // "rx,rz" -> { mesh, verts }
 const lodPolicy = () => ({
 
   groundFar: S.groundFar, waterOpacity: S.water, aoFar: S.aoFar, lightOn: S.light,
-  caps: S.caps, capDrop: S.capDrop,
+  caps: S.caps, capDrop: S.capDrop, capCell: S.capCell,
 
   darkFloor: S.darkFloor, darkGamma: S.darkGamma, skyScale: S.skyScale,
 
@@ -3241,9 +3245,15 @@ function buildPanel() {
           + 'of the leaves. Off is the old far view, one height per cell extruded down to the ground under\n'
           + 'it, which is what turned a tree into a column and a house into a slab. Baked tiles carry their\n'
           + 'own answer, so this only changes them after a re-bake. Skin thinner than ?capdrop blocks is\n'
-          + 'not worth a roof and four walls: 4 by default. URL: ?caps, ?nocaps, ?capdrop',
+          + 'not worth a roof and four walls: 4 by default. A cap is a box as wide as the cell, so past\n?capcell blocks per column it is refused: a cap on a 16-block column is a plateau with a lid, which is\nhow a distant tree became a monolith again. URL: ?caps, ?nocaps, ?capdrop, ?capcell',
         get: () => !!S.caps,
         set: (v) => { S.caps = v ? 1 : 0; applySettings('caps'); } },
+
+      { key: 'capcell', label: 'biggest cell that gets a canopy cap', min: 0, max: 4, step: 1, live: false,
+        fmt: (v) => (v === 0 ? 'no cap, any cell' : `${[1, 2, 4, 8, 16][v]} blk columns`),
+        hint: 'How coarse a far column may be and still get its surface drawn as its own skin. A cap is a\nbox as wide as the cell, so 4 means caps only on 1, 2 and 4-block columns; at 16 a cap is a plateau\nwith a lid. 0 refuses caps at every cell size. Baked tiles carry their own answer. URL: ?capcell',
+        get: () => [1, 2, 4, 8, 16].indexOf(S.capCell),
+        set: (v) => { S.capCell = [1, 2, 4, 8, 16][v] || 255; applySettings('caps'); } },
 
       { key: 'lodclip', label: 'hide baked tiles under the close view', kind: 'check', live: true,
         hint: 'A baked tile is one mesh over 512x512 blocks, so it cannot be unloaded near the camera -\nit is clipped there instead, or its 16 block columns stand over the close terrain as flat slabs\nwith straight cliff walls. Off draws them everywhere. URL: ?nolodclip',
