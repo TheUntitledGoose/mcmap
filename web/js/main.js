@@ -141,6 +141,7 @@ const S = {
   // and hold a chunk while a neighbour is still in flight. 0 = mesh on every dirty mark (?meshkey=0).
   meshKey: num('meshkey', 1) ? 1 : 0,
   bytesKeep: num('byteskeep', 1) ? 1 : 0,          // keep parked triangles across a payload eviction
+  meshIndex: params.has('soup') ? 0 : 1,           // 9.5a: indexed detail meshes; ?soup=1 = the old soup
   // A face pointing at a chunk whose voxels are not held, but whose ground the heightmap skin paints,
   // is behind that skin. Drawing it is the wall of dirt a hole grows when a neighbour never arrived.
   // ?cullcovered=0 puts the walls back to compare.
@@ -645,6 +646,10 @@ const meshOpts = () => ({
   buriedSky: S.buriedSky,
   // Wants the whole map as a surface skin, and the underground only when asked for.
   surfaceOnly: S.caves ? 0 : S.surface,
+  // Four vertices and six indices per face instead of six vertices. The triangles are identical -
+  // 100 real chunks: 20 717 verts/chunk becomes 13 811 in this form, and 12 347 once neighbouring
+  // faces share corners too (build/dbg-mergerate.mjs). ?soup=1 puts the old emission back for an A/B.
+  index: S.meshIndex,
 });
 
 /**
@@ -688,6 +693,7 @@ function buildChunkGeometries(chunk) {
     g.setAttribute('position', new THREE.BufferAttribute(s.position, 3));
     g.setAttribute('uv', new THREE.BufferAttribute(s.uv, 2));
     g.setAttribute('color', new THREE.Uint8BufferAttribute(s.color, 4, true));
+    if (s.index) g.setIndex(new THREE.BufferAttribute(s.index, 1));
     g.computeBoundingSphere();
     geos.push({ pass, geometry: g });
   }
@@ -715,6 +721,7 @@ let meshBytesGhost = 0;                // parked bytes whose voxels the store ha
 const detailSig = () => `A${S.ao ? 1 : 0}/${S.aoMin}L${S.light ? 1 : 0}/${S.darkFloor}/${S.darkGamma}` +
   `/${S.skyScale}D${S.caves ? -1 : S.darkcut}B${S.caves ? 0 : S.buried}S${S.buriedSky}U${S.caves ? 0 : S.surface}` +
   `C${S.shellOn && S.cullCovered ? 1 : 0}` +
+  `I${S.meshIndex}` +                            // four verts + indices, or the soup: not interchangeable
   `G${dimGen}`;
 
 // ---- one mesh per (payload + the border the mesher reads) ----------------------------------------
@@ -814,8 +821,10 @@ function stashMeshBytes(key, entry) {
     passes.push({
       pass,
       position: a.position.array.slice(), uv: a.uv.array.slice(), color: a.color.array.slice(),
+      index: a.index ? a.index.array.slice() : null,
     });
-    bytes += a.position.array.byteLength + a.uv.array.byteLength + a.color.array.byteLength;
+    bytes += a.position.array.byteLength + a.uv.array.byteLength + a.color.array.byteLength
+      + (a.index ? a.index.array.byteLength : 0);
   }
   if (!passes.length) return;
   dropBytes(key);
@@ -859,11 +868,12 @@ function installCached(cx, cz, mk) {
   if (S.meshKey ? e.mk !== mk : e.sig !== detailSig()) { dropBytes(key); return false; }
   dropBytes(key);
   const wasCovered = dropChunkMesh(cx, cz);
-  const geos = e.passes.map(({ pass, position, uv, color }) => {
+  const geos = e.passes.map(({ pass, position, uv, color, index }) => {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(position, 3));
     g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
     g.setAttribute('color', new THREE.Uint8BufferAttribute(color, 4, true));
+    if (index) g.setIndex(new THREE.BufferAttribute(index, 1));
     g.computeBoundingSphere();
     return { pass, geometry: g };
   });
@@ -987,11 +997,12 @@ function startWorkers() {
       // The chunk may have been evicted, replaced, or switched dimension while its mesh was being
       // built; a stale skin over new voxels is worse than one more frame of shell.
       if (!job || job.gen !== dimGen || !store.get(m.cx, m.cz)) return;
-      const geos = m.passes.map(({ pass, position, uv, color }) => {
+      const geos = m.passes.map(({ pass, position, uv, color, index }) => {
         const g = new THREE.BufferGeometry();
         g.setAttribute('position', new THREE.BufferAttribute(position, 3));
         g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
         g.setAttribute('color', new THREE.Uint8BufferAttribute(color, 4, true));
+        if (index) g.setIndex(new THREE.BufferAttribute(index, 1));
         g.computeBoundingSphere();
         return { pass, geometry: g };
       });
@@ -2645,8 +2656,8 @@ function frameBody(now) {
   recomputeAgg();
   for (const list of meshLists()) {
     for (const { mesh } of list) {
-      const n = mesh.geometry.attributes.position.count;
-      verts += n; tris += n / 3; drawn++; detailVerts += n;
+      const a = mesh.geometry.attributes.position, ix = mesh.geometry.index;
+      verts += a.count; tris += (ix ? ix.count : a.count) / 3; drawn++; detailVerts += a.count;
     }
   }
   verts += shellVerts; tris += shellVerts / 3;
@@ -3064,6 +3075,10 @@ window.__world = {
       dirtyWhy: Object.fromEntries(dirtyWhy), meshByWhy: Object.fromEntries(meshWhy),
       farCostScale: +costScale.toFixed(2), farFloorBoost: floorBoost, cpuRenderMs: +cpuRenderMs.toFixed(2),
       shellPatch: S.patch, maxZoom: S.maxZoom, worldSpan: S.worldSpan,
+      // What the page actually parsed for the detail layer. Every A/B of meshing policy has to echo
+      // its own inputs or a URL typo reads like a measured difference.
+      radius: S.radius, detailPx: S.detailPx, detailPixels: S.detailPixels,
+      meshIndex: S.meshIndex, aa: S.aa, caves: S.caves ? 1 : 0,
       near: camera.near, far: camera.far,
       fogNear: scene.fog ? scene.fog.near : 0, fogFar: scene.fog ? scene.fog.far : 0,
       target: [+rig.target.x.toFixed(1), +rig.target.y.toFixed(1), +rig.target.z.toFixed(1)],

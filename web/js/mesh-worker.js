@@ -80,8 +80,9 @@ self.onmessage = ({ data: m }) => {
   for (let pass = 0; pass < streams.length; pass++) {
     const s = streams[pass];                 // meshChunk has already trimmed the streams
     if (!s.count) continue;
-    passes.push({ pass, position: s.position, uv: s.uv, color: s.color, count: s.count });
+    passes.push({ pass, position: s.position, uv: s.uv, color: s.color, index: s.index, count: s.count });
     transfer.push(s.position.buffer, s.uv.buffer, s.color.buffer);
+    if (s.index) transfer.push(s.index.buffer);
   }
   self.postMessage({ key: m.key, cx: m.cx, cz: m.cz, seq: m.seq, passes, stats, ms }, transfer);
 };

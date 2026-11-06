@@ -123,15 +123,29 @@ function cornerShade(occ, lit, own, lx, y, lz, fi, off) {
   return _CS;
 }
 
-/** Growable vertex stream. Non-indexed triangles: simpler, and the GPU cost is negligible here. */
+/**
+ * Growable vertex stream.
+ *
+ * Two shapes. Non-indexed (the default, and what the far layers use): a quad is six vertices, two
+ * triangles that do not share their diagonal. Indexed (`{ indexed: true }`, what the detail pass
+ * asks for): a quad is four vertices and six indices, which is 33 % of the vertex bytes back per
+ * face, measured 40 % once neighbouring faces also share corners - and it is cheaper to write, not
+ * dearer, because the two shared corners are written once. See HANDOFF 9.5: the vertex bill is what
+ * a chunk costs in memory and upload, and indexing is the part of that bill with no rules attached
+ * to it. A merged run of faces would be the rest, and it is not here because it costs CPU to find
+ * and needs uv tiling in the shader.
+ */
 export class VertexStream {
-  constructor(cap = 4096) {
+  constructor(cap = 4096, opts = {}) {
+    this.indexed = !!opts.indexed;
     this.pos = new Float32Array(cap * 3);
     this.uv = new Float32Array(cap * 2);
     this.col = new Uint8Array(cap * 4);      // shade * tint, sent as normalized u8
+    this.idx = this.indexed ? new Uint32Array(cap * 6) : null;
+    this.i = 0;                              // indices written
     this.n = 0;
   }
-  get bytes() { return this.n * 9; }
+  get bytes() { return this.n * 9 + this.i * 4; }
   #grow(need) {
     if (this.n + need <= this.pos.length / 3) return;
     let cap = this.pos.length / 3;
@@ -139,6 +153,32 @@ export class VertexStream {
     const p = new Float32Array(cap * 3); p.set(this.pos.subarray(0, this.n * 3)); this.pos = p;
     const u = new Float32Array(cap * 2); u.set(this.uv.subarray(0, this.n * 2)); this.uv = u;
     const c = new Uint8Array(cap * 4); c.set(this.col.subarray(0, this.n * 4)); this.col = c;
+    if (this.idx) {
+      const x = new Uint32Array(cap * 6); x.set(this.idx.subarray(0, this.i)); this.idx = x;
+    }
+  }
+  /** one vertex, and its number */
+  vert(a, b, c) {
+    this.#grow(1);
+    let o = this.n * 3;
+    this.pos[o] = a[0]; this.pos[o + 1] = a[1]; this.pos[o + 2] = a[2];
+    o = this.n * 2;
+    this.uv[o] = b[0]; this.uv[o + 1] = b[1];
+    o = this.n * 4;
+    this.col[o] = (c[0] * 255) | 0; this.col[o + 1] = (c[1] * 255) | 0;
+    this.col[o + 2] = (c[2] * 255) | 0; this.col[o + 3] = 255;
+    return this.n++;                                 // the slot just written (n was the count before it)
+  }
+  /** six indices for a quad's two triangles, from its four vertex numbers */
+  quadIdx(v0, v1, v2, v3, flip) {
+    this.idx = this.idx ?? new Uint32Array(24);
+    if (this.i + 6 > this.idx.length) {
+      const x = new Uint32Array(this.idx.length * 2); x.set(this.idx); this.idx = x;
+    }
+    const o = this.i;
+    if (flip) { this.idx[o] = v1; this.idx[o + 1] = v2; this.idx[o + 2] = v3; this.idx[o + 3] = v1; this.idx[o + 4] = v3; this.idx[o + 5] = v0; }
+    else { this.idx[o] = v0; this.idx[o + 1] = v1; this.idx[o + 2] = v2; this.idx[o + 3] = v0; this.idx[o + 4] = v2; this.idx[o + 5] = v3; }
+    this.i = o + 6;
   }
   tri(a, b, c) {                             // a,b,c = [x,y,z],[u,v],[r,g,b] floats 0..1
     this.#grow(1);
@@ -154,6 +194,11 @@ export class VertexStream {
   quad(p0, p1, p2, p3, uv, cols, flip = false) {  // uv = [u,v] per corner, matching corner order
     // cols: four per-corner colours, or one colour repeated across the quad
     const c = cols.length === 4 && Array.isArray(cols[0]) ? cols : [cols, cols, cols, cols];
+    if (this.indexed) {
+      this.quadIdx(this.vert(p0, uv[0], c[0]), this.vert(p1, uv[1], c[1]),
+        this.vert(p2, uv[2], c[2]), this.vert(p3, uv[3], c[3]), flip);
+      return;
+    }
     // The two triangles must share the diagonal the corner shading fades along; picking the
     // other one leaves a hard wedge down the middle of the quad.
     if (flip) {
@@ -171,7 +216,15 @@ export class VertexStream {
       position: this.pos.subarray(0, s * 3),
       uv: this.uv.subarray(0, s * 2),
       color: this.col.subarray(0, s * 4),
+      // null means the soup: `count` vertices, every three of them a triangle
+      // 16-bit indices where the mesh fits: they are half the bytes, and at a 16 chunk ring the
+      // index buffer is a tenth of the geometry. A 100k-vertex mesh (village, cave system) has to
+      // stay 32-bit, and three reads the width off the array we hand it.
+      index: this.idx
+        ? (this.n < 65536 ? Uint16Array.from(this.idx.subarray(0, this.i)) : this.idx.subarray(0, this.i))
+        : null,
       count: s,
+      tris: (this.idx ? this.i : s) / 3,
     };
   }
 }
@@ -192,7 +245,10 @@ const hash3 = (x, y, z) => {
  * @param {{ maxQuads?: number }} [opts]
  */
 export function meshChunk(assets, chunk, at, opts = {}) {
-  const streams = [new VertexStream(), new VertexStream(), new VertexStream()];
+  // The detail pass asks for indexed streams (`{ index: 1 }`): four vertices and six indices per
+  // face instead of six vertices. Same triangles, same attributes, ~40 % of the vertex bytes back.
+  const sio = opts.index ? { indexed: true } : {};
+  const streams = [new VertexStream(4096, sio), new VertexStream(4096, sio), new VertexStream(4096, sio)];
   const stats = { cubes: 0, quads: 0, faces: 0, culled: 0, skipped: 0, air: 0, unknown: 0, placeholder: 0, darkCulled: 0, buried: 0, covered: 0 };
   const baseX = chunk.cx << 4, baseZ = chunk.cz << 4;
   const maxQuads = opts.maxQuads ?? Infinity;
