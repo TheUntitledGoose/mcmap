@@ -86,6 +86,33 @@ function colHeight(assets, sh, k, cell, groundFar) {
 const WALLS = [[2, 0, -1], [3, 0, 1], [4, -1, 0], [5, 1, 0]];
 
 /**
+ * The top of one column's surface band, biased, or 0 when the column has no band of its own.
+ *
+ * `band` (shared/chunk-format.mjs) is how many blocks of full-cube skin sit above the ground the column
+ * stands on: 5 for a canopy, 0 for a hillside, a wall or a trunk that goes into the ground. That one
+ * byte is what lets a coarse cell answer two questions instead of one: the body is the ground, and the
+ * skin is drawn where the skin actually is. Without it the far layer had one height per column and
+ * extruded everything under it, which is why a tree was a box 16 blocks wide and 30 tall with grass on
+ * top - the loudest wrong thing in the far view.
+ */
+function colCap(assets, sh, k, cell, ctx) {
+  if (!ctx.caps || !sh.band) return 0;
+  const bd = sh.band[k];
+  if (!bd || bd < ctx.capDrop) return 0;
+  const ht = sh.height[k];
+  if (!ht) return 0;
+  // A film's surface is the water line, not a skin standing over ground: the film rule already puts it
+  // exactly where it belongs and does not extrude it.
+  const cov = sh.cover ? sh.cover[k] : 0;
+  if (!cov || isFilm(assets, cov)) return 0;
+  const body = colHeight(assets, sh, k, cell, ctx.groundFar);
+  // The band has to clear the body, or the roof would sit inside the ground it is drawn over. At cell 1
+  // the body already *is* the canopy top, so this is also what keeps caps off the one-block grid.
+  if (!body || ht - bd + 1 <= body) return 0;
+  return ht;
+}
+
+/**
  * Sprite per face for one state, memoised. `{cell, code}` where `code` is a cube face code
  * (texture * 8 + uv transform); quad-path states fall back to their first usable sprite with the
  * identity transform, which is the best a 2-pixel-wide far column can ask for.
@@ -223,7 +250,7 @@ function patchCtx(assets, opts) {
   const cellFor = opts.cellFor ?? (() => cell);
   const ctx = {
     stream: new VertexStream(opts.cap ?? 8192),
-    stats: { columns: 0, walls: 0, noSprite: 0 },
+    stats: { columns: 0, walls: 0, noSprite: 0, caps: 0, capWalls: 0 },
     maxSkirt: opts.maxSkirt ?? 32,
     shade: opts.shade ?? 1,
     cell,
@@ -239,6 +266,13 @@ function patchCtx(assets, opts) {
     // alpha the detail pass really draws it at, so far water and near water agree on the colour.
     waterOpacity: opts.waterOpacity === undefined ? 0.72 : +opts.waterOpacity,
     groundFar: opts.groundFar === undefined ? 1 : +opts.groundFar,
+    // Caps: draw the surface band where it actually stands, instead of flattening a cell to one height
+    // and hanging a wall from the treetops to the forest floor. `capDrop` is how many blocks a surface
+    // has to stand above the ground it is painted with before it earns its own geometry: 3 keeps grass
+    // and flowers flat, and gives a canopy, a hedge or a player's tower its real silhouette.
+    caps: opts.caps === undefined ? 1 : +opts.caps,
+    capDrop: Math.max(1, +(opts.capDrop ?? 3) || 3),
+    cs: new Int32Array(256),      // scratch: cap tops of one cell
     sprites: new Map(),
     colors: new Map(),
     // Probes need to check a pixel against the block the mesher *chose* for that quad, which after
@@ -303,7 +337,7 @@ function emitRect(ctx, f, wx, wz, yLo, yHi, span, spr, col) {
  */
 export const blendFor = (cell) => Math.min(0.35, 0.15 * (cell - 1));
 
-function meshColumns(assets, shell, ctx, topAt) {
+function meshColumns(assets, shell, ctx, topAt, capAt) {
   const { stats, maxSkirt, shade } = ctx;
   const cell = ctx.cellFor(shell.cx, shell.cz);
   // A 4x4 cell drawn in one bright sprite reads as TV static from 300 blocks up: one ore block or one
@@ -339,6 +373,21 @@ function meshColumns(assets, shell, ctx, topAt) {
   };
 
   const hs = ctx.hs;
+  // What the *upper* surface of a neighbour cell is: its cap top where it has a skin, its body top
+  // where it does not. A canopy wall has to stop against whatever the neighbour paints at the shared
+  // border, which is not the same number as the neighbour's ground.
+  const neighUpper = (wx, wz, dx, dz) => {
+    if (!capAt) return null;
+    let n = 0;
+    for (let j = 0; j < cell; j++) {
+      for (let i = 0; i < cell; i++) {
+        const v = capAt(wx + dx * cell + i, wz + dz * cell + j);
+        if (v === null) return null;
+        ctx.nh[n++] = v;
+      }
+    }
+    return n ? quantile(ctx.nh, n, CELL_PCTL) : null;
+  };
   for (let z0 = 0; z0 < 16; z0 += cell) {
     for (let x0 = 0; x0 < 16; x0 += cell) {
       // The quantile column decides both height and sprite, so one spike (a floating platform, a
@@ -465,6 +514,25 @@ function meshColumns(assets, shell, ctx, topAt) {
         emitRect(ctx, f, wx, wz, yLo, yTop, cell, wallPer[f] ?? wallPer[1], wallCol[f]);
         stats.walls++;
       }
+      // The skin, drawn where the skin is. The body above is the ground this column stands on; if the
+      // save says a band of full cubes floats above that ground (a canopy, a hedge, a player's roof),
+      // draw it as its own roof and four short walls across its own thickness. Extruding one height
+      // down to the ground is what turned every tree in the far view into a solid tower.
+      const capHi = capAt === undefined ? 0 : colCap(assets, shell, bestI, cell, ctx);
+      if (!capHi) continue;
+      const capTopY = capHi - HEIGHT_BIAS + 1;
+      const capLoY = capTopY - shell.band[bestI];
+      emitRect(ctx, 1, wx, wz, capTopY - 1, capTopY, cell, per[1], col[1]);
+      stats.caps++;
+      for (const [f, dx, dz] of WALLS) {
+        const ut = neighUpper(wx, wz, dx, dz);
+        // A neighbour with no skin of its own shows this band's whole thickness, and no more: the trunk
+        // under it is not drawn, and the ground under that already is.
+        const yLo = ut === null ? capLoY : Math.max(capLoY, Math.min(capTopY, ut + 1));
+        if (yLo >= capTopY) continue;
+        emitRect(ctx, f, wx, wz, yLo, capTopY, cell, per[f] ?? per[1], col[f]);
+        stats.capWalls++;
+      }
     }
   }
 }
@@ -491,7 +559,16 @@ export function meshShell(assets, shell, opts = {}) {
       (cx === shell.cx && cz === shell.cz) ? ctx.cell : ctx.cellFor(cx, cz),
       ctx.groundFar) - HEIGHT_BIAS : null;
   };
-  meshColumns(assets, shell, ctx, topAt);
+  const capAt = (wx, wz) => {
+    const cx = Math.floor(wx / 16), cz = Math.floor(wz / 16);
+    const sh = (cx === shell.cx && cz === shell.cz) ? shell : (nb ? nb(cx, cz) : null);
+    if (!sh) return null;
+    const cn = (cx === shell.cx && cz === shell.cz) ? ctx.cell : ctx.cellFor(cx, cz);
+    const k = ((wz & 15) << 4) | (wx & 15);
+    // What that cell paints on top: its skin if it has one, its ground if it does not.
+    return (colCap(assets, sh, k, cn, ctx) || colHeight(assets, sh, k, cn, ctx.groundFar)) - HEIGHT_BIAS;
+  };
+  meshColumns(assets, shell, ctx, topAt, ctx.caps ? capAt : undefined);
   return finish(ctx);
 }
 
@@ -509,13 +586,21 @@ export function meshShellPatch(assets, get, cx0, cz0, w, h, opts = {}) {
     return sh ? colHeight(assets, sh, ((wz & 15) << 4) | (wx & 15),
       ctx.cellFor(cx, cz), ctx.groundFar) - HEIGHT_BIAS : null;
   };
+  const capAt = (wx, wz) => {
+    const cx = Math.floor(wx / 16), cz = Math.floor(wz / 16);
+    const sh = get(cx, cz);
+    if (!sh) return null;
+    const cn = ctx.cellFor(cx, cz);
+    const k = ((wz & 15) << 4) | (wx & 15);
+    return (colCap(assets, sh, k, cn, ctx) || colHeight(assets, sh, k, cn, ctx.groundFar)) - HEIGHT_BIAS;
+  };
   for (let cz = cz0; cz < cz0 + h; cz++) {
     for (let cx = cx0; cx < cx0 + w; cx++) {
       const sh = get(cx, cz);
       // Where the full voxel mesh already draws a chunk, leave it out of the skin: two surfaces at
       // exactly the same height z-fight. `topAt` still reads the skipped shell, so the neighbour
       // walls stay sealed and no cliff opens at the handover border.
-      if (sh && !(skip && skip(cx, cz))) meshColumns(assets, sh, ctx, topAt);
+      if (sh && !(skip && skip(cx, cz))) meshColumns(assets, sh, ctx, topAt, ctx.caps ? capAt : undefined);
     }
   }
   return finish(ctx);

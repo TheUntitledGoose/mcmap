@@ -77,6 +77,7 @@ const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
   // rose does not hold anything up at all. Both come from the packed atlas, not from block names.
   isPaintState: (id) => stateCls.cube[id - 1] === 1 && stateCls.opaque[id - 1] === 1,
   isSolidState: (id) => stateCls.cube[id - 1] === 1,
+  isFilmState: (id) => stateCls.film[id - 1] === 1,
   packDir: PACKS,
   lodDir: LODS === 'none' ? null : LODS,
   stamp,

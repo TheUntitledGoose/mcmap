@@ -11,7 +11,7 @@ import { WorldService } from '../server/world-service.mjs';
 import { shellFromPayload } from '../server/shell.mjs';
 import { buildStateIds, packChunk, openChunk } from '../server/chunk-payload.mjs';
 import { classifyStates } from '../shared/cube-path.mjs';
-import { HEIGHT_BIAS, SHELL_HEADER, SHELL_COLS, SHELL_COLS_BYTES, SHELL_LIGHT_BYTES }
+import { HEIGHT_BIAS, SHELL_HEADER, SHELL_COLS, SHELL_COLS_BYTES, SHELL_LIGHT_BYTES, SHELL_BAND_BYTES }
   from '../shared/chunk-format.mjs';
 import { Assets } from '../web/js/assets.js';
 import { openShellFrame } from '../web/js/payload.js';
@@ -166,7 +166,7 @@ test('shell: a tall tree stands on its forest floor, and a log wall stays a wall
   assert.deepEqual(at(9, 1), { surf: 63, ground: 63, cover: nm(ID.grass), paint: nm(ID.grass) });
 });
 
-test('shell: a frame carries four planes, and a reader rejects the three-plane size', () => {
+test('shell: a frame carries four planes and two bytes, and a reader rejects a nonsense size', () => {
   const chunk = lakeChunk();
   const raw = shellFromPayload(chunk, { isPaint, isSolid });
   const s = openShellFrame(ab(raw));
@@ -184,11 +184,18 @@ test('shell: a frame carries four planes, and a reader rejects the three-plane s
       assert.equal(s.ground[i], s.height[i], `column ${i}: painted with its cover but the ground is lower`);
     }
   }
-  // An old three-plane frame is a different size, and silently reading it would paint the ground plane
-  // as the paint plane.
-  assert.equal(raw.length, SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES,
-    'four u16 planes plus a light byte per column');
+  // Four u16 planes plus a light byte and a skin byte. A frame of any other length is a different
+  // format, and silently reading one would paint the ground plane as the paint plane.
+  assert.equal(raw.length, SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES + SHELL_BAND_BYTES,
+    'four u16 planes plus a light byte and a skin byte per column');
   assert.throws(() => openShellFrame(ab(raw.subarray(0, SHELL_HEADER + SHELL_COLS * 6))), /too short/);
+  // The pre-skin frame (v3) is still readable, with no skin anywhere: a pack that has not been
+  // re-baked yet is a flat far view, not a crash and not a tower.
+  const v3 = Buffer.from(raw);
+  v3.writeUInt16LE(3, 8);
+  const old = openShellFrame(ab(v3.subarray(0, SHELL_HEADER + SHELL_COLS * (2 * 4 + 1))));
+  assert.equal(old.band.length, 256);
+  assert.ok(old.band.every((b) => b === 0), 'a frame without the byte has no skin to draw');
 });
 
 test('shell: the real lake at 2976,2007 is painted with its bed, not its skin', () => {

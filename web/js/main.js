@@ -145,6 +145,21 @@ lodCellMaxPx: Math.max(1, num('lodcellmax', 8)),
   // cell 4, so a world-sized view cannot be given the fine rung everywhere; the budget is spent
   // nearest-first, which is what keeps the middle of the frame sharp and the horizon cheap.
   lodVerts: Math.max(1e5, num('lodverts', 9e6)),
+  // The skin at the surface, drawn where the skin stands. Off puts the old flat cell back: one height
+  // per column, extruded to the neighbours, which is what made a distant tree a solid brown tower.
+  caps: params.has('nocaps') ? 0 : (num('caps', 1) ? 1 : 0),
+  capDrop: Math.max(1, Math.min(255, num('capdrop', 4))),
+  // How far the far world is allowed to drop in quality, in blocks per column. 100 = as coarse as it
+  // likes (today's behaviour, 16-block columns at the horizon). Pull it to 50 and nothing coarser than
+  // 8-block columns is ever accepted, so a distant hillside stops being a few big slabs; at 25 nothing
+  // coarser than 4. Ask for finer than the baked rungs go and the baked layer steps aside and the live
+  // far grid draws that ground instead, correctly but far more expensively - which is the honest price
+  // of refusing to blur, and the reason the slider exists rather than a fixed policy.
+  lodQuality: Math.max(0, Math.min(100, num('lodquality', 100))),
+  lodMaxCell: (() => {
+    const q = Math.max(0, Math.min(100, num('lodquality', 100)));
+    return [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(q / 10)];
+  })(),
   // Vertex bytes kept when a chunk leaves the detail ring, so zooming back in is an upload, not a
   // re-mesh. 256 MB is ~350 chunks. 0 turns the reuse off (every return re-meshes from voxels).
   meshCacheMb: Math.max(0, num('meshcache', 256)),
@@ -1030,7 +1045,9 @@ function demoteOutsideRing(budget = 64) {
 // `?cell=N` forces one size everywhere; otherwise the pixel budget decides: a cell is only allowed
 // to be as coarse as it can be while still covering less than `cellPx` pixels on screen.
 const CELLS16 = [1, 2, 4, 8, 16];
-const tiers = () => (S.forceCell ? [S.forceCell] : CELLS16.filter((c) => c <= S.cellMax));
+const tiers = () => (S.forceCell
+  ? [S.forceCell]
+  : CELLS16.filter((c) => c <= Math.min(S.cellMax, S.lodMaxCell)));   // the quality slider clamps both
 const tierLabel = () => `${tiers().join('/')} blk @${(S.cellPx * costScale).toFixed(2)}px` +
 
   `, ${(S.vertBudget / 1e6).toFixed(1)} M vert${costScale > 1.05 || floorBoost > 1 ? ' (over budget)' : ''}`;
@@ -1254,6 +1271,7 @@ function rebuildPatch(pk) {
     cell: cellOfTier(tier), cellFor: cellForChunk, maxSkirt: S.skirt, skip: detailHere,
     blend: S.blend, trackStates: true, groundFar: S.groundFar, waterOpacity: S.water,
     aoFar: S.aoFar, tex: mode === 1, ...farLightOpts(),
+    caps: S.caps, capDrop: S.capDrop,
   });
   const ms = performance.now() - t0;
   shellN++;
@@ -1280,7 +1298,7 @@ function rebuildPatch(pk) {
   shellMeshes.set(pk, {
     mesh: build(stream, mode === 1 ? shellTexMat : shellMat),
     verts: stream.count,
-    tier, mode, sig: patchSig(pk),
+    tier, mode, caps: stats.caps || 0, sig: patchSig(pk),
   });
   recountShellVerts();
 }
@@ -1355,7 +1373,7 @@ function patchSig(pk) {
   let s = String(patchTier.get(pk) ?? patchTierFor(pk, 0));
   // Meshing policy belongs in the signature too: a patch marked dirty because the user moved a far
   // grid or water slider must not be skipped as "already matches".
-  s += `|g${S.groundFar}w${S.water.toFixed(2)}t${patchTexMode(px, pz, patchTier.get(pk) ?? patchTierFor(pk, 0))}a${S.aoFar}${lightSigBit()}`;
+  s += `|g${S.groundFar}w${S.water.toFixed(2)}t${patchTexMode(px, pz, patchTier.get(pk) ?? patchTierFor(pk, 0))}a${S.aoFar}c${S.caps}d${S.capDrop}${lightSigBit()}`;
   for (let dz = -1; dz <= 1; dz++) {
     for (let dx = -1; dx <= 1; dx++) {
       if (!dx && !dz) continue;
@@ -1836,6 +1854,7 @@ const lodMeshes = new Map();                     // "rx,rz" -> { mesh, verts }
 const lodPolicy = () => ({
 
   groundFar: S.groundFar, waterOpacity: S.water, aoFar: S.aoFar, lightOn: S.light,
+  caps: S.caps, capDrop: S.capDrop,
 
   darkFloor: S.darkFloor, darkGamma: S.darkGamma, skyScale: S.skyScale,
 
@@ -1947,7 +1966,13 @@ function requestLod() {
   // 13x the geometry of the coarse one for pixels the eye cannot tell apart.
   const eye = camera.position;
   let spent = lodVerts;
-  lodStore.request(r[0], r[1], r[2], r[3], [tcx >> 5, tcz >> 5], (rx, rz, held, avail) => {
+  lodStore.request(r[0], r[1], r[2], r[3], [tcx >> 5, tcz >> 5], (rx, rz, held, have) => {
+    if (!have.length) return 0;
+    // The quality slider is a clamp on the coarsest column the far view may use, applied to the baked
+    // ladder as well as the live grid. Ask for finer than the baked rungs and the answer is "no baked
+    // tile here", which hands the ground to the live far grid rather than quietly serving the coarse
+    // tile the slider just refused.
+    const avail = have.filter((c) => c <= S.lodMaxCell);
     if (!avail.length) return 0;
     const coarsest = avail[avail.length - 1];
     if (S.lodCellPx <= 0) return coarsest;              // ?lodcellpx=0: one rung, the previous build
@@ -2853,6 +2878,7 @@ window.__world = {
   gridEst: () => ({ columns: gridColumns(), costScale, floorBoost, vpc: +vertsPerColumn().toFixed(1),
     cutMs: +shellCutAvg.toFixed(2), cuts: shellCuts, dirty: dirtyPatches.size,
     detailMarks: patchDetailMarks,
+    caps: [...shellMeshes.values()].reduce((s, e) => s + (e.caps || 0), 0),
     estVerts: Math.round(gridColumns() * vertsPerColumn()), budget: S.vertBudget,
     cellPx: S.cellPx * costScale,
     verts: [...shellMeshes.values()].reduce((a, e) => a + (e.verts || 0), 0),
@@ -2890,6 +2916,13 @@ function applySettings(what) {
     // far layer is a flat plate that alpha is baked into the vertex colour, so clarity re-cuts; where
     // it is a real translucent quad the material change alone is enough.
     for (const pk of [...shellMeshes.keys()]) dirtyAdd(pk, 'apply');
+    return;
+  }
+  // Caps are geometry, not colour: the only way to change them is to re-cut. The baked tiles
+  // take care of themselves at the top of this function, because caps are part of the policy a tile
+  // has to agree with.
+  if (what === 'caps') {
+    for (const [pk] of shellMeshes) dirtyAdd(pk, 'apply');
     return;
   }
   if (what === 'aofar') {
@@ -3187,6 +3220,16 @@ function buildPanel() {
       { key: 'cullcovered', label: 'drop walls the far view already paints', kind: 'check', live: false,
         hint: 'The edge of the loaded area is a full-depth wall of dirt down to the void. When the \nfar layer paints that ground the wall is hidden behind it, so it is not meshed at all - \nfewer trixels and no black band while chunks stream in. Where the save has no chunk there \n(a world frontier) the wall stays: it is the only thing painting that ground. Off restores \nevery wall. URL: ?nocullcovered',
         get: () => S.cullCovered, set: (v) => { S.cullCovered = v ? 1 : 0; applySettings('light'); } },
+      { key: 'caps', label: 'draw canopies as skin, not as towers', kind: 'check', live: false,
+        hint: 'The far layer carries a second number per column besides its height: how thick the solid\n'
+          + 'skin at the surface is. With this on, a cell paints its ground and draws that skin where the\n'
+          + 'skin actually stands: a canopy gets a roof at the leaves and four walls across the thickness\n'
+          + 'of the leaves. Off is the old far view, one height per cell extruded down to the ground under\n'
+          + 'it, which is what turned a tree into a column and a house into a slab. Baked tiles carry their\n'
+          + 'own answer, so this only changes them after a re-bake. Skin thinner than ?capdrop blocks is\n'
+          + 'not worth a roof and four walls: 4 by default. URL: ?caps, ?nocaps, ?capdrop',
+        get: () => !!S.caps,
+        set: (v) => { S.caps = v ? 1 : 0; applySettings('caps'); } },
 
       { key: 'lodclip', label: 'hide baked tiles under the close view', kind: 'check', live: true,
         hint: 'A baked tile is one mesh over 512x512 blocks, so it cannot be unloaded near the camera -\nit is clipped there instead, or its 16 block columns stand over the close terrain as flat slabs\nwith straight cliff walls. Off draws them everywhere. URL: ?nolodclip',
@@ -3257,6 +3300,14 @@ function buildPanel() {
       { key: 'minradius', label: 'far view floor', min: 4, max: 128, step: 4, live: false,
         fmt: (v) => `${v * CH} m`, hint: 'Far view kept even when zoomed right in. URL: ?minradius',
         get: () => S.skinFloor, set: (v) => { S.skinFloor = Math.max(4, v | 0); applySettings('skin'); } },
+
+      { key: 'lodquality', label: 'far world quality', min: 0, max: 100, step: 5, live: false,
+        fmt: (v) => (v >= 100 ? 'as coarse as it likes (16 blk)' : `never coarser than ${[1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(v / 10)]} blk`),
+        hint: 'How far the LOD is allowed to drop in quality: the coarsest column the far view may use,\nfor the baked tiles and the live far grid together. 100 is today: 16-block columns at the horizon,\nwhich is why a distant tree is one column and a distant house is a slab. Pull it in for shape and\npay vertices: below the baked rungs (4 blocks) the live far grid has to draw that ground itself.\nURL: ?lodquality',
+        get: () => S.lodQuality,
+        set: (v) => { S.lodQuality = Math.max(0, Math.min(100, v | 0));
+          S.lodMaxCell = [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(S.lodQuality / 10)];
+          applySettings('lod'); } },
 
       { key: 'cellmax', label: 'coarsest far grid', min: 0, max: 4, step: 1, live: false,
         fmt: (v) => `${CELLS16[v]} blk`,

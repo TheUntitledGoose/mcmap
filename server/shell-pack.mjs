@@ -22,8 +22,12 @@ import zlib from 'node:zlib';
 // The magic is a container tag; PACK_VERSION is what invalidates a pack. v4 = `ground` is the surface
 // a cell stands on, not the top of whatever happens to be standing on it, and `state` is the paint.
 // Old v3 packs are rejected by the version check rather than quietly mis-drawing the world.
-export const PACK_MAGIC = 'DVSHRP3 ';
-export const PACK_VERSION = 4;          // v4: a pack now stores the ground under a canopy, not the trunk top
+export const PACK_MAGIC = 'DVSHRP4 ';
+export const PACK_VERSION = 6;   // v6: the skin byte stops at films, so v5 packs carry lake water as skin
+// A v4 pack is still readable - it simply has no skin byte, so the far view paints one plate per cell
+// instead of a roof and an underside. Reading a v5 slot grid out of v4 bytes would be worse than that:
+// it would shuffle the planes and paint the world with garbage.
+export const PACK_VERSION_MIN = 4;
 export const PACK_HEADER = 24;
 export const PACK_SLOTS = 1024;          // 32x32 chunks, the world/region granularity
 export const SLOT_COLS = 256;            // columns per chunk
@@ -32,8 +36,16 @@ export const SLOT_COLS = 256;            // columns per chunk
 export const SLOT_PLANES = 4;
 // ...plus one light byte per column, so a pack can carry the save's shading to the far view.
 export const SLOT_LIGHT_BYTES = SLOT_COLS;
-export const SLOT_BYTES = SLOT_COLS * 2 * SLOT_PLANES + SLOT_LIGHT_BYTES;
+// ...and the surface-band byte (shared/chunk-format.mjs SHELL_BAND_BYTES): how many blocks of full-cube
+// material sit on top of the ground this column stands on. Five bytes of extra data per column is what
+// turns a coarse cell from a tower into a roof with an underside.
+export const SLOT_BAND_BYTES = SLOT_COLS;
+export const SLOT_BYTES = SLOT_COLS * 2 * SLOT_PLANES + SLOT_LIGHT_BYTES + SLOT_BAND_BYTES;
 export const RAW_BYTES = PACK_SLOTS * SLOT_BYTES;
+
+/** Slot stride of a pack of a given version: v4 has no skin byte, v5 does. */
+export const packSlotBytes = (version) =>
+  SLOT_COLS * 2 * SLOT_PLANES + SLOT_LIGHT_BYTES + (version >= 5 ? SLOT_BAND_BYTES : 0);
 
 export const slotOf = (cx, cz) => ((cz & 31) << 5) | (cx & 31);
 export const packPath = (dir, rx, rz) => path.join(dir, `${rx}_${rz}.bin`);
@@ -42,13 +54,15 @@ export const packPath = (dir, rx, rz) => path.join(dir, `${rx}_${rz}.bin`);
 export function packBytes(rx, rz, stamp, slots) {
   const raw = Buffer.alloc(RAW_BYTES);
   const bitmap = Buffer.alloc(128);
-  for (const [cx, cz, h, cover, g, st, light] of slots) {
+  for (const [cx, cz, h, cover, g, st, light, band] of slots) {
     const off = slotOf(cx, cz) * SLOT_BYTES;
     const plane = (n, src) => Buffer.from(src.buffer, src.byteOffset, SLOT_COLS * 2)
       .copy(raw, off + n * SLOT_COLS * 2);
     plane(0, h); plane(1, cover); plane(2, g); plane(3, st);
     if (light) Buffer.from(light.buffer, light.byteOffset, SLOT_COLS)
       .copy(raw, off + SLOT_COLS * 2 * SLOT_PLANES);
+    if (band) Buffer.from(band.buffer, band.byteOffset, SLOT_COLS)
+      .copy(raw, off + SLOT_COLS * 2 * SLOT_PLANES + SLOT_COLS);
     bitmap[slotOf(cx, cz) >> 3] |= 1 << (slotOf(cx, cz) & 7);
   }
   const comp = zlib.deflateSync(raw, { level: 6 });
@@ -84,7 +98,12 @@ export class ShellPack {
     const fd = fs.openSync(file, 'r');
     try { fs.readSync(fd, head, 0, head.length, 0); } finally { fs.closeSync(fd); }
     if (head.toString('ascii', 0, 8) !== PACK_MAGIC) throw new Error(`bad shell pack magic in ${file}`);
-    if (head.readUInt16LE(8) !== PACK_VERSION) throw new Error(`shell pack version ${head.readUInt16LE(8)} in ${file}`);
+    const version = head.readUInt16LE(8);
+    if (version < PACK_VERSION_MIN || version > PACK_VERSION) {
+      throw new Error(`shell pack version ${version} in ${file}`);
+    }
+    this.version = version;
+    this.slotBytes = packSlotBytes(version);
     this.rx = head.readInt16LE(12);
     this.rz = head.readInt16LE(14);
     this.stamp = head.readUInt32LE(16);
@@ -116,10 +135,13 @@ export class ShellPack {
   cols(cx, cz) {
     if (!this.has(cx, cz)) return null;
     const raw = this.ensure();
-    const off = slotOf(cx, cz) * SLOT_BYTES;
+    const off = slotOf(cx, cz) * this.slotBytes;
     const view = (n) => new Uint16Array(raw.buffer, raw.byteOffset + off + n * SLOT_COLS * 2, SLOT_COLS);
     const light = new Uint8Array(raw.buffer, raw.byteOffset + off + SLOT_COLS * 2 * SLOT_PLANES, SLOT_COLS);
-    return { h: view(0), cover: view(1), g: view(2), s: view(3), light };
+    const band = this.version >= 5
+      ? new Uint8Array(raw.buffer, raw.byteOffset + off + SLOT_COLS * 2 * SLOT_PLANES + SLOT_COLS, SLOT_COLS)
+      : null;
+    return { h: view(0), cover: view(1), g: view(2), s: view(3), light, band };
   }
 
   free() { this.raw = null; }
@@ -149,6 +171,7 @@ export function overviewFromPacks(dir, stamp, extent, cell = 4) {
   const cstate = new Uint16Array(gw * gh);
   const ccover = new Uint16Array(gw * gh);
   const clight = new Uint8Array(gw * gh);
+  const cband = new Uint8Array(gw * gh);
 
   const hs = [];
   for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.bin')).sort()) {
@@ -166,13 +189,17 @@ export function overviewFromPacks(dir, stamp, extent, cell = 4) {
         if (!hs.length) continue;
         hs.sort((a, b) => a - b);
         const want = hs[Math.min(hs.length - 1, Math.floor(hs.length * PACK_PCTL))];
-        let gap = Infinity, st = 0, gr = 0, cv = 0, lt = 0;
+        let gap = Infinity, st = 0, gr = 0, cv = 0, lt = 0, bd = 0;
         for (let i = 0; i < SLOT_COLS; i++) {
           const d = Math.abs(c.h[i] - want);
-          if (d < gap) { gap = d; st = c.s[i]; gr = c.g[i]; cv = c.cover[i]; lt = c.light ? c.light[i] : 0; }
+          if (d < gap) {
+            gap = d; st = c.s[i]; gr = c.g[i]; cv = c.cover[i]; lt = c.light ? c.light[i] : 0;
+            bd = c.band ? c.band[i] : 0;
+          }
         }
         const id = row + (cx - x0);
         csurf[id] = want; cground[id] = gr; cstate[id] = st; ccover[id] = cv; clight[id] = lt;
+        cband[id] = bd;
       }
     }
     p.free();
@@ -183,6 +210,7 @@ export function overviewFromPacks(dir, stamp, extent, cell = 4) {
   const state = new Uint16Array(w * h);
   const cover = new Uint16Array(w * h);
   const light = new Uint8Array(w * h);
+  const band = new Uint8Array(w * h);
   const pick = [];
   for (let oz = 0; oz < h; oz++) {
     for (let ox = 0; ox < w; ox++) {
@@ -198,13 +226,13 @@ export function overviewFromPacks(dir, stamp, extent, cell = 4) {
       const id = pick[Math.min(pick.length - 1, Math.floor(pick.length * PACK_PCTL))];
       const k = oz * w + ox;
       height[k] = csurf[id]; ground[k] = cground[id]; state[k] = cstate[id]; cover[k] = ccover[id];
-      light[k] = clight[id];
+      light[k] = clight[id]; band[k] = cband[id];
     }
   }
   // Heights stay biased by HEIGHT_BIAS exactly as in a shell frame (server/shell.mjs): the arrays are
   // u16 and world Y goes below zero, so the bias is what keeps them representable. The browser strips
   // it, same as it does for shells. An empty cell is 0, i.e. -2048 once stripped, and paints nothing.
-  return { w, h, x0, z0, cell, height, ground, state, cover, light };
+  return { w, h, x0, z0, cell, height, ground, state, cover, light, band };
 }
 
 /**

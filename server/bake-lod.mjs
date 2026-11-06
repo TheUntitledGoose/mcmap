@@ -49,6 +49,8 @@ const POLICY = {
   darkFloor: +arg('darkfloor', 0.32),
   darkGamma: +arg('darkgamma', 0.72),
   skyScale: +arg('skyscale', 1),
+  caps: arg('caps', '1') !== '0',
+  capDrop: +arg('capdrop', 4),
 };
 
 const atlasStat = fs.statSync(path.join(ASSETS, 'atlas.json'));
@@ -93,7 +95,7 @@ for (const key of dirs) {
     const cols = p && p.cols(cx, cz);
     let f = null;
     if (cols) {
-      const buf = shellFrameCols(cx, cz, cols.h, cols.cover, cols.g, cols.s, cols.light);
+      const buf = shellFrameCols(cx, cz, cols.h, cols.cover, cols.g, cols.s, cols.light, cols.band);
       f = openShellFrame(buf.buffer, 0, buf.length);
     }
     frameAt.set(k, f);

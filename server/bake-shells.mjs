@@ -40,8 +40,10 @@ const cls = classifyStates(atlas.states, atlas.textures);
 // solid *and* opaque enough to paint a far column with (water is not).
 const isSolid = (id) => cls.cube[id - 1] === 1;
 const isPaint = (id) => cls.cube[id - 1] === 1 && cls.opaque[id - 1] === 1;
+// Water and ice hold a lake skin up and must not be counted as one: see server/shell.mjs.
+const isFilm = (id) => cls.film[id - 1] === 1;
 const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
-  isCubeState: isSolid, isPaintState: isPaint, isSolidState: isSolid,
+  isCubeState: isSolid, isPaintState: isPaint, isSolidState: isSolid, isFilmState: isFilm,
 });
 
 const regionName = /^r\.(-?\d+)\.(-?\d+)\.mca$/;
@@ -71,12 +73,12 @@ function bakeDim(d) {
         if (!bytes) continue;
         // Skylight is a property of the dimension, not of the renderer: the nether has no sky
         // arrays at all, so a shell column there must not be filed as standing in open daylight.
-        const frame = shellFromPayload(bytes, { isPaint, isSolid, hasSky: svc.dimHasSky(d) });
+        const frame = shellFromPayload(bytes, { isPaint, isSolid, isFilm, hasSky: svc.dimHasSky(d) });
         if (!frame) continue;
         // The frame is exactly the four u16 planes the pack stores, so read them off its bytes
         // rather than re-deriving anything.
         const pl = shellPlanes(frame);
-        slots.push([cx, cz, pl.h, pl.cover, pl.g, pl.state, pl.light]);
+        slots.push([cx, cz, pl.h, pl.cover, pl.g, pl.state, pl.light, pl.band]);
         chunks++;
       }
     }
@@ -106,7 +108,8 @@ function buildOverview(d, dir) {
   head.writeUInt16LE(ov.w, 24);
   head.writeUInt16LE(ov.h, 26);
   const out = Buffer.concat([head, Buffer.from(ov.height.buffer), Buffer.from(ov.state.buffer),
-    Buffer.from(ov.ground.buffer), Buffer.from(ov.cover.buffer), Buffer.from(ov.light.buffer)]);
+    Buffer.from(ov.ground.buffer), Buffer.from(ov.cover.buffer), Buffer.from(ov.light.buffer),
+    Buffer.from(ov.band.buffer)]);
   const file = path.join(OUT, `overview-${keyOf(d)}.bin`);
   fs.writeFileSync(file, out);
   console.log(`${d.id}: overview ${ov.w}x${ov.h} cells of ${CELL} chunks -> ${file} (${(out.length / 1e6).toFixed(1)} MB)`);

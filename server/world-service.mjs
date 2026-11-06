@@ -9,7 +9,8 @@ import { listDims, dimExtent } from './world-dims.mjs';
 import { decodeChunk, packChunk } from './chunk-payload.mjs';
 import { shellFromPayload, shellFrameCols } from './shell.mjs';
 import {
-  BATCH_MAGIC, OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_HEADER, OVERVIEW_CELL_BYTES,
+  BATCH_MAGIC, OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_VERSION_MIN, OVERVIEW_HEADER,
+  OVERVIEW_CELL_BYTES, overviewCellBytes,
 } from '../shared/chunk-format.mjs';
 import { ShellPack } from './shell-pack.mjs';
 import { loadLodTile, listLodTiles, lodPath } from './lod-pack.mjs';
@@ -89,6 +90,7 @@ export class WorldService {
     // enough to hold a surface up (water is). shell.mjs needs both to see through a lake.
     this.isPaintState = opts.isPaintState ?? opts.isCubeState ?? null;
     this.isSolidState = opts.isSolidState ?? opts.isCubeState ?? null;
+    this.isFilmState = opts.isFilmState ?? null;   // water and ice hold a surface up but are not skin
     this.packDir = opts.packDir ?? null;
     // Baked coarse LOD tiles (server/bake-lod.mjs): the whole world pre-meshed at 16 blocks per
     // column, so the far view costs a file read instead of meshing on every pan and zoom.
@@ -238,14 +240,15 @@ export class WorldService {
     let frame = null;
     if (packed) {
       const cols = packed.cols(cx, cz);
-      // Four planes, in frame order. Passing the old (h, s) pair here reads the pack's cover plane as
-      // the ground plane and paints the world with garbage.
-      frame = cols && shellFrameCols(cx, cz, cols.h, cols.cover, cols.g, cols.s, cols.light);
+      // Four u16 planes plus the light and surface-band bytes, in frame order. Passing the old
+      // (h, s) pair here reads the pack's cover plane as the ground plane and paints the world with
+      // garbage.
+      frame = cols && shellFrameCols(cx, cz, cols.h, cols.cover, cols.g, cols.s, cols.light, cols.band);
     } else {
       const bytes = this.chunkBytes(dimId, cx, cz);
       frame = bytes
         ? shellFromPayload(bytes, { isPaint: this.isPaintState, isSolid: this.isSolidState,
-            hasSky: this.dimHasSky(dim) }) : null;
+            isFilm: this.isFilmState, hasSky: this.dimHasSky(dim) }) : null;
     }
     this.shells.set(key, frame ?? Buffer.alloc(0));
     this.shellOrder.push(key);
@@ -379,11 +382,13 @@ export class WorldService {
     try {
       const b = fs.readFileSync(path.join(this.packDir, `overview-${dim.key}.bin`));
       const cells = b.readUInt16LE(24) * b.readUInt16LE(26);
+      const ver = b.readUInt16LE(8);
+      // Four u16 planes plus a light byte per cell, plus a surface-band byte from v5 on.
       if (b.subarray(0, 8).toString('ascii') === OVERVIEW_MAGIC
-          && b.readUInt16LE(8) === OVERVIEW_VERSION
+          && ver >= OVERVIEW_VERSION_MIN && ver <= OVERVIEW_VERSION
           && b.readUInt32LE(12) === this.stamp
-          && b.length === OVERVIEW_HEADER + cells * OVERVIEW_CELL_BYTES)
-        buf = b;   // four u16 planes plus one light byte per cell
+          && b.length === OVERVIEW_HEADER + cells * overviewCellBytes(ver))
+        buf = b;
     } catch { /* not baked */ }
     this.overviews.set(dim.key, buf ?? Buffer.alloc(0));
     return buf;

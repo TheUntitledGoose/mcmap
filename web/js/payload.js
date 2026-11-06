@@ -3,14 +3,15 @@
 import {
   CHUNK_MAGIC, CHUNK_VERSION, FLAG_HEIGHT, FLAG_HEIGHT_MOTION, FLAG_BE, FLAG_CLASSIC, FLAG_LIGHT,
   LIGHT_VARIES, LIGHT_UNKNOWN, HEIGHT_BIAS, BATCH_MAGIC, SHELL_MAGIC, SHELL_VERSION, SHELL_HEADER, SHELL_COLS,
-  SHELL_COLS_BYTES, SHELL_LIGHT_BYTES,
-  OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_HEADER, OVERVIEW_CELL_BYTES,
+  SHELL_COLS_BYTES, SHELL_LIGHT_BYTES, SHELL_BAND_BYTES, SHELL_VERSION_MIN,
+  OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_HEADER, OVERVIEW_CELL_BYTES, OVERVIEW_VERSION_MIN,
+  overviewCellBytes,
 } from '../../shared/chunk-format.mjs';
 
 export {
   CHUNK_MAGIC, CHUNK_VERSION, FLAG_HEIGHT, FLAG_HEIGHT_MOTION, FLAG_BE, FLAG_CLASSIC, FLAG_LIGHT,
   LIGHT_VARIES, LIGHT_UNKNOWN, HEIGHT_BIAS, BATCH_MAGIC, SHELL_MAGIC, SHELL_VERSION, SHELL_HEADER, SHELL_COLS,
-  SHELL_COLS_BYTES, SHELL_LIGHT_BYTES,
+  SHELL_COLS_BYTES, SHELL_LIGHT_BYTES, SHELL_BAND_BYTES,
   OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_HEADER, OVERVIEW_CELL_BYTES,
 };
 
@@ -161,19 +162,26 @@ export function openBatch(buf) {
  * ~100 KB of full voxel payload.
  */
 export function openShellFrame(buf, byteOffset = 0, length = buf.byteLength - byteOffset) {
-  const need = SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES;
-  if (length < need) throw new Error(`shell frame too short: ${length} < ${need}`);
   const dv = new DataView(buf, byteOffset, length);
   const magic = magicAt(dv, 0);
   if (magic !== SHELL_MAGIC) throw new Error(`bad shell magic ${JSON.stringify(magic)}`);
   const version = dv.getUint16(8, true);
-  if (version !== SHELL_VERSION) throw new Error(`shell frame version ${version}`);
+  if (version < SHELL_VERSION_MIN || version > SHELL_VERSION) throw new Error(`shell frame version ${version}`);
+  if (length < SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES
+      + (version >= 4 ? SHELL_BAND_BYTES : 0)) {
+    throw new Error(`shell frame too short: ${length}`);
+  }
   const cx = dv.getInt16(12, true), cz = dv.getInt16(14, true);
   const plane = (k) => new Uint16Array(buf, byteOffset + SHELL_HEADER + k * SHELL_COLS * 2, SHELL_COLS);
   const height = plane(0), cover = plane(1), ground = plane(2), state = plane(3);
   const light = new Uint8Array(buf, byteOffset + SHELL_HEADER + 4 * SHELL_COLS * 2, SHELL_COLS);
+  // v3 frames stop at the light byte, and a far view mid-rebake should paint ground rather than throw:
+  // no band plane means no skin anywhere, which is exactly what the mesher does with all-zero bands.
+  const band = version >= 4
+    ? new Uint8Array(buf, byteOffset + SHELL_HEADER + 4 * SHELL_COLS * 2 + SHELL_COLS, SHELL_COLS)
+    : new Uint8Array(SHELL_COLS);
   return {
-    cx, cz, height, cover, ground, state, light,
+    cx, cz, height, cover, ground, state, light, band,
     /** world Y of the top counted block in a column (chunk-local x,z) */
     surfaceAt(x, z) { return height[((z & 15) << 4) | (x & 15)] - HEIGHT_BIAS; },
     /** shell state id at a column, as a 1-based global state id (0 = nothing there) */
@@ -184,6 +192,8 @@ export function openShellFrame(buf, byteOffset = 0, length = buf.byteLength - by
     coverAt(x, z) { return cover[((z & 15) << 4) | (x & 15)]; },
     /** packed light byte for a column: 0 in the far layer's own units means "read as zero" */
     lightAt(x, z) { return light[((z & 15) << 4) | (x & 15)]; },
+    /** how many blocks of full-cube skin sit on top of this column's ground (0 = the ground itself) */
+    bandAt(x, z) { return band[((z & 15) << 4) | (x & 15)]; },
   };
 }
 
@@ -205,20 +215,24 @@ export function openOverview(buf, byteOffset = 0, length = buf.byteLength - byte
   const magic = magicAt(dv, 0);
   if (magic !== OVERVIEW_MAGIC) throw new Error(`bad overview magic ${JSON.stringify(magic)}`);
   const version = dv.getUint16(8, true);
-  if (version !== OVERVIEW_VERSION) throw new Error(`overview frame version ${version}`);
+  if (version < OVERVIEW_VERSION_MIN || version > OVERVIEW_VERSION) throw new Error(`overview frame version ${version}`);
   const cell = dv.getUint16(10, true);
   const stamp = dv.getUint32(12, true);
   const x0 = dv.getInt32(16, true), z0 = dv.getInt32(20, true);
   const w = dv.getUint16(24, true), h = dv.getUint16(26, true);
   const n = w * h;
-  if (length < OVERVIEW_HEADER + n * OVERVIEW_CELL_BYTES) {
-    throw new Error(`overview frame truncated: ${length} < ${OVERVIEW_HEADER + n * OVERVIEW_CELL_BYTES}`);
+  const cellBytes = overviewCellBytes(version);
+  if (length < OVERVIEW_HEADER + n * cellBytes) {
+    throw new Error(`overview frame truncated: ${length} < ${OVERVIEW_HEADER + n * cellBytes}`);
   }
   const plane = (k) => new Uint16Array(buf, byteOffset + OVERVIEW_HEADER + k * n * 2, n);
   const height = plane(0), state = plane(1), ground = plane(2), cover = plane(3);
   const light = new Uint8Array(buf, byteOffset + OVERVIEW_HEADER + 4 * n * 2, n);
+  const band = cellBytes >= 10
+    ? new Uint8Array(buf, byteOffset + OVERVIEW_HEADER + 4 * n * 2 + n, n)
+    : new Uint8Array(n);
   return {
-    w, h, x0, z0, cell, stamp, height, state, ground, cover, light,
+    w, h, x0, z0, cell, stamp, height, state, ground, cover, light, band,
     /** world Y of the cell's surface (the 80th percentile of its chunk tops) */
     heightAt(i, j) { return i < 0 || j < 0 || i >= w || j >= h ? -Infinity : height[j * w + i] - HEIGHT_BIAS; },
     /** world Y of the terrain the cell is painted with, i.e. under canopy, plants and water */
@@ -229,6 +243,8 @@ export function openOverview(buf, byteOffset = 0, length = buf.byteLength - byte
     coverAt(i, j) { return i < 0 || j < 0 || i >= w || j >= h ? 0 : cover[j * w + i]; },
     /** packed sky|blk light byte of the column that speaks for the cell */
     lightAt(i, j) { return i < 0 || j < 0 || i >= w || j >= h ? 0 : light[j * w + i]; },
+    /** thickness of that cell's surface skin (0 = the ground itself) */
+    bandAt(i, j) { return i < 0 || j < 0 || i >= w || j >= h ? 0 : band[j * w + i]; },
     /** chunk coordinate range one cell covers, for the skin/overview handover test */
     cellChunks(i, j) { return [x0 + i * cell, z0 + j * cell, x0 + (i + 1) * cell - 1, z0 + (j + 1) * cell - 1]; },
   };

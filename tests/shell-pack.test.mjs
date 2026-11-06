@@ -8,7 +8,8 @@ import path from 'node:path';
 import { packBytes, ShellPack, overviewFromPacks, atlasStamp, PACK_PCTL } from '../server/shell-pack.mjs';
 import { shellFromPayload, shellFrameCols, SHELL_FRAME } from '../server/shell.mjs';
 import {
-  SHELL_MAGIC, SHELL_HEADER, SHELL_COLS, SHELL_COLS_BYTES, SHELL_LIGHT_BYTES, HEIGHT_BIAS, OVERVIEW_MAGIC,
+  SHELL_MAGIC, SHELL_HEADER, SHELL_COLS, SHELL_COLS_BYTES, SHELL_LIGHT_BYTES, SHELL_BAND_BYTES,
+  HEIGHT_BIAS, OVERVIEW_MAGIC,
 } from '../shared/chunk-format.mjs';
 import { classifyStates } from '../shared/cube-path.mjs';
 import { packLight } from '../shared/light.mjs';
@@ -27,16 +28,17 @@ const DIMS = [DIM, 'minecraft:overworld'];
 
 /**
  * Two populated chunk columns with recognisable shapes. Heights are biased as a frame stores them, and
- * every column carries all four planes: the surface the eye sees, what sits at it, the ground under it
- * and the block that paints it. A third of the columns pretend to be water, so the pack round trip and
- * the grid reduction both have to carry the difference rather than collapse back to two planes.
+ * every column carries all five planes: the surface the eye sees, what sits at it, the ground under it,
+ * the block that paints it, and how thick the solid skin at the surface is. A third of the columns
+ * pretend to be water, so the pack round trip and the grid reduction both have to carry the difference
+ * rather than collapse back to two planes.
  */
 function fakeSlots() {
   const out = [];
   for (const [cx, cz, fill] of [[0, 0, (x, z) => 60 + (x & 7)], [1, 0, (x, z) => 70 - (z & 3)]]) {
     const h = new Uint16Array(SHELL_COLS), cover = new Uint16Array(SHELL_COLS);
     const g = new Uint16Array(SHELL_COLS), s = new Uint16Array(SHELL_COLS);
-    const li = new Uint8Array(SHELL_COLS);
+    const li = new Uint8Array(SHELL_COLS), bd = new Uint8Array(SHELL_COLS);
     for (let z = 0; z < 16; z++) {
       for (let x = 0; x < 16; x++) {
         const k = (z << 4) | x, top = fill(x, z);
@@ -47,9 +49,12 @@ function fakeSlots() {
         s[k] = 1 + ((x * 16 + z) % 7);
         // light travels with the column it belongs to, or a coarse cell paints bright ground in a cave
         li[k] = packLight(Math.min(15, top - 50), wet ? 5 : 0);
+        // and so does the skin: a canopy that is three blocks thick has to still be three blocks thick
+        // after the pack, or the far layer draws a tower for it
+        bd[k] = wet ? 0 : ((x * 5 + z) % 4);
       }
     }
-    out.push([cx, cz, h, cover, g, s, li]);
+    out.push([cx, cz, h, cover, g, s, li, bd]);
   }
   return out;
 }
@@ -62,7 +67,7 @@ test('pack: columns survive the deflate round trip', () => {
   const pk = ShellPack.load(packFile, 4242);
   assert.ok(pk, 'the pack loaded');
   assert.deepEqual([pk.rx, pk.rz, pk.stamp], [0, 0, 4242]);
-  for (const [cx, cz, h, cover, g, st, li] of fakeSlots()) {
+  for (const [cx, cz, h, cover, g, st, li, bd] of fakeSlots()) {
     const got = pk.cols(cx, cz);
     assert.ok(got, `chunk ${cx},${cz} is present`);
     assert.deepEqual([...got.h], [...h], `heights for ${cx},${cz}`);
@@ -70,6 +75,7 @@ test('pack: columns survive the deflate round trip', () => {
     assert.deepEqual([...got.g], [...g], `ground for ${cx},${cz}`);
     assert.deepEqual([...got.s], [...st], `states for ${cx},${cz}`);
     assert.deepEqual([...got.light], [...li], `light for ${cx},${cz}`);
+    assert.deepEqual([...got.band], [...bd], `skin for ${cx},${cz}`);
   }
   assert.equal(pk.cols(20, 20), null, 'an empty slot is absent, not zero-filled');
   // Deflating heightmaps has to pay for itself, or the file buys nothing.
@@ -85,10 +91,11 @@ test('pack: a stale atlas stamp, or a missing file, serves nothing', () => {
 });
 
 test('pack: re-assembling a frame from stored columns gives the same bytes', () => {
-  const [cx, cz, h, cover, g, st, li] = fakeSlots()[0];
-  const frame = shellFrameCols(cx, cz, h, cover, g, st, li);
-  assert.equal(frame.length, SHELL_FRAME, 'four planes of u16 plus a light byte per column');
-  assert.equal(SHELL_FRAME, SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES);
+  const [cx, cz, h, cover, g, st, li, bd] = fakeSlots()[0];
+  const frame = shellFrameCols(cx, cz, h, cover, g, st, li, bd);
+  assert.equal(frame.length, SHELL_FRAME, 'four planes of u16 plus a light byte and a skin byte per column');
+  assert.equal(SHELL_FRAME,
+    SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES + SHELL_BAND_BYTES);
   assert.equal(frame.subarray(0, 8).toString('ascii'), SHELL_MAGIC);
   const got = openShellFrame(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length));
   assert.equal(got.cx, cx);
@@ -98,6 +105,7 @@ test('pack: re-assembling a frame from stored columns gives the same bytes', () 
     assert.equal(got.ground[i], g[i], `column ${i} ground`);
     assert.equal(got.state[i], st[i], `column ${i} state`);
     assert.equal(got.light[i], li[i], `column ${i} light`);
+    assert.equal(got.band[i], bd[i], `column ${i} skin`);
   }
 });
 

@@ -10,15 +10,17 @@
 import { openChunk } from './chunk-payload.mjs';
 import {
   SHELL_MAGIC, SHELL_VERSION, SHELL_HEADER, SHELL_COLS, SHELL_COLS_BYTES, SHELL_LIGHT_BYTES,
-  HEIGHT_BIAS,
+  SHELL_BAND_BYTES, HEIGHT_BIAS,
 } from '../shared/chunk-format.mjs';
 import { packLight } from '../shared/light.mjs';
 
-export const SHELL_FRAME = SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES;
+export const SHELL_FRAME =
+  SHELL_HEADER + SHELL_COLS * SHELL_COLS_BYTES + SHELL_LIGHT_BYTES + SHELL_BAND_BYTES;
 // Struct of arrays, so the two height planes and the two state planes each compress as a run.
 export const SHELL_H = 0, SHELL_C = 1, SHELL_G = 2, SHELL_S = 3;
 const ARR = SHELL_COLS * 2;
 const LIGHT_OFF = SHELL_HEADER + 4 * ARR;
+const BAND_OFF = LIGHT_OFF + SHELL_COLS;
 
 /**
  * Collapse a decoded chunk payload into a shell frame.
@@ -51,12 +53,16 @@ export function shellFromPayload(bytes, opts = {}) {
   const maxVegDrop = opts.maxVegDrop ?? 40;
   const isPaint = opts.isPaint ?? opts.isCube ?? null;
   const isSolid = opts.isSolid ?? null;
+  // A film (water, ice, glass) holds a surface up but is not a skin: the film rule already draws it at
+  // the water line, and counting 39 blocks of lake as "skin" would ask for a 39-block cap box.
+  const isFilm = opts.isFilm ?? null;
 
   const h = new Uint16Array(SHELL_COLS);      // surface height (biased)
   const cover = new Uint16Array(SHELL_COLS);  // state at that height
   const g = new Uint16Array(SHELL_COLS);      // top of the paint block (biased)
   const s = new Uint16Array(SHELL_COLS);      // paint state
   const li = new Uint8Array(SHELL_COLS);      // sky|blk light on the column's surface
+  const bd = new Uint8Array(SHELL_COLS);      // thickness of the solid run that starts at the surface
   h.set(c.height);
   /**
    * Is this block part of a surface, or is it a spike? A trunk is paintable, opaque and a full cube, so
@@ -117,9 +123,33 @@ export function shellFromPayload(bytes, opts = {}) {
     s[i] = paint;
     g[i] = py + HEIGHT_BIAS;
     li[i] = columnLight(c, x, top, z, hasSky);
+    // How thick is the skin? `height` and `ground` between them say a canopy tops the column and the
+    // forest floor stands under it, but not whether the gap is twenty blocks of leaves or one trunk.
+    // That is the difference between a green roof with an underside you can see and a tower, so the
+    // run of see-through full cubes starting at the surface block gets measured once, here.
+    //
+    // "See-through" is the whole trick: a trunk is solid *and* paintable, so a contiguous-solid test
+    // walks straight down a tree's trunk into the ground and reports nothing interesting. Leaves are
+    // full cubes that may not paint a cell, so counting them from the surface down to the first block
+    // that may paint gives the canopy's own thickness. A hillside starts with grass, which may paint,
+    // and costs one test. The walk never goes below the ground the column stands on.
+    //
+    // A film stops the run too. Without that, a lake column reports the water's depth as its skin - the
+    // deepest bands in this world were 39 blocks of water over a gravel bed - and a canopy with a stream
+    // running through it measures the water as part of its own thickness.
+    if (isSolid && isPaint && at && isSolid(at) && !isPaint(at)) {
+      const room = Math.min(254, top - py + 1);
+      let k = 0;
+      while (k < room) {
+        const b = c.stateAt(x, top - k, z);
+        if (!b || !isSolid(b) || isPaint(b) || (isFilm && isFilm(b))) break;
+        k++;
+      }
+      bd[i] = k;
+    }
   }
 
-  return frame(c.cx, c.cz, h, cover, g, s, li);
+  return frame(c.cx, c.cz, h, cover, g, s, li, bd);
 }
 
 /**
@@ -142,8 +172,8 @@ function columnLight(c, x, top, z, hasSky) {
   return packLight(hasSky ? 15 : 0, 0);
 }
 
-/** Pack four u16 column planes and one light byte per column into a shell frame. */
-function frame(cx, cz, h, cover, g, s, light) {
+/** Pack four u16 column planes, one light byte and one surface-band byte into a shell frame. */
+function frame(cx, cz, h, cover, g, s, light, band) {
   const out = Buffer.alloc(SHELL_FRAME);
   out.write(SHELL_MAGIC, 0, 'ascii');
   out.writeUInt16LE(SHELL_VERSION, 8);
@@ -156,15 +186,16 @@ function frame(cx, cz, h, cover, g, s, light) {
   Buffer.from(g.buffer, g.byteOffset, ARR).copy(out, at(SHELL_G));
   Buffer.from(s.buffer, s.byteOffset, ARR).copy(out, at(SHELL_S));
   if (light) Buffer.from(light.buffer, light.byteOffset, SHELL_COLS).copy(out, LIGHT_OFF);
+  if (band) Buffer.from(band.buffer, band.byteOffset, SHELL_COLS).copy(out, BAND_OFF);
   return out;
 }
 
 /**
- * Re-assemble a shell frame from stored columns. Shell packs keep exactly these four u16 planes, so
+ * Re-assemble a shell frame from stored columns. Shell packs keep exactly these planes, so
  * a pack read becomes a frame without touching NBT at all.
  */
-export function shellFrameCols(cx, cz, h, cover, g, s, light) {
-  return frame(cx, cz, h, cover, g, s, light);
+export function shellFrameCols(cx, cz, h, cover, g, s, light, band) {
+  return frame(cx, cz, h, cover, g, s, light, band);
 }
 
 /** The column planes of a shell frame, as views over its bytes. */
@@ -173,5 +204,9 @@ export function shellPlanes(buf, off = 0) {
   const base = (ab === buf ? 0 : buf.byteOffset) + off + SHELL_HEADER;
   const plane = (k) => new Uint16Array(ab, base + k * ARR, SHELL_COLS);
   const light = new Uint8Array(ab, base + 4 * ARR, SHELL_COLS);
-  return { h: plane(SHELL_H), cover: plane(SHELL_C), g: plane(SHELL_G), state: plane(SHELL_S), light };
+  const band = new Uint8Array(ab, base + 4 * ARR + SHELL_COLS, SHELL_COLS);
+  return {
+    h: plane(SHELL_H), cover: plane(SHELL_C), g: plane(SHELL_G), state: plane(SHELL_S),
+    light, band,
+  };
 }
