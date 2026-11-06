@@ -1,5 +1,14 @@
 node_modules/
-build/
+# build/ holds derived artifacts (payload cache, shell packs, LOD tiles) - tens of GB, never committed.
+# The probe scripts and parsers that live there are source: they are how every number in HANDOFF.md was
+# produced, and an untracked probe is a measurement that cannot be repeated after a disk incident.
+build/*
+!build/q_*.js
+!build/q-*.js
+!build/*_parse.cjs
+!build/mk_*.mjs
+!build/spec_*.json
+!build/*.mjs
 .cache/
 *.log
 .DS_Store

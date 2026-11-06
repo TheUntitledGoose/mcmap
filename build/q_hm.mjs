@@ -1,0 +1,12 @@
+import fs from 'node:fs';
+import zlib from 'node:zlib';
+import { readNbt } from '../tools/nbt.mjs';
+import { RegionFile } from '../tools/region.mjs';
+const rf = new RegionFile('DarkRPG/world/region/r.0.0.mca');
+const raw = rf.readChunkNbtBytes(0, 0);
+const nbt = readNbt(zlib.inflateSync(raw)).value;
+console.log('keys', Object.keys(nbt));
+console.log('Heightmaps', nbt.Heightmaps && Object.keys(nbt.Heightmaps));
+const hm = nbt.Heightmaps?.WORLD_SURFACE;
+console.log('WORLD_SURFACE', hm && hm.constructor.name, hm && hm.length, hm && hm[0]);
+console.log('yPos', nbt.yPos, 'yMax', nbt.yMax, 'section0 keys', Object.keys(nbt.sections?.[0] ?? {}));

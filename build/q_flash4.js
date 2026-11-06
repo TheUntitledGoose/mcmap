@@ -1,0 +1,1 @@
+(() => { const w = window.__world; const out = []; const push = () => { const d = w.lodDiag(); out.push(`pass ${JSON.stringify(d.passes)} cand ${JSON.stringify(d.passInfo)} loaded ${d.loaded} dropped ${d.dropped} held ${d.held} wanted ${d.wanted} rung ${JSON.stringify(d.rung)} verts ${d.verts}`); }; for (let i = 0; i < 5; i++) { push(); w.tick(40); } return out.join("\n"); })()

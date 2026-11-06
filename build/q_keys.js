@@ -1,0 +1,1 @@
+(() => { const w = window.__world, d = w.lodDiag(); return "rect " + JSON.stringify(d.rect) + " indexed " + d.indexed + " held " + d.held + " wanted " + d.wanted + " gaps " + d.gaps + " cellPx " + d.cellPx + " maxPx " + d.cellMaxPx + " budget " + d.budget + " lodSpan " + w.settings.lodSpan + " lodMax " + w.settings.lodMax; })()
