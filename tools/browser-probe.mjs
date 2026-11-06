@@ -29,12 +29,21 @@ const URL0 = arg('url', pos.find((p) => /^https?:\/\//.test(p)) ?? 'http://127.0
 const stray = pos.filter((p) => !/^https?:\/\//.test(p));
 if (stray.length) console.log(`probe: ignoring positional argument(s) ${JSON.stringify(stray)}`);
 if (!pos.includes(URL0) && !argv.includes('--url')) console.log('probe: no URL given, using ' + URL0);
-const OUT = path.resolve(arg('out', 'build/probe.png'));
 const WAIT = +arg('wait', 7000);
 const PORT = +arg('port', 9223);
-const SHOT = arg('shot', null);            // --shot 480x270: a small frame is quicker to read and diff
-const W = +arg('width', SHOT ? +SHOT.split('x')[0] : 1280);
-const H = +arg('height', SHOT ? +SHOT.split('x')[1] : 800);
+// --shot takes a size (480x270) or a path (build/x.png); one value, no silent fallbacks. A path used to
+// be swallowed as a size spec, which produced W=NaN, wrote to build/probe.png, and left every A/B diff
+// comparing files from an earlier run - numbers that looked like measurements.
+const SHOT = arg('shot', null);
+const SHOT_SIZE = SHOT && /^\d+x\d+$/.test(SHOT) ? SHOT : null;
+if (SHOT && !SHOT_SIZE && !path.extname(SHOT)) {
+  throw new Error(`--shot ${JSON.stringify(SHOT)} is neither WxH nor a file path - use --shot 900x500 --out build/x.png`);
+}
+const OUT = path.resolve(arg('out') || (SHOT && !SHOT_SIZE ? SHOT : 'build/probe.png'));
+const W = +arg('width', SHOT_SIZE ? +SHOT_SIZE.split('x')[0] : 1280);
+const H = +arg('height', SHOT_SIZE ? +SHOT_SIZE.split('x')[1] : 800);
+if (!Number.isFinite(W) || !Number.isFinite(H) || W < 1 || H < 1) throw new Error(`bad screenshot size ${W}x${H}`);
+if (W !== Math.round(W) || H !== Math.round(H)) throw new Error(`bad screenshot size ${W}x${H}`);
 const EDGE = arg('edge', 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe');
 const PROFILE = arg('profile') || fs.mkdtempSync(path.join(os.tmpdir(), 'pi-edge-'));
 
