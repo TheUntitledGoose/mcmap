@@ -3348,6 +3348,7 @@ window.__world = {
   // find-and-replace over the settings list.
   panelKeys: () => (panel ? panel.keys() : []),
   presets: () => Object.keys(PRESETS),
+  presetKeys: () => Object.fromEntries(Object.entries(PRESETS).map(([k, p]) => [k, Object.keys(p.s)])),
   set: (k, v) => {
     if (k === 'dist') { rig.dist = Math.max(2, Math.min(S.maxZoom, +v)); updateView(); requestAround(); return rig.dist; }
     const key = { far: 'skinCap', detail: 'radius', world: 'dim' }[k] ?? k;
@@ -3823,6 +3824,14 @@ function buildPanel() {
   // a copy of the settings that would drift. Presets only name these keys, and every one of them has
   // a control: that is what makes 'caves' mean caves instead of leaving the dark rule half on.
   const byKey = new Map(items.filter((it) => it.key).map((it) => [it.key, it]));
+  // Presets name controls, not settings. If a row leaves the panel and a preset still points at it,
+  // the button quietly does half its job - which is how "caves" once left the dark rule half on.
+  // So the mismatch is reported at boot, where it costs a console line, not at click time, where
+  // it costs a user an hour of wondering why one knob would not move.
+  for (const [name, p] of Object.entries(PRESETS)) {
+    const bad = Object.keys(p.s).filter((k) => !byKey.has(k));
+    if (bad.length) console.error(`preset "${name}": no control for ${bad.join(', ')}`);
+  }
   let presetBack = null, presetCam = null;
   function preset(name) {
     const p = PRESETS[name];
