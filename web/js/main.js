@@ -40,7 +40,10 @@ const clampInt = (v, lo, hi) => Math.min(hi, Math.max(lo, v | 0));
 // probe URL and a slider describe the same page. The settings panel is a view over this, never a
 // second copy of it.
 const S = {
-  radius: Math.max(0, num('radius', 5)),         // detail (voxel) ring ceiling, in chunks
+  radius: Math.max(0, num('radius', 8)),         // detail (voxel) ring ceiling, in chunks
+  // 5 was too small to see: at a 257 m orbit that is an 80 m sharp patch in a 1200 m view, which is
+  // what the "sliver of detail surrounded by LOD" complaint is. 8 chunks = 128 m of block-by-block
+  // ground, ~290 chunk meshes, ~4 M verts. The panel row goes to 24 for people with the GPU for it.
   detailPx: num('detailpx', 1),            // a 1-block column must cover this many px to earn triangles
   detailLod: !params.has('nodetaillod'),   // off = the old behaviour: full res whatever the zoom
   payloadLead: num('payloadlead', 6),            // chunks of voxel payload kept warm beyond the mesh ring
@@ -912,7 +915,7 @@ function startWorkers() {
     w.seq = gen;
     w.onmessage = (e) => {
       const m = e.data;
-      if (m.patch) { patchResult(w, m); return; }
+      if (m.patch) { patchResult(w, m); pumpMeshes(1, Infinity); return; }
       if (m.ready) { workerReadyMsgs++; if (w.seq === workerSeq) workerReady++; return; }
       w.busy = false;
       const job = jobs.get(m.seq);
@@ -932,6 +935,10 @@ function startWorkers() {
       meshStat(m.ms ?? 0);
       meshWait = Math.max(meshWait, performance.now() - job.t0);
       attachChunkMesh(m.cx, m.cz, geos, m.stats, job.wasCovered, job.mk);
+      // This thread is free now. Ask for the next chunk instead of waiting for the next frame: at 6 fps
+      // a once-a-frame drain feeds eight workers six times a second, which is how a full detail ring
+      // took 15 s to paint after a pan.
+      pumpMeshes(1, Infinity);
     };
     // A worker that dies takes a chunk of the meshing capacity with it, and "0 workers" in the HUD
     // with everything meshing on the render thread is otherwise invisible: the world just loads slowly
@@ -964,6 +971,7 @@ function resetWorkers() {
   }
   for (const [seq, job] of [...patchJobs]) { patchJobs.delete(seq); patchJobForKey.delete(job.pk); }
   patchInflight = 0;
+  waveDrop(true);                       // the wave's keys go back to the dirty set, not into the void
   startWorkers();
 }
 
@@ -1005,15 +1013,37 @@ function meshAsync(cx, cz, mk) {
 
 // Drain the dirty set: hand work to free workers when they are up, otherwise pay for it here so the
 // page still renders on browsers or probes that forced ?workers=0.
-function drainMeshes(now) {
+//
+// The queue is drained by whoever frees a thread, not once per frame. Posting used to be a once-per-
+// frame event: at 6 fps the pool got six chances a second to be fed, and eight threads that can each
+// finish a chunk in 26 ms managed 35 chunk meshes a second between them. A 10-chunk detail ring then
+// took 15 s to paint after a pan with every payload already in memory (inflight 0, queue 0, and a
+// `budget` of 8, 24 or 48 making no difference at all) - which is exactly what "detailed chunks are not
+// loading after panning around" looks like. `pumpMeshes` now runs from the frame **and** from a worker's
+// result handler, so a thread that goes idle asks for work immediately instead of at the next frame.
+let wave = [], waveAt = 0, waveCx = 1e9, waveCz = 1e9;
+
+// A key taken out of `store.dirty` is the wave's responsibility until it is handled: dropping the wave
+// without putting the rest back loses those chunks.
+function waveDrop(requeue) {
+  if (requeue && store) for (let i = waveAt; i < wave.length; i++) store.dirty.add(wave[i]);
+  wave = []; waveAt = 0;
+}
+
+/**
+ * Walk the nearest-first list and finish at most `maxJobs` of it, stopping at `deadline`.
+ * The deadline bounds *inline* meshing (no worker pool); with a pool the stop condition is "no thread
+ * free", and whatever is left keeps its order in the wave for the next pump.
+ */
+function pumpMeshes(maxJobs, deadline) {
+  if (!store) return 0;
   const inline = !workersUsable();
-  // One nearest-first pick for the whole frame, then walk it. takeDirty() is a full pass over the dirty
-  // set, and this loop used to ask it for exactly one key at a time: a frame that processed 50 keys paid
-  // 50 scans of a 1.4k-key set. Whatever the mesher costs, this part cost 14 ms a frame in a drag.
-  const keys = store.takeDirty(Infinity);
-  const requeue = (from) => { for (let j = from; j < keys.length; j++) store.dirty.add(keys[j]); };
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[i];
+  let done = 0;
+  for (;;) {
+    if (done >= maxJobs) return done;
+    if (waveAt >= wave.length) { wave = store.takeDirty(Infinity); waveAt = 0; }
+    if (waveAt >= wave.length) return done;
+    const k = wave[waveAt++];
     const [cx, cz] = k.split(',').map(Number);
     // A dirty key whose chunk is gone must be dropped, not put back. It used to go back, and since
     // the loop stops on the first refusal, one stale key throttled the whole mesh queue: 35 of them
@@ -1029,7 +1059,7 @@ function drainMeshes(now) {
       if (have && have.mk === mk) { meshUnchanged.count++; dirtyTag.delete(k); continue; }
     }
     const parked = meshBytes.get(k);
-    if (parked && parked.mk === mk) { installCached(cx, cz, mk); dirtyTag.delete(k); continue; }
+    if (parked && parked.mk === mk) { installCached(cx, cz, mk); done++; dirtyTag.delete(k); continue; }
     // Meshing against a border that is not settled is the expensive case: whatever is built now has a
     // wall against the unknown in it, and the arrival forces a second mesh of the same chunk. Counted
     // because it is the number that says whether the payload ring is wide enough. Waiting it out was
@@ -1038,15 +1068,24 @@ function drainMeshes(now) {
     if (S.meshKey && !settledNeighbours(cx, cz)) meshUnsettled.count++;
     if (inline) {
       rebuild(cx, cz, mk);
-      // Over budget: stop for the frame, and put everything still unvisited back in the queue.
-      if (performance.now() > now + S.budget) { requeue(i + 1); break; }
+      done++;
+      if (performance.now() > deadline) return done;   // over budget: the wave keeps the rest
       continue;
     }
-    if (meshAsync(cx, cz, mk)) continue;
-    requeue(i);                         // no free worker: the rest stays queued for the next frame
+    if (meshAsync(cx, cz, mk)) { done++; continue; }
+    waveAt--;                                // no thread free: this key waits, and keeps its place
     markChunk(k, 'no-worker', true);
-    break;
+    return done;
   }
+}
+
+function drainMeshes(now) {
+  // Re-order the queue when the view centre moved: nearest-first was computed when the wave was taken,
+  // and after a pan the middle of the new view has to jump the old view's leftovers. Putting the tail
+  // back in the dirty set is what keeps that from dropping chunks.
+  const [cx, cz] = centerChunk();
+  if (cx !== waveCx || cz !== waveCz) { waveDrop(true); waveCx = cx; waveCz = cz; }
+  pumpMeshes(Infinity, now + S.budget);
 }
 
 const centerChunk = () => [Math.floor(rig.target.x / 16), Math.floor(rig.target.z / 16)];
@@ -2888,6 +2927,10 @@ window.__world = {
       meshUnsettled: meshUnsettled.count, meshBytesGhost, parkThenBuild,
       parkedWaiting: parkedAt.size,
       payloadLead: S.payloadLead, bytesKeep: S.bytesKeep,
+      // The mesh queue's own depth: keys waiting in the wave (taken from the dirty set) and jobs the
+      // pool has not answered yet. Without these, "chunks" and "dirty" cannot say whether the page is
+      // waiting on the network, on the threads, or on its own bookkeeping.
+      meshWave: wave.length - waveAt, meshJobs: jobs.size,
       dirtyWhy: Object.fromEntries(dirtyWhy), meshByWhy: Object.fromEntries(meshWhy),
       farCostScale: +costScale.toFixed(2), farFloorBoost: floorBoost, cpuRenderMs: +cpuRenderMs.toFixed(2),
       shellPatch: S.patch, maxZoom: S.maxZoom, worldSpan: S.worldSpan,
@@ -3444,7 +3487,7 @@ function buildPanel() {
         get: () => rig.dist,
         set: (v) => { rig.dist = Math.max(2, Math.min(S.maxZoom, v)); updateView(); requestAround(); } },
 
-      { key: 'radius', label: 'close detail', min: 0, max: 14, step: 1, live: false,
+      { key: 'radius', label: 'close detail', min: 0, max: 24, step: 1, live: false,
         fmt: (v) => (v ? `${v * CH} m` : 'off'),
         hint: 'The most terrain built block by block with real textures, around what you look at - a\nceiling, not a promise: zoom out and less of it is drawn, because far away those\ntriangles are smaller than a pixel. Bigger is prettier and slower. URL: ?radius',
         get: () => S.radius, set: (v) => { S.radius = Math.max(0, v | 0); applySettings('radius'); } },
