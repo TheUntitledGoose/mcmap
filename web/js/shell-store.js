@@ -30,6 +30,10 @@ export class ShellStore {
     this.dirty = new Set();
     this.radius = 0;
     this.center = null;
+    // Eviction bookkeeping. A sweep walks every held chunk, so it is only worth doing when the box it
+    // enforces has actually changed.
+    this.evCx = null; this.evCz = null; this.evLimit = -1;
+    this.evSweeps = 0; this.evSkipped = 0; this.evVisited = 0;
     this.listeners = [];
   }
 
@@ -127,17 +131,26 @@ export class ShellStore {
   #evict() {
     const [cx, cz] = this.center;
     const limit = this.radius + this.keep;
-    for (const k of [...this.shells.keys()]) {
-      const s = this.shells.get(k);
+    // A sweep is O(held), and `#ingest` used to call it for every arriving batch. At whole-world radius
+    // the held set is ~37 000 chunks, so a pan paid ~37 000 key visits plus a copied key array per
+    // batch: 4.3% of the page's CPU, in one function, most of it after the box had stopped moving.
+    if (cx === this.evCx && cz === this.evCz && limit === this.evLimit) { this.evSkipped++; return; }
+    this.evCx = cx; this.evCz = cz; this.evLimit = limit; this.evSweeps++;
+    // The live Map, not a copy of its keys: deleting the entry being visited is well defined, and a
+    // `[...keys]` per sweep is 37 000 allocations.
+    for (const [k, s] of this.shells) {
+      this.evVisited++;
       if (Math.abs(s.cx - cx) > limit || Math.abs(s.cz - cz) > limit) {
         this.shells.delete(k);
         this.#touch(s.cx, s.cz);
       }
     }
     // Confirmed holes have to expire too, or the count keeps every hole the camera ever flew past
-    // and the HUD stops describing the view it is showing.
-    for (const k of [...this.missing]) {
-      const [mx, mz] = k.split(',').map(Number);
+    // and the HUD stops describing the view it is showing. Parsed with one indexOf: `split + map`
+    // allocated two arrays per hole on every sweep.
+    for (const k of this.missing) {
+      const i = k.indexOf(',');
+      const mx = +k.slice(0, i), mz = +k.slice(i + 1);
       if (Math.abs(mx - cx) > limit || Math.abs(mz - cz) > limit) this.missing.delete(k);
     }
   }

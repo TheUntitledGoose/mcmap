@@ -81,6 +81,10 @@ const S = {
   groundFar: Math.max(0, Math.min(1, num('groundfar', 1))),
   budget: num('budget', 8),
   shellBudget: num('sbudget', 10),
+  // Demotion is a *time* budget as well as a headcount. Demoting one chunk means slicing three
+  // attribute arrays into the park and deleting up to three GPU buffers; 64 of them measured 45 ms
+  // in a single frame in the middle of a pan, which is a stutter you can see and hear.
+  demoteBudget: num('demotems', 6),
   // Render scale, as a multiple of the capped device pixel ratio. Fewer pixels is the one remedy
   // that helps no matter which stage of the pipeline is slow. URL: ?res=0.75
   res: Math.max(0.4, Math.min(2, num('res', 1))),
@@ -331,6 +335,14 @@ function makeMaterial(kind, map) {
 // inherit it from parents.
 const groups = [new THREE.Group(), new THREE.Group(), new THREE.Group()];
 groups.forEach((g, i) => { g.name = `pass${i}`; scene.add(g); });
+// Every mesh this viewer builds is authored in world coordinates and never moved afterwards, so the
+// per-frame matrix work is pure waste: three.js composes a local matrix and multiplies it into the
+// world matrix for every object in the scene, and with the whole world in view that measured 2.1% of
+// the page's CPU in updateMatrixWorld plus 1.4% in multiplyMatrices. Pin them instead: one compose when
+// the mesh is built, nothing per frame. `?matrixlive=1` puts the per-frame recomputation back so the
+// difference can be measured (and so a future feature that does move a mesh has a knob to find it).
+const STATIC_MATRIX = !params.has('matrixlive');
+const pinStatic = (o) => { o.matrixAutoUpdate = STATIC_MATRIX; o.updateMatrix(); return o; };
 // The shell skin lives in its own node inside the opaque group, so the vert counter and the
 // "far view" HUD row can see it without walking the detail meshes.
 const shellGroup = new THREE.Group();
@@ -738,6 +750,12 @@ const detailSig = () => `A${S.ao ? 1 : 0}/${S.aoMin}L${S.light ? 1 : 0}/${S.dark
 const meshDone = new Map();                 // "cx,cz" -> key of the mesh currently installed
 const PARK_THEN_BUILD_MS = 10000;           // a re-cut this soon after an install means the install was wasted
 const meshUnchanged = { count: 0 };         // dirty marks that needed no work at all
+// A worker result that gets thrown away has already consumed the chunk's dirty mark - `takeDirty` handed
+// the key over and the result was rejected. Without a re-mark the chunk ends up held, inside the ring,
+// unmeshed and unqueued, which is the `ringStuck [6,0]` settle failure: six chunks at the dead centre of
+// the view, 24 sections of voxels in hand, and a hole in the middle of the picture that no amount of
+// waiting fixed. Counted so a regression shows up as a number instead of a screenshot.
+const meshResultsDropped = { count: 0 };
 const meshUnsettled = { count: 0 };         // meshes actually built against a border with a hole in it
 
 // The key itself lives in web/js/mesh-key.js, which is DOM-free and three-free so a test can hold it:
@@ -898,12 +916,23 @@ function dropChunkMesh(cx, cz, stash = false) {
 // The skin has to stop drawing under anything the detail pass picks up, otherwise two surfaces sit
 // at the same height and z-fight. `wasCovered` is the state before this mesh landed.
 function attachChunkMesh(cx, cz, geos, stats, wasCovered, mk = null) {
-  if (!geos.length) return;
   // A worker can finish a chunk after the ring has already moved past it. Installing that result would
   // put full-res geometry back exactly where the far grid is supposed to paint it (the demote pass had
   // already run), so the work is thrown away rather than drawn.
   if (S.shellOn && S.detailLod && !inDetailRing(cx, cz, 1)) {
     for (const { geometry } of geos) geometry.dispose();
+    return;
+  }
+  // An empty answer is still an answer, so it is recorded: `meshes.has` is what `detailHere` asks, and
+  // the mk short-circuit in the mesh drain is what stops the next dirty mark from meshing it again.
+  // Six chunks in a void column (surface sentinel -2048, air top to bottom) were the whole of the
+  // `ringStuck [6,0]` settle failure: no triangles to install, no entry, so every arrive/evict/ring mark
+  // re-ran the mesher over them and every settle re-counted them as unfinished work.
+  // The skin-coverage mark is only for a chunk that actually picked something up - there is no surface
+  // to stop drawing under when the answer is nothing, and a patch re-cut costs ~11 ms.
+  if (!geos.length && !wasCovered) {
+    meshes.set(`${cx},${cz}`, { list: [], stats, mk });
+    meshDone.set(`${cx},${cz}`, mk);
     return;
   }
   // The skin has to stop drawing under anything the detail pass picks up, otherwise two surfaces sit at
@@ -918,6 +947,8 @@ function attachChunkMesh(cx, cz, geos, stats, wasCovered, mk = null) {
     mesh.name = `detail${pass}`;
     mesh.renderOrder = pass;
     mesh.frustumCulled = true;
+    // A chunk mesh never moves: its vertices are already in world coordinates.
+    pinStatic(mesh);
     groups[pass].add(mesh);
     return { pass, mesh };
   });
@@ -988,7 +1019,7 @@ function startWorkers() {
     w.seq = gen;
     w.onmessage = (e) => {
       const m = e.data;
-      if (m.patch) { patchResult(w, m); pumpMeshes(1, Infinity); return; }
+      if (m.patch) { patchResult(w, m); pumpMeshes(1, performance.now() + MIDPUMP_MS); return; }
       if (m.ready) { workerReadyMsgs++; if (w.seq === workerSeq) workerReady++; return; }
       w.busy = false;
       const job = jobs.get(m.seq);
@@ -996,7 +1027,14 @@ function startWorkers() {
       jobForKey.delete(m.key);
       // The chunk may have been evicted, replaced, or switched dimension while its mesh was being
       // built; a stale skin over new voxels is worse than one more frame of shell.
-      if (!job || job.gen !== dimGen || !store.get(m.cx, m.cz)) return;
+      if (!job || job.gen !== dimGen || !store.get(m.cx, m.cz)) {
+        meshResultsDropped.count++;
+        // Discarding the triangles is right; discarding the *work order* along with them is what left a
+        // hole. Put the order back if the chunk is still something the sharp layer owns.
+        if (store && store.has(m.cx, m.cz) && inDetailRing(m.cx, m.cz, 1) &&
+            !meshes.has(`${m.cx},${m.cz}`)) markChunk(m.key ?? `${m.cx},${m.cz}`, 'worker-dropped');
+        return;
+      }
       const geos = m.passes.map(({ pass, position, uv, color, index }) => {
         const g = new THREE.BufferGeometry();
         g.setAttribute('position', new THREE.BufferAttribute(position, 3));
@@ -1012,7 +1050,7 @@ function startWorkers() {
       // This thread is free now. Ask for the next chunk instead of waiting for the next frame: at 6 fps
       // a once-a-frame drain feeds eight workers six times a second, which is how a full detail ring
       // took 15 s to paint after a pan.
-      pumpMeshes(1, Infinity);
+      pumpMeshes(1, performance.now() + MIDPUMP_MS);
     };
     // A worker that dies takes a chunk of the meshing capacity with it, and "0 workers" in the HUD
     // with everything meshing on the render thread is otherwise invisible: the world just loads slowly
@@ -1109,6 +1147,11 @@ function waveDrop(requeue) {
  * The deadline bounds *inline* meshing (no worker pool); with a pool the stop condition is "no thread
  * free", and whatever is left keeps its order in the wave for the next pump.
  */
+// A worker that just freed up is fed straight away rather than at the next frame - that is what took
+// a detail ring from 15 s to 4 s after a pan - but the feed is cost-bounded, because eight results
+// can land in one task and each one posts another job on the way out.
+const MIDPUMP_MS = 2;
+
 function pumpMeshes(maxJobs, deadline) {
   if (!store) return 0;
   const inline = !workersUsable();
@@ -1151,7 +1194,14 @@ function pumpMeshes(maxJobs, deadline) {
       if (performance.now() > deadline) return done;   // over budget: the wave keeps the rest
       continue;
     }
-    if (meshAsync(cx, cz, mk)) { done++; continue; }
+    if (meshAsync(cx, cz, mk)) {
+      done++;
+      // The deadline used to be paid only on the inline path. With workers, one frame's drain posted
+      // job after job - each one a copy of the chunk's voxel arrays plus the structured clone on the way
+      // out - and a frame in the middle of a pan paid 27-40 ms without ever meshing anything itself.
+      if (performance.now() > deadline) return done;
+      continue;
+    }
     waveAt--;                                // no thread free: this key waits, and keeps its place
     markChunk(k, 'no-worker', true);
     return done;
@@ -1298,10 +1348,13 @@ function markDetailRing() {
 // Demote: dispose the geometry (that is the VRAM and the draw cost), keep the payload. The patches
 // the skin skipped because detail owned them have to be re-meshed, or dropping detail punches a hole
 // - the same failure class as an overview cell that nothing paints.
-function demoteOutsideRing(budget = 64) {
+function demoteOutsideRing(now, budget = 64) {
   let n = 0;
+  // The headcount bound was the only bound, and it is not a measure of work: what a demotion costs is
+  // the parked-byte copies and the buffer deletes, and 64 chunks of them landed 45 ms on one frame.
+  const deadline = now + S.demoteBudget;
   for (const k of [...meshes.keys()]) {
-    if (n >= budget) return n;
+    if (n >= budget || performance.now() > deadline) return n;
     const [cx, cz] = k.split(',').map(Number);
     if (inDetailRing(cx, cz, 1)) continue;
     if (dropChunkMesh(cx, cz, true)) { markPatch(cx, cz, 'demote'); demoted++; n++; }
@@ -1604,7 +1657,7 @@ function installPatch(pk, plan, stream, stats, ms) {
     const m = new THREE.Mesh(g, mat);
     m.name = 'shpatch';
     m.renderOrder = 0;
-    shellGroup.add(m);
+    shellGroup.add(pinStatic(m));          // world-coordinate geometry; it does not move
     return m;
   };
   shellMeshes.set(pk, {
@@ -1639,7 +1692,8 @@ function patchResult(w, m) {
 }
 
 function rebuildPatch(pk) {
-  if (patchJobForKey.has(pk)) return;      // a cut is already running for this patch
+  if (patchJobForKey.has(pk)) return 'dup';    // a cut is already running for this patch
+  const tJob = performance.now();             // the whole job: plan, pack, and mesh if it stays here
   const plan = planPatch(pk);
   if (plan.skip) {
     const old = shellMeshes.get(pk);
@@ -1649,12 +1703,16 @@ function rebuildPatch(pk) {
       recountShellVerts();
     }
     patchTier.delete(pk);
-    return;
+    return 'skip';
   }
   // The cut goes to a worker when one is free, and the previous mesh stays on screen until the new one
   // arrives: that is also what stops a re-cut from blanking a patch for a frame, which is what far
   // terrain flickering during a drag used to mean.
-  if (patchInflight < patchCap() && postPatchJob(pk, plan)) return;
+  if (patchInflight < patchCap() && postPatchJob(pk, plan)) {
+    const ms = performance.now() - tJob;
+    patchJobAvg += (ms - patchJobAvg) / ++patchJobN;
+    return 'worker';
+  }
   // No worker free, so this one is cut here - but with the same packed answers the worker gets, not the
   // live closures. `cellForChunk`/`detailHere` are asked once per column, which at cell 1 is 4096 asks
   // per patch, each building a chunk key string and walking two Maps and the tier table: 14% of a drag's
@@ -1673,9 +1731,14 @@ function rebuildPatch(pk) {
     const t1 = performance.now();
     const again = meshShellPatch(assets, shellAt, plan.x0, plan.z0, plan.w, plan.h, plan.opts);
     installPatch(pk, plan, again.stream, again.stats, performance.now() - t1);
-    return;
+    const ms2 = performance.now() - tJob;
+    shellCutAvg += (ms2 - shellCutAvg) / ++shellCuts;
+    return 'inline';
   }
   installPatch(pk, plan, stream, stats, performance.now() - t0);
+  const ms = performance.now() - tJob;
+  shellCutAvg += (ms - shellCutAvg) / ++shellCuts;
+  return 'inline';
 }
 
 // Counted from the live meshes rather than the mesher stats: a patch that was skipped (detail owns
@@ -1686,13 +1749,44 @@ function recountShellVerts() {
 }
 
 let shellCutAvg = 0, shellCuts = 0, PATCH_CUT_MAX = 64;
-// Signature tests per frame: enough to settle a page of patches in a few frames, few enough that
-// the tests themselves cannot become the frame.
-const SETTLE_TESTS = 24;
+// Three different pieces of work live in this pass and they cost three different things: a signature
+// test (walks a patch's tier, its eight neighbours' tiers and 64 chunk keys), an inline cut (meshing
+// up to 65 536 columns), and a worker job build (collecting the patch's shell frames to send away).
+// Budgeting them with one blended average is how a frame ended up 30 ms: the blend said ~6 ms, the
+// inline cut was 25.
+let patchJobAvg = 0, patchJobN = 0, sigAvg = 0, sigN = 0;
+// How many signature tests the pass ran, and how many dirty patches it left marked because its
+// budget ran out. Without these two, "the far layer is slow to settle" cannot be told apart from
+// "the far layer settled and nothing was left to do".
+let patchTestedN = 0, patchDeferredN = 0, patchCursor = 0;
+// A cut is either a first mesh (nothing on screen yet, so no test was possible) or a re-cut after the
+// signature said the inputs changed. Without the split, "1 000 cuts in a pan" cannot be judged: a pan
+// marks a patch for every chunk that arrives or is evicted, and it is the second kind that is worth
+// hunting.
+let patchCutsNew = 0, patchCutsChanged = 0;
+// (There used to be a `SETTLE_TESTS = 24` count here. A signature test measured 0.03 ms, so a *count*
+// was the wrong unit: it left 150+ dirty patches untested per frame, and the code answered "untested"
+// by cutting the patch anyway - 2 901 inline cuts of 11 ms in one pan. The tests now share the pass's
+// wall-clock deadline instead, and an untested patch stays marked.)
 
 function drainShellPatches(now) {
-  let n = 0, tested = 0;
-  for (const pk of [...dirtyPatches]) {
+  let n = 0;
+  // One wall-clock deadline for the *whole* pass. The cut branch respected `shellBudget`; the
+  // signature tests did not, and on a wide skin square the tests are the expensive part - 24 walks of
+  // nine neighbour tiers plus 64 chunk keys each measured 20-45 ms. A frame could therefore spend
+  // 46 ms in this bucket and cut nothing at all, which is the stutter in the middle of a pan.
+  const deadline = now + S.shellBudget;
+  // Round-robin from a cursor: the dirty set is insertion-ordered, and a pass that always starts at
+  // the front starves whatever sits at the back while the front keeps getting re-marked by the pan.
+  const all = [...dirtyPatches];
+  patchCursor %= Math.max(1, all.length);
+  const ordered = patchCursor ? all.slice(patchCursor).concat(all.slice(0, patchCursor)) : all;
+  for (const pk of ordered) {
+    const t0 = performance.now();
+    // A test is the cheapest thing this loop can do, so if even a test does not fit, stop. A cut is
+    // gated after it runs, by the average of the path that cut actually took (see rebuildPatch).
+    if (t0 + Math.max(0.3, sigAvg) > deadline) return;
+    patchCursor = (patchCursor + 1) % Math.max(1, all.length);
     const live = shellMeshes.get(pk);
     if (!dirtySince.has(pk)) dirtySince.set(pk, now);
     const waited = now - dirtySince.get(pk);
@@ -1712,20 +1806,40 @@ function drainShellPatches(now) {
     // sit dirty while 141 patches exist, and testing every one of them every frame measured 20 ms of
     // a 10 ms budget - the signature tests, not the meshing. So they are budgeted too: answer as many
     // as the frame can afford and leave the rest marked for the next one.
-    if (live && tested++ < SETTLE_TESTS && live.sig === patchSig(pk)) {
-      dirtyPatches.delete(pk); dirtySince.delete(pk);
-      continue;
+    if (live) {
+      // Out of time for a test: leave it marked. Cutting it anyway is not a cheaper answer, it is the
+      // very work the signature exists to skip - and it throws away a mesh that is on screen.
+      //
+      // This used to be a flat count (24 tests a frame). A test measured 0.03 ms, so the count let 150+
+      // dirty patches go untested each frame, and untested used to mean "cut it": 2 901 inline cuts in
+      // one pan, 11 ms each. Budget the tests with the same clock the cuts obey.
+      if (performance.now() + Math.max(0.3, sigAvg) > deadline) { patchDeferredN++; continue; }
+      patchTestedN++;
+      const ts = performance.now();
+      const same = live.sig === patchSig(pk);
+      const sms = performance.now() - ts;
+      sigAvg += (sms - sigAvg) / ++sigN;
+      if (same) { dirtyPatches.delete(pk); dirtySince.delete(pk); continue; }
+    }
+    // A cut has to fit in the budget it is started in. When no thread is free the cut runs here at the
+    // measured inline average, and starting one 9 ms into a 10 ms frame meant the frame paid 38 ms.
+    // The first cut of a frame is always allowed, or a budget smaller than one cut would never cut.
+    if (n && patchInflight >= patchCap() &&
+        performance.now() + Math.max(2, shellCutAvg) > deadline) {
+      dirtyAdd(pk, 'budget'); patchDeferredN++;
+      return;
     }
     dirtyPatches.delete(pk); dirtySince.delete(pk);
     // Pay for the patch, then decide with the cost of *that* patch in hand. A 16x16 patch is 65 536
     // heightmap columns, and its cut measured 5.5 ms; a flat count of four per frame therefore cost
     // 22 ms of a 10 ms budget and put the whole page at 23 fps while the far grid stood up. Patches
-    // vary several-fold, so the last cut is the only honest estimate of the next one.
-    const t0 = performance.now();
-    rebuildPatch(pk);
-    const cut = performance.now() - t0;
-    shellCutAvg += (cut - shellCutAvg) / ++shellCuts;
-    if (++n >= PATCH_CUT_MAX || performance.now() + shellCutAvg > now + S.shellBudget) return;
+    // vary several-fold, so the last cut is the only honest estimate of the next one - and the path
+    // matters: a cut handed to a thread costs the job build, an inline one costs the whole mesh.
+    const path = rebuildPatch(pk);
+    if (path === 'skip' || path === 'dup') continue;
+    if (live) patchCutsChanged++; else patchCutsNew++;
+    const est = path === 'worker' ? Math.max(0.5, patchJobAvg) : Math.max(2, shellCutAvg);
+    if (++n >= PATCH_CUT_MAX || performance.now() + est > deadline) return;
   }
 }
 
@@ -1976,7 +2090,7 @@ function drainOverview(now) {
       const mesh = new THREE.Mesh(g, shellMat);
       mesh.name = 'overview';
       mesh.renderOrder = -1;               // draw the coarse layer before the skin covering the same ground
-      ovGroup.add(mesh);
+      ovGroup.add(pinStatic(mesh));        // world-coordinate geometry; it does not move
       ovBands.set(i, { mesh, verts: stream.count, cells: stats.columns, skipped: stats.skipped ?? 0, sig });
       if (ovGroup.children.length !== ovBands.size) {
         for (const m of [...ovGroup.children]) { ovGroup.remove(m); m.geometry.dispose(); }
@@ -2480,7 +2594,7 @@ function drainLod(now) {
     mesh.userData.tile = k;                  // so a ray can say which baked tile painted this pixel
 
     mesh.position.y = LOD_Y_BIAS;
-
+    pinStatic(mesh);                       // the bias is written once, not recomputed per frame
     mesh.renderOrder = -1;
 
     lodGroup.add(mesh);
@@ -2646,7 +2760,7 @@ function frameBody(now) {
   // Demote before counting, so a pull-back stops paying for full-res geometry in the same frame it
   // decided to. Bounded: disposing 300 BufferGeometries in one frame is its own hitch.
 
-  if (S.shellOn) demoteOutsideRing(64);
+  if (S.shellOn) demoteOutsideRing(now);
   // The store evicts on its own schedule; once a second is often enough to notice that a parked
   // mesh's payload has gone away, and rarely enough that walking the map is free.
   if (now - lastBytesSweep > 1000) { lastBytesSweep = now; sweepMeshBytes(); }
@@ -3007,11 +3121,18 @@ function atLight(wx, wy, wz) {
 function ringStuck() {
   if (!store) return [0, 0];
   let n = 0, q = 0;
+  ringStuck.rows = [];
   for (const c of store.chunks.values()) {
     if (!inDetailRing(c.cx, c.cz, 1)) continue;
     const k = `${c.cx},${c.cz}`;
     if (meshes.has(k)) continue;
-    n++; if (store.dirty.has(k)) q++;
+    n++;
+    if (store.dirty.has(k)) q++;
+    else if (ringStuck.rows.length < 8) {
+      const [tcx, tcz] = centerChunk();
+      ringStuck.rows.push({ k, dist: Math.max(Math.abs(c.cx - tcx), Math.abs(c.cz - tcz)),
+        queued: store.queue.has?.(k) ?? null, sections: c.sections?.length ?? -1, mk: meshKeyFor(c.cx, c.cz) });
+    }
   }
   return [n, q];
 }
@@ -3034,7 +3155,7 @@ window.__world = {
       // [held chunks inside the sharp ring with no mesh, how many of those are queued].
       // `ringStuck[0] > 0 && ringStuck[1] === 0` is the failure, not a slow queue: work that
       // nobody will ever ask for again.
-      ringStuck: ringStuck(),
+      ringStuck: ringStuck(), ringStuckRows: ringStuck.rows ?? [],
       mesh: aggTotal, meshMs: +meshAvg.toFixed(2), meshMax: +meshMax.toFixed(2), meshed: meshN,
       // What the player actually waits for: request-accepted to mesh-landed, which includes queueing.
       meshWait: +meshWait.toFixed(2), workers: pool.length, workerReady, workerError, workerReadyMsgs, meshQueued: jobs.size,
@@ -3042,6 +3163,10 @@ window.__world = {
   lodGaps: lodStore ? lodStore.gaps() : 0, lodError, lodCap: S.lodCap,
   shellPatches: shellMeshes.size, shellVerts, retired: retireN, shellHeld: shellStore ? shellStore.loaded : 0,
       shellTextured: [...shellMeshes.values()].filter((e) => e.mode === 1).length,
+      // Sweeps of the far skin's held set (one per box change, used to be one per arriving batch).
+      shellEvSweeps: shellStore ? shellStore.evSweeps : 0,
+      shellEvSkipped: shellStore ? shellStore.evSkipped : 0,
+      shellEvVisited: shellStore ? shellStore.evVisited : 0,
       ovCells, ovVerts, ovSkipped, ovMs: +ovMs.toFixed(1), ovReady: !!overview, ovOn: ovActive() ? 1 : 0,
       ovMeshes: ovGroup.children.length,   // must equal ovBands: more means ghost bands still drawing
       ovBands: ovBands.size, ovBandsTotal: ovBandTotal(), ovBandRows: ovBandRows(),
@@ -3065,20 +3190,31 @@ window.__world = {
       meshCacheMB: +(meshBytesTotal / 1048576).toFixed(1), meshCachedChunks: meshBytes.size,
       meshReused: cachedInstalls, meshCacheDropped: meshBytesDropped,
       meshBuilds, meshKeyOn: S.meshKey, meshUnchanged: meshUnchanged.count,
-      meshUnsettled: meshUnsettled.count, meshBytesGhost, parkThenBuild,
+      meshUnsettled: meshUnsettled.count, meshResultsDropped: meshResultsDropped.count, meshBytesGhost, parkThenBuild,
       parkedWaiting: parkedAt.size,
       payloadLead: S.payloadLead, bytesKeep: S.bytesKeep,
       // The mesh queue's own depth: keys waiting in the wave (taken from the dirty set) and jobs the
       // pool has not answered yet. Without these, "chunks" and "dirty" cannot say whether the page is
       // waiting on the network, on the threads, or on its own bookkeeping.
       meshWave: wave.length - waveAt, meshJobs: jobs.size,
+      // Far-patch pass progress: signature tests run, and dirty patches left marked because the pass
+      // ran out of budget. `patchDeferred` climbing while `retired`/`shellPatches` stall means the
+      // far layer is starving, not settling.
+      patchTested: patchTestedN, patchDeferred: patchDeferredN, patchCuts: shellCuts,
+      patchCutsNew, patchCutsChanged,
+      // Cuts that went to a thread versus cuts the render thread had to do itself.
+      patchWorkerJobs: patchPosted, patchWorkerDropped: patchDropped, patchInflightNow: patchInflight,
+      // Measured cost per piece of far-patch work, so a budget number means something.
+      patchCutMsAvg: +shellCutAvg.toFixed(2), patchJobMsAvg: +patchJobAvg.toFixed(2),
+      patchSigMsAvg: +sigAvg.toFixed(2),
+      shellBudgetMs: S.shellBudget, demoteBudgetMs: S.demoteBudget,
       dirtyWhy: Object.fromEntries(dirtyWhy), meshByWhy: Object.fromEntries(meshWhy),
       farCostScale: +costScale.toFixed(2), farFloorBoost: floorBoost, cpuRenderMs: +cpuRenderMs.toFixed(2),
       shellPatch: S.patch, maxZoom: S.maxZoom, worldSpan: S.worldSpan,
       // What the page actually parsed for the detail layer. Every A/B of meshing policy has to echo
       // its own inputs or a URL typo reads like a measured difference.
       radius: S.radius, detailPx: S.detailPx, detailPixels: S.detailPixels,
-      meshIndex: S.meshIndex, aa: S.aa, caves: S.caves ? 1 : 0,
+      meshIndex: S.meshIndex, aa: S.aa, caves: S.caves ? 1 : 0, staticMatrix: STATIC_MATRIX ? 1 : 0,
       near: camera.near, far: camera.far,
       fogNear: scene.fog ? scene.fog.near : 0, fogFar: scene.fog ? scene.fog.far : 0,
       target: [+rig.target.x.toFixed(1), +rig.target.y.toFixed(1), +rig.target.z.toFixed(1)],
@@ -3309,6 +3445,10 @@ window.__world = {
     out.total = +(profSum(prof) / n).toFixed(2);
     return out;
   },
+  // The raw sums. A per-frame cost derived by differencing two rounded *means* is off by
+  // (0.005 ms x frames), which at a few thousand frames is several ms - enough to make a bucket look
+  // negative and a frame look 85 ms fat. Any probe that wants one frame's cost must difference sums.
+  profTotals: () => ({ ...prof }),
   lodOf: (wx, wz) => {
     const cx = Math.floor(wx / CH), cz = Math.floor(wz / CH), pk = patchKey(cx, cz);
     const tier = patchTier.get(pk);
@@ -3849,8 +3989,11 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         hint: 'Time per frame spent building close-up chunk meshes. Higher loads faster but hitches. URL: ?budget',
         get: () => S.budget, set: (v) => { S.budget = v; } },
       { key: 'sbudget', label: 'far meshing ms per frame', min: 0, max: 60, step: 1,
-        hint: 'Same, for far-terrain batches. URL: ?sbudget',
+        hint: 'Time per frame spent re-cutting far-terrain batches - including deciding whether a batch\nneeds re-cutting at all. A whole pan frame measured 46 ms in this bucket with 24 of those\ndecisions queued and no work done. URL: ?sbudget',
         get: () => S.shellBudget, set: (v) => { S.shellBudget = v; } },
+      { key: 'demotems', label: 'parking ms per frame', min: 0, max: 40, step: 1,
+        hint: 'Time per frame allowed for parking detail meshes that the sharp circle left behind. Parking\none chunk copies its vertex bytes and releases up to three GPU buffers; 64 chunks of that measured\n45 ms on a single frame. URL: ?demotems',
+        get: () => S.demoteBudget, set: (v) => { S.demoteBudget = Math.max(0, v); } },
       { key: 'workers', label: 'meshing threads', min: 0, max: 8, step: 1, live: false,
         hint: 'Background threads that build chunk meshes. Changing this restarts them (a moment of stutter).\n0 meshes on the render thread instead. URL: ?workers',
         get: () => workerCount(),
