@@ -46,6 +46,11 @@ const S = {
   // ground, ~290 chunk meshes, ~4 M verts. The panel row goes to 24 for people with the GPU for it.
   detailPx: num('detailpx', 1),            // a 1-block column must cover this many px to earn triangles
   detailLod: !params.has('nodetaillod'),   // off = the old behaviour: full res whatever the zoom
+  // Should the sharp ring shrink when the zoom makes its one-block columns sub-pixel?
+  // URL: ?detailpixels=1. Off by default: the stated policy is that the sharp region stays
+  // near the middle of the view at any zoom (?lodanchor=center), and this row is the A/B that
+  // prices that preference rather than silently reversing it.
+  detailPixels: params.has('nodetailpixels') ? 0 : (num('detailpixels', 0) ? 1 : 0),
   payloadLead: num('payloadlead', 6),
   // Re-mark the sharp ring when the view centre moves (URL: ?noringscan). A pan slides the
   // ring over payloads that were pre-fetched and already dropped from the mesh queue.
@@ -389,7 +394,7 @@ function updateView() {
   // Under centre anchoring the ring does not collapse either: the point of the anchor is that the
   // sharp ground sits in the middle of the frame at any zoom, and a ring that shrinks on a wheel
   // gesture is exactly the unload/reload churn that made the view feel broken.
-  const wantD = (S.shellOn && S.detailLod && S.lodAnchor !== 'center')
+  const wantD = (S.shellOn && S.detailLod && (S.lodAnchor !== 'center' || S.detailPixels))
     ? detailRadius(rig.dist, pxPerRad(), S.detailPx, S.radius) : S.radius;
   // Grow at once - detail that arrives late is a visible hole. Shrink only once it is clearly more
   // than needed, so a wheel drag does not thrash 300 chunks between mesh and demote every frame.
@@ -1102,11 +1107,16 @@ function pumpMeshes(maxJobs, deadline) {
     }
     const parked = meshBytes.get(k);
     if (parked && parked.mk === mk) { installCached(cx, cz, mk); done++; dirtyTag.delete(k); continue; }
-    // Meshing against a border that is not settled is the expensive case: whatever is built now has a
-    // wall against the unknown in it, and the arrival forces a second mesh of the same chunk. Counted
-    // because it is the number that says whether the payload ring is wide enough. Waiting it out was
-    // tried and measured dead - 0 deferrals across four A/B runs and eight pan legs - because that ring
-    // already settles the border before a chunk reaches the mesh ring.
+    // Meshing against a border that is not settled is the expensive case in theory: whatever is
+    // built now has a wall against the unknown in it, and the arrival forces a second mesh of the
+    // same chunk. Counted (`meshUnsettled`) because it is the number that says whether the payload
+    // ring is wide enough - and waited out twice, both times for nothing. The first try measured 0
+    // deferrals across four A/B runs and eight pan legs. The second (radius 8, dist 1200, ten pan
+    // legs, `?deferms` bounded wait): 60 waits, unsettled meshes 102 -> 60, `arrive`-marked builds
+    // 198 -> 181, and the pan's total builds unchanged at 738 vs 734. The reason is the shape of a
+    // pan: a 17x17 ring sliding 4.8 chunks per leg sweeps ~990 chunk positions that were never
+    // meshed, so nearly every arrival is a *new* chunk rather than the neighbour of one already
+    // meshed, and there is no second mesh to avoid.
     if (S.meshKey && !settledNeighbours(cx, cz)) meshUnsettled.count++;
     if (inline) {
       rebuild(cx, cz, mk);
@@ -3014,7 +3024,7 @@ window.__world = {
       detailMeshes: meshes.size, detailVerts, demoted, dirtyPatches: dirtyPatches.size, bytesHeld: store ? store.bytesHeld : 0,
       underFar: underFar ? 1 : 0,
       cullDark: aggTotal.darkCulled, cullBuried: aggTotal.buried, cullCoveredFaces: aggTotal.covered,
-      detailLod: S.detailLod, detailReachBlocks: Math.round(detailReach(pxPerRad(), S.detailPx)),
+      detailLod: S.detailLod, detailPixels: S.detailPixels, detailReachBlocks: Math.round(detailReach(pxPerRad(), S.detailPx)),
       lightOn: S.light ? 1 : 0, darkFloor: S.darkFloor, darkGamma: S.darkGamma, skyScale: S.skyScale, ao: S.ao ? 1 : 0,
       cavesOn: S.caves, darkcut: S.caves ? -1 : S.darkcut,
       surfaceOn: S.caves ? 0 : S.surface,
