@@ -76,6 +76,11 @@ const browser = spawn(EDGE, [
   // Software rasterisation by default: it makes the numeric framebuffer probes bit-reproducible.
   // It also means the fps in the HUD is worthless - pass --gpu to measure against the real GPU.
   ...(flag('gpu') ? ['--use-angle=d3d11'] : ['--enable-unsafe-swiftshader', '--use-angle=swiftshader']),
+  // There is no working way to ask headless Chrome for a 2x display: --force-device-scale-factor
+  // left devicePixelRatio at 1, so a probe with it measured a 1x screen and looked like a finding.
+  // Price the HiDPI case with ?res=2 on the URL instead - same 4x pixel count, and the page's own
+  // DPR_CAP path.
+  ...(flag('scale') ? [`--force-device-scale-factor=${arg('scale')}`] : []),
   `--window-size=${W},${H}`, 'about:blank',
 ], { stdio: ['ignore', 'ignore', 'pipe'] });
 let browserErr = '';

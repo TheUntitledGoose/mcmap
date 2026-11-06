@@ -18,7 +18,7 @@ import { HEIGHT_BIAS } from '../../shared/chunk-format.mjs';
 import { layerAlpha, stackOver, over, dmax } from '../../shared/composite.mjs';
 import { CH, maxZoomFor, cornerTan, zoomCeiling, frustumFor, groundReach, skinRadius, fogFor,
   closestApproach, cellForPixels, budgetCell, detailRadius, detailReach, faceFactor, tierDistance,
-  pickEvictions } from '../../shared/view.mjs';
+  pickEvictions, aaDefault } from '../../shared/view.mjs';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -84,6 +84,19 @@ const S = {
   // Render scale, as a multiple of the capped device pixel ratio. Fewer pixels is the one remedy
   // that helps no matter which stage of the pipeline is slow. URL: ?res=0.75
   res: Math.max(0.4, Math.min(2, num('res', 1))),
+  // Multisample edge smoothing. There is no post pass in this viewer, so MSAA is the only thing
+  // that softens the edge of a quad, and at whole-world framing almost every edge is a fraction of
+  // a pixel. It is chosen when the GL context is made, so it is a URL switch rather than a slider:
+  // ?noaa forces off, ?aa=1 forces on. Measured on a real GPU at 1280x720 (9.7): at
+  // 9.4 M verts it costs 0.5 ms of a 2.6 ms GPU frame and the frame rate does not move; at 31.8 M
+  // verts it costs nothing at all (11.5 ms with, 12.8 ms without); at 4x the pixels it costs a
+  // third of the frame (157 fps with, 238 without). So it is asked for on every screen and left
+  // to auto resolution to buy the pixels back on a 2x one, rather than deciding the picture is
+  // already sharp enough on the viewer's behalf.
+  aa: aaDefault({
+    aa: params.has('aa') ? num('aa', 1) : undefined,
+    noAA: params.has('noaa'),
+  }),
   // Auto resolution: only while the GPU timer is available and the view is fully loaded.
   resAuto: params.has('noautores') ? 0 : 1,
   targetFps: Math.max(20, Math.min(120, num('targetfps', 60))),
@@ -231,7 +244,7 @@ lodCellMaxPx: Math.max(1, num('lodcellmax', 8)),
   maxZoom: 1200,       // wheel ceiling, recomputed from worldSpan + skinCap
 };
 const hud = {
-  fps: $('fps'), verts: $('verts'), tris: $('tris'), chunks: $('chunks'), queue: $('queue'),
+  fps: $('fps'), scale: $('scale'), verts: $('verts'), tris: $('tris'), chunks: $('chunks'), queue: $('queue'),
   cpu: $('cpu'),
   mesh: $('mesh'), shell: $('shell'), pos: $('campos'), dim: $('dim'), msg: $('msg'),
 };
@@ -278,7 +291,7 @@ const canvas = $('gl');
 // compositing; that costs a copy per frame, so it is only on for debug runs.
 const DEBUG = params.has('debug') || params.get('view') === 'flat';
 const renderer = new THREE.WebGLRenderer({
-  canvas, antialias: false, preserveDrawingBuffer: DEBUG, powerPreference: 'high-performance',
+  canvas, antialias: S.aa === 1, preserveDrawingBuffer: DEBUG, powerPreference: 'high-performance',
 });
 // A 4K or 2x-HiDPI window is 4-8x the pixels of the 1280x800 the mesh budget was tuned against,
 // and pixel count, not triangle count, is usually what caps the frame rate. Cap the ratio, then let
@@ -2660,6 +2673,12 @@ function frameBody(now) {
   if (now - fpsAt > 500) {
     lastFps = frames * 1000 / (now - fpsAt);
     hud.fps.textContent = lastFps.toFixed(0);
+    // A blurry picture is usually a resolution decision rather than a rendering decision, so the
+    // pill says when the picture is not the screen's own pixels.
+    if (hud.scale) {
+      const k = resWanted() / DPR_CAP;
+      hud.scale.textContent = Math.abs(k - 1) < 0.02 ? '' : '×' + (+k.toFixed(2));
+    }
     hud.verts.textContent = verts.toLocaleString();
     hud.tris.textContent = Math.round(tris).toLocaleString();
     hud.chunks.textContent = `${store.loaded} held (detail r${detailR}), ${drawn} meshes`;
@@ -3798,9 +3817,11 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         get: () => S.alphaTest, set: (v) => { S.alphaTest = v; applySettings('alphaTest'); } },
       { kind: 'section', key: 'sec_perf', label: 'speed and controls', open: false,
         hint: 'How much work and how many pixels a frame may spend, and which threads do it.' },
-      { key: 'res', label: 'draw resolution', min: 0.4, max: 1, step: 0.05, live: true,
-        hint: 'How many pixels are drawn, as a fraction of the screen. Below 1 the image is rendered smaller\nand stretched, which is the cheapest way to gain frame rate. Auto mode only lowers it when the GPU\nitself is the limit and the terrain is fully loaded. URL: ?res=0.75 ?noautores',
+      { key: 'res', label: 'draw resolution', live: true,
+        stops: [0.4, 0.6, 0.8, 1, 1.25, 1.5, 2],
+        hint: 'How many pixels are drawn, as a fraction of the screen. Below 1 the image is rendered smaller\nand stretched, which is the cheapest way to gain frame rate; above 1 it is drawn bigger than\nthe screen and shrunk back, which costs a third of the frame rate at 4x pixels and takes the\nstaircase off quad edges. It also grows the sharp ring, because that ring is measured in pixels.\nAuto mode only lowers it when the GPU itself is the limit and the view is loaded. Edge staircases\nare also smoothed by MSAA, on every screen, unless ?noaa. URL: ?res=1.5 ?noaa',
         get: () => S.res,
+        fmt: (v) => (v === 1 ? 'native' : v < 1 ? `${v}x softer` : `${v}x bigger`),
         set: (v) => { S.res = Math.max(0.4, Math.min(2, v)); resAuto = 1; applyRes(); } },
       { key: 'resAuto', label: 'auto resolution', min: 0, max: 1, step: 1, live: true,
         labels: ['manual', 'auto'],

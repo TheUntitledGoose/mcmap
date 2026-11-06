@@ -55,3 +55,10 @@ test('an output that shrank too far is refused', () => {
   assert.match(r.out, /refusing to write/);
   assert.equal(r.after, 'const a = 1;\nconst b = 2;\n');
 });
+
+test('a replacement written with the wrong key names fails loudly, not cryptically', () => {
+  const r = run(null, { replace: [{ find: 'const a = 1;', replace: 'const a = 9;' }] });
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /needs string .old. and .new./);
+  assert.equal(r.after, 'const a = 1;\nconst b = 2;\n');
+});

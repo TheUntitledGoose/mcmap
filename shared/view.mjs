@@ -242,3 +242,21 @@ export function pickEvictions(entries, cap, center) {
   }
   return out;
 }
+
+/**
+ * Whether to ask the WebGL context for multisample edge smoothing (MSAA).
+ *
+ * MSAA is the only edge smoothing this viewer has: there is no post pass, and at whole-world
+ * framing nearly every quad edge is a fraction of a pixel. The measured bill (real GPU, 1280x720,
+ * 9.7): at 9.4 M verts it costs 0.5 ms of a 2.6 ms GPU frame and the frame rate does not move; at
+ * 31.8 M verts it costs nothing (11.5 ms with, 12.8 ms without); at 4x the pixels - what a 2x
+ * screen costs - it takes a third of the frame (157 fps with, 238 without), which is what auto
+ * resolution is there to buy back. Asked once, when the context is made, so it is a URL switch.
+ *
+ * `aa` is an explicit URL value (may be undefined), `noAA` is `?noaa`.
+ */
+export function aaDefault({ aa, noAA = false } = {}) {
+  if (noAA) return 0;
+  if (aa !== undefined && aa !== null) return aa ? 1 : 0;
+  return 1;
+}

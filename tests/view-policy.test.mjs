@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import {
   CH, fitDistance, maxZoomFor, cornerTan, zoomCeiling, frustumFor, groundReach, skinRadius, fogFor,
   closestApproach, cellForPixels, budgetCell, detailRadius, detailReach, faceFactor, pickEvictions,
+  aaDefault,
 } from '../shared/view.mjs';
 
 const PXR_G = 800 / (55 * Math.PI / 180);   // shared: pxPerRad for an 800 px tall window
@@ -328,4 +329,15 @@ test('a mesh byte cache loses its farthest entries first, not its oldest', () =>
     'drops farthest-first until back under the cap');
   assert.deepEqual(pickEvictions(fat, 9100, [0, 0]), ['9,9'], 'one thin far chunk is enough there');
   assert.deepEqual(pickEvictions(fat, 9200, [0, 0]), [], 'exactly at the cap is not over it');
+});
+
+test('MSAA is asked for unless the URL says otherwise', () => {
+  // The bill is fill, not triangles: at 1280x720 it cost 0.5 ms of a 2.6 ms GPU frame at 9.4 M
+  // verts, nothing at 31.8 M verts, and a third of the frame at 4x the pixels - which is the case
+  // a 2x screen is in, and the case auto resolution answers.
+  assert.equal(aaDefault({}), 1);
+  assert.equal(aaDefault({ dpr: 2 }), 1, 'a 2x screen pays more but still gets smoothed edges');
+  assert.equal(aaDefault({ aa: 0 }), 0, '?aa=0');
+  assert.equal(aaDefault({ aa: 1 }), 1, '?aa=1');
+  assert.equal(aaDefault({ aa: 1, noAA: true }), 0, '?noaa outranks everything');
 });

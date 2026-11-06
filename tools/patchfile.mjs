@@ -39,6 +39,12 @@ if (!(spec.replace ?? []).length && !(spec.expect ?? []).length) {
 }
 let t = src;
 for (const [i, r] of (spec.replace ?? []).entries()) {
+  if (typeof r.old !== 'string' || typeof r.new !== 'string') {
+    // A spec written with find/replace instead of old/new used to crash inside the error message,
+    // and `split(undefined)` matches the literal text "undefined" rather than failing loudly.
+    console.error(`replace #${i}: needs string "old" and "new" (keys: ${Object.keys(r).join(', ') || 'none'})`);
+    process.exit(1);
+  }
   const n = t.split(r.old).length - 1;
   if (n !== (r.count ?? 1)) {
     console.error(`replace #${i}: found ${n} occurrence(s), expected ${r.count ?? 1}\n  old: ${JSON.stringify(r.old.slice(0, 120))}`);
