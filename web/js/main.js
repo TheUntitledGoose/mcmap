@@ -151,10 +151,14 @@ lodCellMaxPx: Math.max(1, num('lodcellmax', 8)),
   capDrop: Math.max(1, Math.min(255, num('capdrop', 4))),
   // How far the far world is allowed to drop in quality, in blocks per column. 100 = as coarse as it
   // likes (today's behaviour, 16-block columns at the horizon). Pull it to 50 and nothing coarser than
-  // 8-block columns is ever accepted, so a distant hillside stops being a few big slabs; at 25 nothing
-  // coarser than 4. Ask for finer than the baked rungs go and the baked layer steps aside and the live
-  // far grid draws that ground instead, correctly but far more expensively - which is the honest price
-  // of refusing to blur, and the reason the slider exists rather than a fixed policy.
+  // 8-block columns is ever accepted *where a coarse column would actually be a visible blob*, so a
+  // distant hillside stops being a few big slabs; at 25 nothing coarser than 4. Ask for finer than the
+  // baked rungs go and the baked layer keeps painting that ground at its own rung rather than leaving a
+  // hole, while the live far grid draws it finer - correctly but far more expensively, which is the
+  // honest price of refusing to blur and the reason the slider exists rather than a fixed policy.
+  // Measured at a 1.2 km view: 100 -> 3.8 M baked verts / 6.4 fps, 50 -> 6.4 M / 6.1 fps (refusing the
+  // coarse rung unconditionally cost 23.8 M verts and 3 fps), 25 -> 4.0 M live verts / 5.6 fps,
+  // 0 -> 10.2 M live verts / 3.6 fps. Only the live grid still pays for the floor at the horizon.
   lodQuality: Math.max(0, Math.min(100, num('lodquality', 100))),
   lodMaxCell: (() => {
     const q = Math.max(0, Math.min(100, num('lodquality', 100)));
@@ -1972,12 +1976,22 @@ function requestLod() {
     // ladder as well as the live grid. Ask for finer than the baked rungs and the answer is "no baked
     // tile here", which hands the ground to the live far grid rather than quietly serving the coarse
     // tile the slider just refused.
-    const avail = have.filter((c) => c <= S.lodMaxCell);
-    if (!avail.length) return 0;
-    const coarsest = avail[avail.length - 1];
-    if (S.lodCellPx <= 0) return coarsest;              // ?lodcellpx=0: one rung, the previous build
     const bx = (rx * 32 + 16) * CH, bz = (rz * 32 + 16) * CH;
     const d = Math.max(64, Math.hypot(bx - eye.x, bz - eye.z));
+    // The quality slider is a demand for *shape*, and shape only matters where a column measures
+    // something on screen. So refuse a coarse rung only when its columns would come out bigger than
+    // `lodCellMaxPx` pixels: at a distance where a 16-block column is already sub-pixel, insisting on
+    // the fine rung buys no shape and bills the vertex budget anyway - measured at a 1.2 km view,
+    // forcing cell 4 for every tile drew 23.8 M verts and ran at 3 fps. And when the refused rungs are
+    // the only ones baked for that ground, take the coarse tile rather than nothing: a missing far tile
+    // is a hole in the world, not a quality setting (q=25 used to drop the baked layer to 0 tiles).
+    let avail = have;
+    if ((pxPerRad() / d) * have[have.length - 1] > S.lodCellMaxPx) {
+      const fine = have.filter((c) => c <= S.lodMaxCell);
+      if (fine.length) avail = fine;
+    }
+    const coarsest = avail[avail.length - 1];
+    if (S.lodCellPx <= 0) return coarsest;              // ?lodcellpx=0: one rung, the previous build
     let want = pickLodCell(avail, pxPerRad() / d, S.lodCellPx, held, S.lodCellMaxPx);
     if (want < coarsest && spent + lodCostFor(want) > S.lodVerts) want = coarsest;
     spent += lodCostFor(want);
@@ -3303,7 +3317,7 @@ function buildPanel() {
 
       { key: 'lodquality', label: 'far world quality', min: 0, max: 100, step: 5, live: false,
         fmt: (v) => (v >= 100 ? 'as coarse as it likes (16 blk)' : `never coarser than ${[1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(v / 10)]} blk`),
-        hint: 'How far the LOD is allowed to drop in quality: the coarsest column the far view may use,\nfor the baked tiles and the live far grid together. 100 is today: 16-block columns at the horizon,\nwhich is why a distant tree is one column and a distant house is a slab. Pull it in for shape and\npay vertices: below the baked rungs (4 blocks) the live far grid has to draw that ground itself.\nURL: ?lodquality',
+        hint: 'How far the LOD is allowed to drop in quality: the coarsest column the far view may use,\napplied where a coarse column would really be a blob on screen. 100 is today: 16-block columns at the\nhorizon, which is why a distant tree is one column and a distant house is a slab. Pull it in for shape\nand pay vertices: finer than the baked rungs (4 blocks) the live far grid has to draw that ground itself,\nand the baked tiles keep their rung instead of leaving a hole. URL: ?lodquality',
         get: () => S.lodQuality,
         set: (v) => { S.lodQuality = Math.max(0, Math.min(100, v | 0));
           S.lodMaxCell = [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 16][Math.round(S.lodQuality / 10)];

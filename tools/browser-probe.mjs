@@ -19,7 +19,7 @@ const flag = (name) => argv.includes(`--${name}`);
 // "http://...&lodclip=0"` silently loaded the *default* URL instead: every A/B in that run measured
 // the same page twice and reported a 1% difference as if it were a finding.
 const VALUED = ['url', 'out', 'wait', 'port', 'width', 'height', 'edge', 'profile', 'goto', 'orbit',
-  'eval', 'shot', 'click', 'keys'];
+  'eval', 'eval-file', 'shot', 'click', 'keys'];
 const pos = [];
 for (let i = 0; i < argv.length; i++) {
   if (argv[i].startsWith('--')) { if (VALUED.includes(argv[i].slice(2))) i++; continue; }

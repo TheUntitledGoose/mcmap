@@ -37,9 +37,25 @@ export class AssetIndex {
     this.jars = []; // free handles; entries are read on demand
   }
 
+  // A momentary share violation on Windows (EPERM / EBUSY) is not a missing jar: an antivirus scan or
+  // a sibling test process can hold it for a tenth of a second. Retry that, and only that, a few
+  // times. Anything else - a truncated jar, a wrong path - fails at once.
+  #openJar(p) {
+    let last;
+    for (let try_ = 0; try_ < 5; try_++) {
+      try { return new ZipFile(p); }
+      catch (e) {
+        last = e;
+        if (e && e.code !== 'EPERM' && e.code !== 'EBUSY' && e.code !== 'EACCES') break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120 * (try_ + 1));
+      }
+    }
+    throw last;
+  }
+
   #ingest(p, jarIdx) {
     let z;
-    try { z = new ZipFile(p); }
+    try { z = this.#openJar(p); }
     catch (e) {
       // A jar that will not open is not "some optional mod we can do without": it is one the caller
       // listed deliberately, and skipping it silently drops every model it provided. The census then
