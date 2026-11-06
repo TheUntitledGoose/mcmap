@@ -21,6 +21,8 @@ import { atlasStamp } from './shell-pack.mjs';
 import { pruneCache } from './cache-prune.mjs';
 import { buildStateIds } from './chunk-payload.mjs';
 import { classifyStates } from '../shared/cube-path.mjs';
+import { LOD_CELL } from '../shared/lod-format.mjs';
+import { summarizeLodDir } from './lod-pack.mjs';
 
 const argv = process.argv.slice(2);
 const arg = (name, dflt) => {
@@ -66,19 +68,7 @@ const PACKS = arg('packs', 'build/shells');
 // and the browser keeps meshing its far layers live, which is the behaviour before this existed.
 const LODS = arg('lods', 'build/lods');
 // Counted once at startup: the browser's /meta answer for "is there a baked far layer?".
-const lodSummary = (() => {
-  if (LODS === 'none') return { dims: 0, tiles: 0 };
-  let dims = 0, tiles = 0;
-  try {
-    for (const n of fs.readdirSync(LODS)) {
-      const d = path.join(LODS, n);
-      if (!fs.statSync(d).isDirectory()) continue;
-      const t = fs.readdirSync(d).filter((f) => f.endsWith('.bin')).length;
-      if (t) { dims++; tiles += t; }
-    }
-  } catch { /* nothing baked */ }
-  return { dims, tiles };
-})();
+const lodSummary = LODS === 'none' ? { dims: 0, tiles: 0, cells: [] } : summarizeLodDir(LODS);
 const stamp = atlasStamp(fs.statSync(path.join(ASSETS, 'atlas.json')), atlas.states.length);
 const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
   isCubeState: (id) => stateCls.cube[id - 1] === 1,
@@ -198,8 +188,11 @@ const server = http.createServer(async (req, res) => {
         'application/json; charset=utf-8');
     }
     if (u.pathname === '/lod') {
-      // One baked region tile (32x32 chunks at 16 blocks per column), already inflated.
-      const b = svc.lodBytes(q.get('dim') ?? 'minecraft:overworld', +q.get('rx'), +q.get('rz'));
+      // One baked region tile (32x32 chunks) at one rung of the ladder - `cell` blocks per column -
+      // already inflated. Absent rung is a 404, and the index says which rungs exist so a viewer does
+      // not go asking for one the dimension never had.
+      const b = svc.lodBytes(q.get('dim') ?? 'minecraft:overworld', +q.get('cell') || LOD_CELL,
+        +q.get('rx'), +q.get('rz'));
       return b ? send(req, res, 200, b, 'application/octet-stream')
         : send(req, res, 404, 'no lod tile (run node server/bake-lod.mjs)', 'text/plain');
     }

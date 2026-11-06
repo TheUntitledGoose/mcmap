@@ -152,12 +152,20 @@ test('packer output payload contract', { skip, timeout: 600_000 }, () => {
   const AIRS = new Set(['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air', 'minecraft:structure_void']);
   let total = 0, covered = 0;
   const missed = [];
+  const samplesOf = new Map(census.states.map((st) => [st.key, st.samples]));
   for (const st of census.states) {
     total += st.samples;
     const rec = a.states.find(x => x.k === st.key);
     if (rec?.cube || rec?.g?.length) covered += st.samples;
     else if (AIRS.has(st.name)) covered += st.samples;
     else if (missed.length < 12) missed.push(st.key);
+  }
+  if (covered / total <= 0.99) {
+    // A coverage drop here means the packer drew no geometry for states the world actually uses, and
+    // the only way to chase it is to know which ones. This fired twice as a full-suite-only failure
+    // (87.8% and 91.0%) while the same test passed alone, which is why the names get printed.
+    console.log(`  uncovered samples ${total - covered} of ${total}; heaviest missed states:`);
+    for (const k of missed) console.log(`    ${k} x${samplesOf.get(k) ?? '?'}`);
   }
   assert.ok(covered / total > 0.99, `only ${(100 * covered / total).toFixed(2)}% of samples covered`);
   // What matters for mesh speed is sample-weighted coverage, not distinct-state count: block

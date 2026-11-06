@@ -45,6 +45,10 @@ export function shellFromPayload(bytes, opts = {}) {
   if (!c.height) return null;
   const maxDrop = opts.maxDrop ?? 5;          // a flower sits one or two blocks above its ground
   const maxWaterDrop = opts.maxWaterDrop ?? 40;  // an ocean bed can be that far below its surface
+  // A tree canopy can sit 25 blocks above the forest floor, and the floor is what the far view has to
+  // stand its cell on. Stopping at the first solid block finds the *trunk top* instead, and a cell then
+  // stands as a solid column one cell wide and 25 blocks tall: a tree that looks like a tower.
+  const maxVegDrop = opts.maxVegDrop ?? 40;
   const isPaint = opts.isPaint ?? opts.isCube ?? null;
   const isSolid = opts.isSolid ?? null;
 
@@ -54,6 +58,27 @@ export function shellFromPayload(bytes, opts = {}) {
   const s = new Uint16Array(SHELL_COLS);      // paint state
   const li = new Uint8Array(SHELL_COLS);      // sky|blk light on the column's surface
   h.set(c.height);
+  /**
+   * Is this block part of a surface, or is it a spike? A trunk is paintable, opaque and a full cube, so
+   * "is it solid?" cannot tell a tree from the ground - and a player's log wall must still count as the
+   * thing it is made of. The structural test does: a surface has paintable material beside it *at its own
+   * level*, a pillar has air or leaves. (Two columns down the contour of a hillside always touch the same
+   * level, so a slope passes; a ridge one block wide does not, and it falls back to the old answer.)
+   * Only blocks inside this chunk are known, and that is honest: across the border the neighbouring
+   * chunk decides for itself.
+   */
+  const onSurface = (x, y, z) => {
+    let n = 0, known = 0;
+    for (const [dx, dz] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+      const nx = x + dx, nz = z + dz;
+      if (nx < 0 || nx > 15 || nz < 0 || nz > 15) continue;
+      known++;
+      const b = c.stateAt(nx, y, nz);
+      if (b && isPaint(b)) n++;
+    }
+    return n >= Math.min(2, known);
+  };
+
   for (let i = 0; i < SHELL_COLS; i++) {
     const x = i & 15, z = i >> 4;
     const top = c.height[i] - HEIGHT_BIAS;
@@ -61,16 +86,29 @@ export function shellFromPayload(bytes, opts = {}) {
     cover[i] = at;
     let paint = 0, py = top;
     if (isPaint) {
+      const seeThru = !!(at && isSolid && isSolid(at));
       if (at && isPaint(at)) {
-        paint = at;
+        paint = at;                                 // the surface block is itself the ground
       } else {
-        // A see-through *cube* is water or slime: the block under it is the terrain, and it can be
-        // deep. Anything else (a plant, a sign, a pane) is a thin hat on the ground right below it.
-        const deep = at && isSolid && isSolid(at) ? maxWaterDrop : maxDrop;
-        for (let k = 1; k <= deep; k++) {
+        // The block at the top is a hat: a plant, a pane, a canopy, water. Two separate answers are
+        // needed, and the old code used one for both:
+        //   what to paint with  - the first paintable block under the hat, usually one or two down;
+        //   what to stand on    - the first paintable block that is *attached* to its own level (see
+        //     onSurface), which for a tree is the forest floor and not the top of its trunk.
+        // Standing a far cell on the trunk top is what made a tree a solid column: a tower.
+        const limit = seeThru ? maxWaterDrop : maxVegDrop;
+        let surf = 0, first = 0;
+        for (let k = 1; k <= limit; k++) {
           const below = c.stateAt(x, top - k, z);
-          if (below && isPaint(below)) { paint = below; py = top - k; break; }
+          if (!below || !isPaint(below)) continue;
+          if (!first && (seeThru || k <= maxDrop)) first = top - k;
+          if (surf || !onSurface(x, top - k, z)) continue;
+          surf = top - k;
+          break;
         }
+        py = surf || first || py;
+        if (first) paint = c.stateAt(x, first, z);
+        else if (py !== top) paint = c.stateAt(x, py, z);
       }
     } else {
       paint = at;                              // no classifier: paint whatever is on top

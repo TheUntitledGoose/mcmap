@@ -50,7 +50,7 @@ export const GEO_MAGIC = 'DVGEO12 ';
 // a shell frame has per column (see SHELL_COLS_BYTES). `cell` is in chunks: cell (i,j) covers chunks
 // x0+i*cell, ...
 export const OVERVIEW_MAGIC = 'DVSHOV3 ';
-export const OVERVIEW_VERSION = 3;   // v3 adds the per-cell light byte
+export const OVERVIEW_VERSION = 4;   // v4: follows the v4 packs (ground under a canopy, not the trunk top)
 export const OVERVIEW_HEADER = 28;
 // bytes per cell in an overview file: four u16 planes plus one light byte
 export const OVERVIEW_CELL_BYTES = 9;

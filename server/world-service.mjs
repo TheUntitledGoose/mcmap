@@ -12,7 +12,7 @@ import {
   BATCH_MAGIC, OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_HEADER, OVERVIEW_CELL_BYTES,
 } from '../shared/chunk-format.mjs';
 import { ShellPack } from './shell-pack.mjs';
-import { loadLodTile, listLodTiles } from './lod-pack.mjs';
+import { loadLodTile, listLodTiles, lodPath } from './lod-pack.mjs';
 import { LOD_HEADER, LOD_BYTES_PER_VERT } from '../shared/lod-format.mjs';
 
 const MAX_OPEN_REGIONS = 24;
@@ -300,7 +300,17 @@ export class WorldService {
     if (hit !== undefined && (hit || Date.now() - (this.packMissAt.get(k) ?? 0) <= PACK_MISS_MS)) {
       return hit || null;
     }
-    const p = ShellPack.load(path.join(this.packDir, dim.key, `${rx}_${rz}.bin`), this.stamp);
+    // A pack older than this code is not a server error, it is unbaked ground: fall back to deriving
+    // the shell from the chunk, and say once why. Without this, re-baking (which rewrites packs one at
+    // a time while a viewer is connected) turns every request for a not-yet-rewritten region into a
+    // 500, and the far view goes full-screen hole for the hour the bake takes.
+    let p;
+    try {
+      p = ShellPack.load(path.join(this.packDir, dim.key, `${rx}_${rz}.bin`), this.stamp);
+    } catch (e) {
+      if (!this.packError) this.packError = `${k}: ${e.message}`;
+      p = null;
+    }
     this.packs.set(k, p);
     if (p) this.packMissAt.delete(k); else this.packMissAt.set(k, Date.now());
     while (this.packs.size > 64) this.packs.delete(this.packs.keys().next().value);
@@ -312,14 +322,14 @@ export class WorldService {
    * (shared/lod-format.mjs). The file stores its vertex body deflated; inflating here - about 1 ms
    * for a 450 KB tile - keeps any decompressor out of the browser.
    */
-  lodBytes(dimId, rx, rz) {
+  lodBytes(dimId, cell, rx, rz) {
     if (!this.lodDir || this.stamp === null) return null;
     const dim = this.resolve(dimId);
-    const k = `${dim.key}|${rx},${rz}`;
+    const k = `${dim.key}|${cell},${rx},${rz}`;
     if (this.lods.has(k)) return this.lods.get(k);
     let img = null;
     try {
-      const t = loadLodTile(path.join(this.lodDir, dim.key, `${rx}_${rz}.bin`), this.stamp);
+      const t = loadLodTile(lodPath(path.join(this.lodDir, dim.key), cell, rx, rz), this.stamp);
       img = Buffer.alloc(LOD_HEADER + t.verts * LOD_BYTES_PER_VERT);
       img.set(t.head, 0);                      // magic, version, stamp, region, policy
       img.set(Buffer.from(t.pos.buffer, t.pos.byteOffset, t.verts * 12), LOD_HEADER);
@@ -336,14 +346,14 @@ export class WorldService {
     return img;
   }
 
-  /** Which regions have tiles. Without this the browser would ask for every region slot in the
-   *  bounding box, and a save with 327 packed regions inside a 1 734 slot box spends its first
-   *  seconds on 1 400 empty requests. */
+  /** Which regions have tiles, and at which rung: [cell,rx,rz]. Without this the browser would ask
+   *  for every region slot in the bounding box, and a save with 327 packed regions inside a 1 734
+   *  slot box spends its first seconds on 1 400 empty requests - then does it again for every rung. */
   lodIndex(dimId) {
     if (!this.lodDir) return [];
     try {
       const dim = this.resolve(dimId);
-      return listLodTiles(path.join(this.lodDir, dim.key)).map((t) => [t.rx, t.rz]);
+      return listLodTiles(path.join(this.lodDir, dim.key)).map((t) => [t.cell, t.rx, t.rz]);
     } catch { return []; }
   }
 
@@ -352,7 +362,7 @@ export class WorldService {
     if (!this.lodDir) return false;
     try {
       const dim = this.resolve(dimId);
-      return fs.readdirSync(path.join(this.lodDir, dim.key)).some((n) => n.endsWith('.bin'));
+      return listLodTiles(path.join(this.lodDir, dim.key)).length > 0;
     } catch { return false; }
   }
 

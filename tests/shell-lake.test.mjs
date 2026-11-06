@@ -40,6 +40,7 @@ const ID = {
   water: idOf('minecraft:water|level=0'),
   tuft: idOf('minecraft:tall_grass|half=lower'),
   leaves: idOf('minecraft:spruce_leaves|distance=1,persistent=false,waterlogged=false'),
+  log: idOf('minecraft:oak_log|axis=y'),
 };
 const nm = (id) => (id ? (atlas.states[id - 1]?.k ?? `?${id}`) : 'none');
 
@@ -100,6 +101,69 @@ test('shell: a lake keeps its water line but paints its bed', () => {
   // Nothing paintable within the drop budget: fall back to painting the cover, the old behaviour, and
   // better than an empty cell.
   assert.deepEqual(at(4, 0), { surf: 63, ground: 63, cover: nm(ID.water), paint: nm(ID.water) });
+});
+
+/**
+ * A tall tree and a player's wall, so the two questions the paint rule must separate sit side by side:
+ * a 20-block trunk is a *spike* standing on a forest floor, while a wall the player built out of the
+ * same log is the surface itself.
+ */
+function forestChunk() {
+  const yMin = 3, yCount = 3;
+  const pal = [0, ID.grass, ID.log, ID.leaves];
+  const sects = new Map();
+  const put = (x, y, z, id) => {
+    const sy = y >> 4;
+    let vox = sects.get(sy);
+    if (!vox) { vox = new Uint16Array(4096); sects.set(sy, vox); }
+    vox[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)] = pal.indexOf(id);
+  };
+  const stack = (x, z, from, to, id) => { for (let y = from; y <= to; y++) put(x, y, z, id); };
+  for (let z = 0; z <= 4; z++) for (let x = 8; x <= 15; x++) put(x, 63, z, ID.grass);   // forest floor
+  stack(12, 0, 64, 84, ID.log);                        // trunk, 21 blocks tall
+  for (let z = 0; z <= 2; z++) for (let x = 11; x <= 13; x++) stack(x, z, 85, 88, ID.leaves);
+  for (let x = 9; x <= 11; x++) stack(x, 3, 64, 66, ID.log);   // a player's 1-block-thick log wall
+  stack(15, 4, 64, 68, ID.log);                        // and a 1x1 pillar nobody can see from far off
+
+  const height = new Uint16Array(256);
+  for (let z = 0; z < 16; z++) {
+    for (let x = 0; x < 16; x++) {
+      let top = 0;
+      for (let y = (yMin + yCount) * 16 - 1; y >= yMin * 16; y--) {
+        const vox = sects.get(y >> 4);
+        if (vox && vox[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)]) { top = y; break; }
+      }
+      height[(z << 4) | x] = top ? top + HEIGHT_BIAS : 0;
+    }
+  }
+  return packChunk({
+    cx: 0, cz: 0, yMin, yCount, palette: pal,
+    sections: [...sects.entries()].sort((a, b) => a[0] - b[0]).map(([y, vox]) => ({ y, single: 0, vox })),
+    height, heightMotion: null, blockEntities: null, unknownStates: 0, classicSections: false,
+  });
+}
+
+test('shell: a tall tree stands on its forest floor, and a log wall stays a wall', () => {
+  const s = openShellFrame(ab(shellFromPayload(forestChunk(), { isPaint, isSolid })));
+  const at = (x, z) => ({
+    surf: s.surfaceAt(x, z), ground: s.groundAt(x, z),
+    cover: nm(s.coverAt(x, z)), paint: nm(s.stateAt(x, z)),
+  });
+  // The trunk is a full opaque cube, so "is it paintable?" says yes - and using it as the ground is what
+  // made a far cell a 21-block solid column: the tree that reads as a tower. Structurally it is a spike,
+  // not a surface: nothing paintable sits next to it at its own level. The cell therefore stands on the
+  // forest floor, but it is still painted with the bark, which is the right material for a trunk wall.
+  assert.deepEqual(at(12, 0), { surf: 88, ground: 63, cover: nm(ID.leaves), paint: nm(ID.log) },
+    'a canopy 25 blocks up finds the floor under the trunk, not the trunk top');
+  // The same log laid in a row IS a surface, and the far view must keep painting the player's wall.
+  assert.deepEqual(at(10, 3), { surf: 66, ground: 66, cover: nm(ID.log), paint: nm(ID.log) },
+    'a 1-block-thick wall keeps its own height and its own material');
+  // A lone 1x1 pillar is the honest limit of this rule: its top block is itself paintable, so the far
+  // view reads it as a surface. Fixing that would mean the same question one level up, and it is not
+  // what the user is complaining about - a real tree always has a canopy, which is never paintable.
+  assert.equal(at(15, 4).ground, 68, 'a paintable spike keeps its height (documented limit)');
+  // Ordinary ground is untouched by all of this.
+  assert.deepEqual(at(9, 1), { surf: 63, ground: 63, cover: nm(ID.grass), paint: nm(ID.grass) });
 });
 
 test('shell: a frame carries four planes, and a reader rejects the three-plane size', () => {

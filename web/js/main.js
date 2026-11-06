@@ -7,6 +7,7 @@ import { meshChunk, tintOf, FACE_SHADE, NEIGH_COVERED } from './mesher.js';
 import { ChunkStore } from './store.js';
 import { ShellStore } from './shell-store.js';
 import { LodStore } from './lod-store.js';
+import { pickLodCell, LOD_CELL } from '../../shared/lod-format.mjs';
 import { openOverview } from './payload.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
 import { mountPanel } from './ui.js';
@@ -133,7 +134,17 @@ const S = {
   // paint the ground, so meshing it again is the CPU cost the bake exists to remove. 0 = never skip.
   lodCap: Math.max(0, Math.min(16, num('lodcap', 8))),
   lodSpan: Math.max(0, num('lodspan', 0)),   // 0 = the whole dimension, which is the point
-  lodMax: Math.max(16, num('lodmax', 640)),        // tiles held (the overworld is 327)
+  lodMax: Math.max(16, num('lodmax', 640)),        // tiles held (the overworld is 327 coarse, 3 298 fine)
+  // A baked column has to be worth the triangle it is made of. This is how wide one column of a rung
+  // has to measure, in device pixels, before that rung is asked for: 3 px means a 4-block rung is used
+  // out to where a column is three pixels wide, and beyond that the 16-block rung paints the same hill
+  // for a thirteenth of the geometry. ?lodcellpx=0 asks for the coarse rung everywhere (the old build).
+  lodCellPx: Math.max(0, num('lodcellpx', 3)),
+lodCellMaxPx: Math.max(1, num('lodcellmax', 8)),
+  // The bill for the fine rung, in drawn vertices. The overworld is 2.4 M verts at cell 16 and 32 M at
+  // cell 4, so a world-sized view cannot be given the fine rung everywhere; the budget is spent
+  // nearest-first, which is what keeps the middle of the frame sharp and the horizon cheap.
+  lodVerts: Math.max(1e5, num('lodverts', 9e6)),
   // Vertex bytes kept when a chunk leaves the detail ring, so zooming back in is an upload, not a
   // re-mesh. 256 MB is ~350 chunks. 0 turns the reuse off (every return re-meshes from voxels).
   meshCacheMb: Math.max(0, num('meshcache', 256)),
@@ -1857,6 +1868,10 @@ async function lodIndexLoad(store) {
     if (!Array.isArray(j.tiles)) throw new Error('no tiles field');
     if (lodStore !== store) return;             // the dimension changed while this was in flight
     store.setIndex(j.tiles);
+    // The listing is the authority. /meta's count is a startup convenience and it can be wrong in
+    // exactly the silent way that matters: if it under-reads the layout, the browser would sit on the
+    // live far mesh forever with nothing on screen to say so.
+    if (j.tiles.length) lodAvail = true;
     recomputeZoom();
     requestLod();                     // fill the view now rather than waiting for the next camera move
   } catch (e) {
@@ -1908,6 +1923,14 @@ function lodRequestRect() {
 
 
 
+/** What a tile of one rung costs, from the tiles actually on hand. The rungs differ by 16x in columns
+ *  but only ~13x in vertices (a flat field merges into fewer quads when the columns are wide), so
+ *  guessing from columns over-bills the fine rung and starves it. */
+const lodCost = new Map();                       // cell -> {n, v}
+const lodAvg = (cell) => { const s = lodCost.get(cell); return s && s.n ? s.v / s.n : 0; };
+const lodCostFor = (cell) => lodAvg(cell)
+  || (lodAvg(LOD_CELL) || 7300) * (LOD_CELL / cell) ** 1.15;   // fallback: 2.4 M verts / 327 tiles
+
 function requestLod() {
 
   if (!lodActive() || lodIndexPending) return;
@@ -1918,7 +1941,27 @@ function requestLod() {
 
   const [tcx, tcz] = centerChunk();
 
-  lodStore.request(r[0], r[1], r[2], r[3], [tcx >> 5, tcz >> 5]);
+  // Which rung each tile asks for, decided nearest-first so a budget is spent on the part of the frame
+  // the eye is looking at. pickLodCell answers "what would a column of this rung measure on screen";
+  // the budget is what stops a world-sized view from taking the fine rung everywhere, which would be
+  // 13x the geometry of the coarse one for pixels the eye cannot tell apart.
+  const eye = camera.position;
+  let spent = lodVerts;
+  lodStore.request(r[0], r[1], r[2], r[3], [tcx >> 5, tcz >> 5], (rx, rz, held, avail) => {
+    if (!avail.length) return 0;
+    const coarsest = avail[avail.length - 1];
+    if (S.lodCellPx <= 0) return coarsest;              // ?lodcellpx=0: one rung, the previous build
+    const bx = (rx * 32 + 16) * CH, bz = (rz * 32 + 16) * CH;
+    const d = Math.max(64, Math.hypot(bx - eye.x, bz - eye.z));
+    let want = pickLodCell(avail, pxPerRad() / d, S.lodCellPx, held, S.lodCellMaxPx);
+    if (want < coarsest && spent + lodCostFor(want) > S.lodVerts) want = coarsest;
+    spent += lodCostFor(want);
+    return want;
+  });
+  for (const t of lodStore.tiles.values()) {
+    const s = lodCost.get(t.cell) ?? { n: 0, v: 0 };
+    s.n++; s.v += t.verts; lodCost.set(t.cell, s);
+  }
 
 }
 
@@ -1948,13 +1991,15 @@ function drainLod(now) {
 
   }
 
-  let n = 0;
+  let n = 0, made = 0;
 
   for (const [k, t] of lodStore.tiles) {
 
     if (lodMeshes.has(k)) continue;
 
-    if (n >= 8 || performance.now() > now + 4) break;
+    // Not a tile count but a vertex count: a fine tile is ~15x the upload of a coarse one, so a cap of
+    // "eight tiles" used to mean eight coarse tiles or half a fine one.
+    if (n >= 8 || made + t.verts > 3e6 || performance.now() > now + 6) break;
 
     const g = new THREE.BufferGeometry();
 
@@ -1976,6 +2021,7 @@ function drainLod(now) {
     lodGroup.add(mesh);
 
     lodMeshes.set(k, { mesh, verts: t.verts });
+    made += t.verts;
 
     n++;
 
@@ -2001,7 +2047,8 @@ function lodAt(wx, wz) {
 
   const t = lodStore ? lodStore.get(rx, rz) : null;
 
-  return { rx, rz, held: !!t, drawn: lodMeshes.has(rx + ',' + rz), verts: t ? t.verts : 0,
+  return { rx, rz, held: !!t, cell: t ? t.cell : 0,
+    drawn: !!(t && lodMeshes.has(lodStore.key(rx, rz))), verts: t ? t.verts : 0,
 
     policy: t ? t.policy : null };
 
@@ -2657,6 +2704,9 @@ window.__world = {
     clipOn: lodClipOn, clip: lodClipRect.map((v) => (v > 1e8 ? 'off' : v)), cov: lodCovPatches,
     covDetail: lodCovDetail,
     held: lodStore ? lodStore.tiles.size : 0, drawn: lodTiles, verts: lodVerts,
+    cells: lodStore ? lodStore.cells : [], cellPx: S.lodCellPx, cellMaxPx: S.lodCellMaxPx, budget: S.lodVerts,
+    rung: lodStore ? Object.fromEntries(lodStore.cells.map((c) =>
+      [c, [...lodStore.tiles.values()].filter((t) => t.cell === c).length])) : {},
     wanted: lodStore ? lodStore.wanted.size : 0, gaps: lodStore ? lodStore.gaps() : 0,
     indexed: lodStore && lodStore.index ? lodStore.index.size : -1,
     blind: lodStore ? lodStore.reqBlind : 0, pending: lodIndexPending ? 1 : 0,

@@ -40,7 +40,15 @@ export class AssetIndex {
   #ingest(p, jarIdx) {
     let z;
     try { z = new ZipFile(p); }
-    catch (e) { this.stats.skipped++; return; }
+    catch (e) {
+      // A jar that will not open is not "some optional mod we can do without": it is one the caller
+      // listed deliberately, and skipping it silently drops every model it provided. The census then
+      // has states with no geometry and the renderer draws them as nothing - no error anywhere. This
+      // showed up as a full-suite-only coverage failure (88%, then 91%) while the identical pack run
+      // on its own measured 100%: the jar was momentarily locked by a sibling process. A build that
+      // quietly loses a jar is worse than a build that stops and names it.
+      throw new Error(`asset index cannot open jar ${p}: ${e.message}`);
+    }
     this.stats.jars++;
     for (const name of z.names()) {
       if (!name.startsWith('assets/')) continue;

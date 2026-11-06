@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { encodeLodTile, openLodTile, policyMatches, policyMismatch, LOD_HEADER, LOD_CELL, LOD_BYTES_PER_VERT } from '../shared/lod-format.mjs';
-import { lodFileBytes, loadLodTile, listLodTiles, lodPath } from '../server/lod-pack.mjs';
+import { lodFileBytes, loadLodTile, listLodTiles, lodPath, summarizeLodDir } from '../server/lod-pack.mjs';
 import { LOD_CELLS, pickLodCell } from '../shared/lod-format.mjs';
 import { atlasStamp, ShellPack } from '../server/shell-pack.mjs';
 import { shellFrameCols } from '../server/shell.mjs';
@@ -89,11 +89,55 @@ test('the ladder: a rung is asked for when its columns still measure something',
   // A finer rung already in RAM stays even when it is no longer needed: it is already paid for, and
   // dropping it would cost a dispose plus a re-fetch the next time the view wants it back.
   assert.equal(pickLodCell([4, 16], 1, 3, 4), 4, 'held finer stays');
-  // And a rung change has to clear a margin, or a slow zoom re-downloads the world rung by rung.
-  assert.equal(pickLodCell([4, 16], 0.76, 3, 16), 16, '4-block columns at 3.04 px are not worth a refetch');
-  assert.equal(pickLodCell([4, 16], 1.2, 3, 16), 4, 'at 4.8 px they are');
+  // A finer rung already in RAM stays: it is already paid for, and dropping it costs a dispose plus a
+  // re-fetch the next time the view wants it back.
+  assert.equal(pickLodCell([4, 16], 1, 3, 4), 4, 'held finer stays');
+  // The visual rule: a 16-block column that measures over the blob bar goes finer even though the fine
+  // columns would be small, because a tree inside a 12 px column is a tower. This is the exact case the
+  // previous rule refused - it demanded 3.9 px from the fine rung and got 3.04, so the tower stayed.
+  assert.equal(pickLodCell([4, 16], 0.76, 3, 16), 4, 'a 12 px column is a blob: go finer');
+  assert.equal(pickLodCell([4, 16], 0.5, 3, 16), 16, 'an 8 px column is still ground, leave it');
+  // Three rungs: it stops at the first one that is not a blob, rather than leaping to the finest.
+  assert.equal(pickLodCell([4, 8, 16], 0.76, 3, 16), 4, 'finest that still measures');
+  assert.equal(pickLodCell([4, 8, 16], 0.76, 3, 8), 8, 'an 6 px column does not need the finest rung');
+  // Releasing a fine tile you already hold is also a decision: it costs a re-fetch to want it back.
+  assert.equal(pickLodCell([4, 16], 0.5, 3, 4), 4, 'a held tile at 2 px stays rather than re-fetch');
+  assert.equal(pickLodCell([4, 16], 0.05, 3, 4), 16, 'once it is a twentieth of a pixel it goes');
   assert.equal(pickLodCell([], 10, 3), 0, 'no rungs, no request');
   assert.equal(pickLodCell([16], 100, 3), 16, 'a single-rung dimension still paints');
+});
+
+test('/meta must count the baked layer with the reader, not with a folder listing', () => {
+  // The bug this pins: worldd used to answer "is there a baked far layer?" by counting *.bin files
+  // directly inside build/lods/<dim>. The rungs then moved into c<cell>/ subfolders, that count went
+  // to zero, and the browser quietly declined to use 4 GB of baked geometry - no error, no 404, just a
+  // slower far view that looked like a performance problem.
+  const dir = fs.mkdtempSync(path.join('build', 'lodmeta-'));
+  try {
+    const write = (cell, rx, rz) => {
+      const f = cell ? lodPath(path.join(dir, 'region'), cell, rx, rz) : path.join(dir, 'region', `${rx}_${rz}.bin`);
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, lodFileBytes({ rx, rz, stamp: 1, pos: new Float32Array(3), col: new Uint8Array(4), count: 1, policy: POLICY }));
+    };
+    assert.deepEqual(summarizeLodDir(dir), { dims: 0, tiles: 0, cells: [] }, 'an empty tree is a zero, not an error');
+    write(0, 1, 2);                                    // the retired flat layout: unreachable, so not counted
+    assert.equal(summarizeLodDir(dir).tiles, 0, 'a tile outside a rung folder does not exist');
+    write(LOD_CELL, 1, 2); write(4, 1, 2);
+    const s = summarizeLodDir(dir);
+    assert.deepEqual(s, { dims: 1, tiles: 2, cells: [LOD_CELL, 4] }, 'both rungs counted, both named');
+    assert.equal(s.tiles, listLodTiles(path.join(dir, 'region')).length, 'the summary is the reader, summed');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+
+  // And against the real bake: if tiles are on disk in a layout the reader can see, /meta has to say so.
+  if (fs.existsSync(LODS)) {
+    const real = summarizeLodDir(LODS);
+    const n = fs.readdirSync(LODS).reduce((a, sub) => {
+      const d = path.join(LODS, sub);
+      return a + (fs.statSync(d).isDirectory() ? listLodTiles(d).length : 0);
+    }, 0);
+    assert.equal(real.tiles, n, 'the real bake counts the same from both ends');
+    if (n) assert.ok(real.dims >= 1 && real.cells.length >= 1, `${n} tiles on disk must not read as absent`);
+  }
 });
 
 test('a served tile inflates to an image the browser can open', () => {

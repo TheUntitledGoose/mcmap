@@ -19,8 +19,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
+// The magic is a container tag; PACK_VERSION is what invalidates a pack. v4 = `ground` is the surface
+// a cell stands on, not the top of whatever happens to be standing on it, and `state` is the paint.
+// Old v3 packs are rejected by the version check rather than quietly mis-drawing the world.
 export const PACK_MAGIC = 'DVSHRP3 ';
-export const PACK_VERSION = 3;
+export const PACK_VERSION = 4;          // v4: a pack now stores the ground under a canopy, not the trunk top
 export const PACK_HEADER = 24;
 export const PACK_SLOTS = 1024;          // 32x32 chunks, the world/region granularity
 export const SLOT_COLS = 256;            // columns per chunk

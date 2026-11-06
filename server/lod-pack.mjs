@@ -1,7 +1,11 @@
 // On-disk container for baked coarse LOD tiles: a 40 byte header (shared/lod-format.mjs) followed by
 // the deflated vertex body. worldd inflates before serving, so the browser never needs a decompressor.
 //
-//   build/lods/<dimkey>/<rx>_<rz>.bin
+//   build/lods/<dimkey>/c<cell>/<rx>_<rz>.bin
+//
+// One directory per rung of the ladder, because the rungs are baked and retired independently: cell 4
+// costs 16x the bake time and 13x the bytes of cell 16, so a build that only has the coarse rung on
+// disk is a normal state, not a half-finished one.
 //
 // Same region granularity and same stamp discipline as the shell packs: a tile is only valid for the
 // atlas whose state ids its colours were computed from.
@@ -9,13 +13,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import {
-  LOD_MAGIC, LOD_VERSION, LOD_HEADER, LOD_CELL, LOD_BYTES_PER_VERT,
+  LOD_MAGIC, LOD_VERSION, LOD_HEADER, LOD_CELL, LOD_CELLS, LOD_BYTES_PER_VERT, lodCellDir,
   encodeLodTile, openLodTile,
 } from '../shared/lod-format.mjs';
 
-export { LOD_MAGIC, LOD_VERSION, LOD_HEADER, LOD_CELL };
+export { LOD_MAGIC, LOD_VERSION, LOD_HEADER, LOD_CELL, LOD_CELLS };
 
-export const lodPath = (dir, rx, rz) => path.join(dir, `${rx}_${rz}.bin`);
+export const lodPath = (dir, cell, rx, rz) => path.join(dir, lodCellDir(cell), `${rx}_${rz}.bin`);
 
 /** @param {{rx,rz,stamp,pos,col,count,policy}} t @returns {Buffer} file contents */
 export function lodFileBytes(t) {
@@ -60,15 +64,53 @@ export function loadLodTile(file, wantStamp = null) {
   return t;
 }
 
-/** Every tile file in a dimension's directory, as {rx,rz}. */
-export function listLodTiles(dir) {
+/** Which region slots have shell packs (the bake's work list). */
+export function listPackRegions(dir) {
   let names;
   try { names = fs.readdirSync(dir); } catch { return []; }
   const out = [];
   for (const n of names) {
-    if (!n.endsWith('.bin')) continue;
     const m = /^(-?\d+)_(-?\d+)\.bin$/.exec(n);
     if (m) out.push({ rx: +m[1], rz: +m[2] });
   }
   return out.sort((a, b) => a.rx - b.rx || a.rz - b.rz);
+}
+
+/** Every tile file in a dimension's LOD directory, as {cell,rx,rz}, coarsest rung first. */
+export function listLodTiles(dir) {
+  const out = [];
+  for (const sub of listDirs(dir)) {
+    if (!sub.startsWith('c') || !/^c\d+$/.test(sub)) continue;
+    const cell = +sub.slice(1);
+    let names;
+    try { names = fs.readdirSync(path.join(dir, sub)); } catch { continue; }
+    for (const n of names) {
+      const m = /^(-?\d+)_(-?\d+)\.bin$/.exec(n);
+      if (m) out.push({ cell, rx: +m[1], rz: +m[2] });
+    }
+  }
+  return out.sort((a, b) => b.cell - a.cell || a.rx - b.rx || a.rz - b.rz);
+}
+
+const listDirs = (dir) => { try { return fs.readdirSync(dir); } catch { return []; } };
+
+/**
+ * What /meta says about the baked far layer: how many dimensions have tiles, how many tiles in total,
+ * and which rungs of the ladder exist. This lives next to the reader on purpose. When the counting
+ * code was written separately, against the folder layout rather than the reader, a layout change made
+ * it report "nothing baked" - and the browser then declined the baked layer without an error line
+ * anywhere, leaving the far world to live meshing with no hint of why.
+ */
+export function summarizeLodDir(dir) {
+  let dims = 0, tiles = 0;
+  const cells = new Set();
+  for (const sub of listDirs(dir)) {
+    const d = path.join(dir, sub);
+    let st;
+    try { st = fs.statSync(d); } catch { continue; }
+    if (!st.isDirectory()) continue;
+    const t = listLodTiles(d);
+    if (t.length) { dims++; tiles += t.length; for (const x of t) cells.add(x.cell); }
+  }
+  return { dims, tiles, cells: [...cells].sort((a, b) => b - a) };
 }
