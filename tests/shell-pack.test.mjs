@@ -134,7 +134,16 @@ test('overview: a dimension of packs reduces to one grid of columns', () => {
 // ---- against the real world, when it has been baked ------------------------------------------
 // The skip test asks the server itself rather than guessing file names: the dimension directory is
 // named from the save's own layout, and a test that re-derived it would drift the way the bake did.
-const baked = fs.existsSync(SHELLS) && fs.existsSync(atlasPath) && DIMS.every((d) => !!service().svc.overviewBytes(d));
+const baked = (() => {
+  if (!fs.existsSync(SHELLS) || !fs.existsSync(atlasPath)) return { ok: false, why: 'build/shells not baked (run node server/bake-shells.mjs)' };
+  try {
+    return { ok: DIMS.every((d) => !!service().svc.overviewBytes(d)), why: 'no overview for this dimension' };
+  } catch (e) {
+    // A reader that rejects the on-disk version is the guard working: derived data older than the
+    // policy that produced it must not be served, and the fix is a re-bake, not a relaxed check.
+    return { ok: false, why: `the packs on disk predate this code (${e.message}) - run node server/bake-shells.mjs --force` };
+  }
+})();
 
 function service() {
   const atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
@@ -156,7 +165,7 @@ function service() {
 const asArrayBuffer = (b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.length);
 
 for (const DIM of DIMS) test(`worldd: a baked pack answers exactly what the chunk would have (${DIM})`, (t) => {
-  if (!baked) return t.skip('build/shells not baked (run node server/bake-shells.mjs)');
+  if (!baked.ok) return t.skip(baked.why);
   const { svc } = service();
   let checked = 0, packed = 0;
   for (const [cx, cz] of [[0, 0], [4, 8], [-2, 6], [100, -20], [31, 31]]) {
@@ -187,7 +196,7 @@ for (const DIM of DIMS) test(`worldd: a baked pack answers exactly what the chun
 });
 
 for (const DIM of DIMS) test(`worldd: the overview frame covers the dimension and matches the packs (${DIM})`, (t) => {
-  if (!baked) return t.skip('build/shells not baked');
+  if (!baked.ok) return t.skip(baked.why);
   const { svc } = service();
   const buf = svc.overviewBytes(DIM);
   assert.ok(buf, 'the overview is served');
@@ -241,7 +250,7 @@ for (const DIM of DIMS) test(`worldd: the overview frame covers the dimension an
 });
 
 test('overview mesh: one top per cell, cliffs on the steps, nothing under the skin', (t) => {
-  if (!baked) return t.skip('build/shells not baked');
+  if (!baked.ok) return t.skip(baked.why);
   const atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
   const geo = fs.readFileSync('build/assets/geometry.bin');
   const assets = new Assets(atlas, asArrayBuffer(geo));

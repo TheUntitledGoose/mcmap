@@ -2,15 +2,20 @@
 // read instead of meshing.
 //
 // One tile is one region (32x32 chunks, the same granularity as the shell packs) meshed at a fixed
-// coarse cell, 16 blocks per column - one column per chunk, i.e. exactly the resolution the
-// whole-dimension overview used to have. That is the floor of the LOD ladder: nothing in the world is
-// drawn coarser than this, and nothing finer than this is baked (see PLAN.md: cell 4 for the whole
-// overworld would be 70 M verts and cell 1 is 770 M, which no GPU can look at).
+// coarse cell. The ladder has two rungs and both are baked: 16 blocks per column (one column per
+// chunk) and 4 blocks per column (one column per 4x4 blocks). Those are the only two rungs because
+// the cost of the next one down is not geometry, it is triangles:
 //
-// Why baking is affordable: at 16 blocks per column the overworld is ~28 verts per chunk, 8 M verts
-// for all 284 239 chunks, ~130 MB of raw vertices before deflate (a region tile is ~450 KB raw,
-// ~100 KB on disk). The voxel detail tier for the same world would be 9.3 G verts (~220 GB). The voxel detail tier for the same
-// world would be 9.3 G verts (~220 GB) - that is the tier that must stay live.
+//   cell 16   327 tiles  2.4 M verts   5.5 MB   - the floor; nothing is drawn coarser than this
+//   cell 4   3298 tiles 32.3 M verts    72 MB   - the rung where a 5-block house is more than one quad
+//   cell 1     (live)  762 M verts   ~1.7 GB    - not baked: 60 M triangles, and the GPU cannot look at it
+//
+// Why baking is affordable: at 16 blocks per column the overworld is ~28 verts per chunk, and at 4 it
+// is ~140. The voxel detail tier for the same world is 9.3 G verts (~220 GB) - that is the tier that
+// must stay live.
+//
+// The browser picks a rung per tile from what a column would measure on screen (pickLodCell), so the
+// near half of the view can sit at cell 4 while the horizon stays at cell 16 for the same frame.
 //
 // A tile carries the far-paint policy it was baked with (ground/cover rule, water film alpha, AO
 // match, light curve). The browser compares that against its own settings and refuses to draw a tile
@@ -32,14 +37,22 @@
 //
 // No UVs: a baked tile is a flat paint (the far view's default). The textured far mode is opt-in and
 // live-meshed, so a tile would only be able to draw itself flat anyway; storing UVs would cost 22%
-// of the file for a mode that cannot use them. Version 2 if that ever changes.
+// of the file for a mode that cannot use them.
+import { CH } from './view.mjs';
+
 export const LOD_MAGIC = 'DVDXLOD1';
-export const LOD_VERSION = 1;
+// v2: the ladder. v1 readers reject any cell but 16, so a v1 tile and a v2 tile are not
+// interchangeable even though the layout never changed - say so in the version.
+export const LOD_VERSION = 2;
 export const LOD_HEADER = 40;
-export const LOD_CELL = 16;            // blocks per column
+export const LOD_CELL = 16;            // the coarsest rung, and the floor of the whole renderer
+/** The rungs this build can bake and draw, coarsest first. */
+export const LOD_CELLS = [16, 4];
 export const LOD_TILE_CHUNKS = 32;     // chunks per tile side (a region)
 export const LOD_BYTES_PER_VERT = 16;  // f32 xyz + u8 rgba, block layout
-export const LOD_TILE_BYTES = LOD_HEADER + LOD_TILE_CHUNKS * LOD_TILE_CHUNKS * 28 * LOD_BYTES_PER_VERT;
+/** Columns in one tile at a given cell - the upper bound on its vertex count. */
+export const lodTileCols = (cell = LOD_CELL) => (LOD_TILE_CHUNKS * CH / cell) ** 2;
+export const LOD_TILE_BYTES = LOD_HEADER + lodTileCols() * 28 * LOD_BYTES_PER_VERT;
 
 /** The far-paint policy a tile was baked with, in the units the header stores. */
 export function policyBits(p) {
@@ -111,7 +124,7 @@ export function openLodTile(buf, off = 0, len = buf.byteLength - off, wantStamp 
   if (bodyLen !== verts * LOD_BYTES_PER_VERT) {
     throw new Error(`lod tile body ${bodyLen} != ${verts} verts`);
   }
-  if (cell !== LOD_CELL) throw new Error(`lod tile cell ${cell} != ${LOD_CELL}`);
+  if (!LOD_CELLS.includes(cell) || cell < 1 || cell > CH) throw new Error(`lod tile cell ${cell} is not a rung`);
   // The body is pos block then col block, each contiguous, so both views can alias the buffer
   // directly - no copy - as long as each start is 4-byte aligned. LOD_HEADER (40) and the pos block
   // (verts*12) are both multiples of 4.
@@ -130,6 +143,46 @@ export function openLodTile(buf, off = 0, len = buf.byteLength - off, wantStamp 
     },
   };
 }
+
+/**
+ * Which rung of the ladder one tile should use.
+ *
+ * A column of `cell` blocks at distance `d` blocks is `cell * pxPerBlock` pixels wide, where
+ * `pxPerBlock` is what one block of ground measures at that distance. The finest rung that still
+ * measures at least `minPx` is the cheapest one that does not spend a triangle on something smaller
+ * than a pixel, and if nothing measures up then the coarsest rung is still the honest answer: painted
+ * ground beats an unpainted horizon, and that is the whole reason the tiles exist.
+ *
+ * @param {number[]} cells    rungs the server has for this dimension, any order
+ * @param {number} pxPerBlock pixels one block of ground measures at this tile's distance
+ * @param {number} minPx      how wide a baked column has to be to be worth a triangle at all
+ * @param {number} [held]     the rung already on hand for this tile, 0 if none
+ * @param {number} [maxPx]    how wide a column may get before a finer rung is worth going to get
+ * @returns {number} the cell to ask for
+ */
+export function pickLodCell(cells, pxPerBlock, minPx, held = 0, maxPx = minPx * 4) {
+  const have = cells.filter((c) => c >= 1).sort((a, b) => a - b);
+  if (!have.length) return 0;
+  const size = (c) => c * pxPerBlock;
+  let want = null;
+  for (const c of have) if (size(c) >= minPx && (want === null || c < want)) want = c;
+  if (want === null) want = have[have.length - 1];      // nothing measures up: paint the ground anyway
+  if (!held || !have.includes(held) || want === held) return want;
+  // Re-cutting a tile costs a fetch, an upload and a dispose, so a rung change has to be a real one.
+  if (want < held) {
+    // Going finer is worth it when the columns on screen have turned into blobs and the finer rung
+    // would still land in a sane size range - not merely when it is technically affordable.
+    if (size(held) <= maxPx || size(want) < minPx * 1.3) return held;
+    return want;
+  }
+  // Going coarser is worth releasing a fine tile only once its columns are down near a pixel: the
+  // vertices are already paid for, and dropping them costs a re-fetch on the next zoom in.
+  if (size(held) >= minPx * 0.5) return held;
+  return want;
+}
+
+/** Where a rung's tiles live under a dimension's LOD directory. */
+export const lodCellDir = (cell) => `c${cell}`;
 
 /**
  * Which fields describe the *shape* of the ground, and which only describe how it was shaded.

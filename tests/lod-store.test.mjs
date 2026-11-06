@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { LodStore } from '../web/js/lod-store.js';
-import { encodeLodTile, LOD_HEADER, LOD_BYTES_PER_VERT } from '../shared/lod-format.mjs';
+import { encodeLodTile, LOD_HEADER, LOD_BYTES_PER_VERT, LOD_CELL, pickLodCell } from '../shared/lod-format.mjs';
 
 const POLICY = {
   groundFar: 1, waterOpacity: 0.72, aoFar: 0.949, lightOn: 1,
@@ -56,6 +56,38 @@ test('a 404 is remembered: the same view does not re-ask, and does not spin', as
   assert.equal(calls, 2, 'a remembered miss is not re-asked on the next view');
 });
 
+test('a finer rung arriving retires the coarse tile it lands on, and the ladder is per tile', async () => {
+  // Two rungs painting the same ground is z-fighting plus a double vertex bill, so a position holds one
+  // tile. This is also the test that the *request* is for the rung the caller asked for.
+  const seen = [];
+  const fetchFn = async (url) => {
+    const q = new URL('http://x' + url).searchParams;
+    const rx = +q.get('rx'), rz = +q.get('rz'), cell = +q.get('cell');
+    seen.push(cell);
+    const verts = cell === 4 ? 9 : 3;
+    const pos = new Float32Array(verts * 3).fill(1);
+    const col = new Uint8Array(verts * 4).fill(200);
+    const img = encodeLodTile({ rx, rz, stamp: 7, cell, pos, col, count: verts, policy: POLICY });
+    return { ok: true, status: 200, arrayBuffer: async () => img.buffer };
+  };
+  const st = new LodStore('d', { policy: POLICY, fetchFn });
+  st.setIndex([[LOD_CELL, 0, 0], [4, 0, 0]]);
+  assert.deepEqual(st.cells, [4, LOD_CELL], 'finest rung first');
+  assert.deepEqual(st.cellsAt(0, 0), [4, LOD_CELL], 'and this tile has both');
+  st.request(0, 0, 1, 1, [0, 0], (rx, rz, held, avail) => pickLodCell(avail, 40, 3, held));
+  await settle();
+  assert.equal(st.tiles.size, 1, 'one tile per position, whichever rung it is');
+  assert.equal(st.get(0, 0).cell, 4, 'a 250 block tile at 40 px/block is worth the fine rung');
+  assert.equal(st.heldCell(0, 0), 4);
+  // Pull back to where a 4-block column is a quarter of a pixel: the coarse rung takes over, and the
+  // fine tile that was there goes with it.
+  st.request(0, 0, 1, 1, [0, 0], (rx, rz, held, avail) => pickLodCell(avail, 1 / 4000, 3, held));
+  await settle();
+  assert.equal(st.get(0, 0).cell, LOD_CELL, 'the horizon takes the cheap rung');
+  assert.equal(st.tiles.size, 1, 'and never both at once');
+  assert.deepEqual(seen, [4, LOD_CELL], 'asked for exactly those two rungs');
+});
+
 test('a broken endpoint is tried once per window, then parked', async () => {
   let calls = 0;
   const fetchFn = async () => { calls++; throw new Error('socket hang up'); };
@@ -72,7 +104,7 @@ test('a broken endpoint is tried once per window, then parked', async () => {
   // Two attempts out of twelve expiry windows: the second failure widens the wait to
   // twenty windows, so a broken endpoint goes quiet on its own.
   assert.ok(calls <= 4, `repeated failure parks the tile instead of looping (${calls} calls)`);
-  assert.ok(st.fails.get('0,0') >= 2, 'and the store counted them');
+  assert.ok(st.fails.get(`${LOD_CELL},0,0`) >= 2, 'and the store counted them, per rung');
 });
 
 test('regions outside the index are never asked for', async () => {
