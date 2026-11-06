@@ -3244,7 +3244,7 @@ function buildPanel() {
         set: (v) => { S.buried = Math.min(64, Math.max(0, v | 0)); applySettings('light'); } },
 
       { key: 'surface', label: 'mesh the surface only', kind: 'check', live: false,
-        hint: 'On (default) a detail face is drawn only if rock does not sit above the air it looks into:\nthe world is meshed as a skin, not as a block of rock. 24 sampled chunks: 16,184 verts and 26.2 ms\nper chunk with the underground, 4,008 verts and 16.5 ms as a skin. The skylight rule above stays on\nas well, so a ravine or a cave mouth is never a hole. Off is the A/B control. URL: ?nosurface',
+        hint: 'On (default) a detail face is drawn only if opaque rock does not sit above the air it looks\ninto: the world is meshed as a skin, not as a block of rock. 24 sampled chunks: 16,184 verts and\n25.9 ms per chunk with the underground, 13,659 verts and 19.9 ms as a skin (-16 % / -23 %). Leaves\nand water are not cover, so a forest floor and a lake bed survive. The skylight rule stays on as\nwell, so a ravine or a cave mouth is never a hole. Off is the A/B control. URL: ?nosurface',
         get: () => S.surface,
         set: (v) => { S.surface = v ? 1 : 0; applySettings('light'); } },
 
