@@ -970,11 +970,15 @@ function meshAsync(cx, cz, mk) {
   const key = `${cx},${cz}`;
   if (jobForKey.has(key)) return true;
   if (!mk) mk = meshKeyFor(cx, cz);
-  // A pan wants two kinds of work at once: chunk meshes for the middle of the view and far patch cuts
-  // for everything around it. If the chunk queue takes every worker, the patch cut falls back to the
-  // render thread - a 20 ms hitch, which is the whole reason the cut has workers now - so while patches
-  // are waiting, some slots stay free for them.
-  const reserve = patchCap() && dirtyPatches.size ? Math.min(patchCap(), pool.length - 1) : 0;
+  // A pan wants two kinds of work at once: chunk meshes for the middle of the view, and far patch
+  // cuts for everything around it. Reserving threads for the cuts is what stopped a 20 ms cut falling
+  // back onto the render thread - but the reservation was `min(patchCap, pool-1)`, which with 6 cut
+  // threads on an 8-thread pool left chunk meshing 2 workers, and the detail layer stopped coming
+  // back after a pan: 15 s out it had painted 380 chunk meshes with 855 keys still queued, where 2
+  // cut threads reached 530 meshes and an empty queue in 4.5 s. Detail is the layer the user is
+  // looking at, so the cut queue only holds back what it can actually start, and never more than two.
+  const pending = Math.min(patchCap(), dirtyPatches.size);   // cuts the far grid wants right now
+  const reserve = pending > patchInflight ? Math.min(2, pool.length - 1) : 0;
   let free = 0;
   for (const x of pool) if (!x.busy) free++;
   if (free <= reserve) return false;
@@ -2584,6 +2588,10 @@ function abandonTimer(now) {
   timerExt = null;
 }
 
+// Who owns the drawing-buffer key: resize() is the only place that reallocates, so it is the only
+// place that decides whether the picture actually changed.
+let lastResKey = '', resDir = 0, resChanges = 0;
+
 function applyRes() {
   renderer.setPixelRatio(resWanted());
   resize();
@@ -2592,24 +2600,36 @@ function applyRes() {
 function tuneRes(now, force = false) {
   if (!S.resAuto || !timerExt || params.get('view') === 'flat') return;
   // Waiting on the network or on meshing threads is not the graphics card's fault, and shrinking the
-  // picture would not help.
-  if (!force && (store.inflight || store.queue.length || store.dirty.size || jobs.size)) return;
+  // picture would not help. The far grid counts too: while patches are waiting or being cut, the frame
+  // is spent building terrain, and a resolution change in the middle of that is a buffer reallocation
+  // on top of the work that was already late.
+  if (!force && (store.inflight || store.queue.length || store.dirty.size || jobs.size
+    || dirtyPatches.size || patchInflight)) return;
   // Neither is being CPU-bound: `total - render` is our own work, and while it is large the frame is
   // spent meshing, not drawing.
   const w = profWindow();
   if (!force && w.total - w.render > (1000 / S.targetFps) * 0.5) return;
-  if (gpuSamples === 0 || now - resTuneAt < 900) return;
-  resTuneAt = now;
+  if (gpuSamples === 0 || now - resTuneAt < 2500) return;
   const want = 1000 / S.targetFps;
-  if (gpuMs > want * 0.85 && resAuto > 0.5) resAuto = Math.max(0.5, resAuto * 0.88);
-  else if (gpuMs < want * 0.55 && resAuto < 1) resAuto = Math.min(1, resAuto * 1.06);
-  else return;
+  // Two readings in the same direction, and at least 2 s apart. A single noisy sample used to be
+  // enough to resize the picture, and the resize is the expensive part, not the decision.
+  const dir = gpuMs > want * 0.85 ? -1 : (gpuMs < want * 0.55 ? 1 : 0);
+  if (dir !== resDir) { resDir = dir; return; }
+  if (dir === 0) return;
+  resTuneAt = now;
+  if (dir < 0 && resAuto > 0.5) resAuto = Math.max(0.5, resAuto * 0.9);
+  else if (dir > 0 && resAuto < 1) resAuto = Math.min(1, resAuto * 1.06);
+  else { resDir = 0; return; }
   applyRes();
 }
 
 function resize() {
   const w = innerWidth, h = innerHeight;
-  renderer.setSize(w, h, false);
+  // setSize reallocates the drawing buffer, the depth buffer and the mip tree - tens of milliseconds on
+  // a software GL, and a CPU profile of a pan showed WebGLRenderer.setSize at 29% of the render
+  // thread's busy samples while auto-res re-decided the picture every second. Only pay for a change.
+  const key = `${w}x${h}@${renderer.getPixelRatio().toFixed(4)}`;
+  if (key !== lastResKey) { lastResKey = key; resChanges++; renderer.setSize(w, h, false); }
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   recomputeZoom();                     // a wider window reaches farther, so the ceiling moves with it
@@ -3074,6 +3094,7 @@ window.__world = {
   // Bucket means in ms/frame over the last HUD tick (0.5 s). The honest answer to "what is slow".
   prof: () => profWindow(),
   res: () => ({ scale: resWanted(), cap: DPR_CAP, auto: resAuto, setting: S.res, autoOn: !!S.resAuto,
+    changes: resChanges,
     gpuTimer: !!timerExt, timerDead, gpuMs, cpuRenderMs, samples: gpuSamples }),
   // Drive the resolution governor from a probe: claim a GPU time and run one step of the control
   // loop. Without this the shrink path only shows up on a card that is actually slow, and a probe
