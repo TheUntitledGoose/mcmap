@@ -11,6 +11,7 @@ import { pickLodRung, LOD_CELL } from '../../shared/lod-format.mjs';
 import { openOverview } from './payload.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
 import { PATCH_REACH, packPatchFrames, packPatchPolicy, patchFrameGetter, patchPolicy } from './shell-batch.js';
+import { cutReserve, patchThreadCap } from '../../shared/pool.mjs';
 import { meshKeyTool } from './mesh-key.js';
 import { mountPanel } from './ui.js';
 import { HEIGHT_BIAS } from '../../shared/chunk-format.mjs';
@@ -977,8 +978,8 @@ function meshAsync(cx, cz, mk) {
   // back after a pan: 15 s out it had painted 380 chunk meshes with 855 keys still queued, where 2
   // cut threads reached 530 meshes and an empty queue in 4.5 s. Detail is the layer the user is
   // looking at, so the cut queue only holds back what it can actually start, and never more than two.
-  const pending = Math.min(patchCap(), dirtyPatches.size);   // cuts the far grid wants right now
-  const reserve = pending > patchInflight ? Math.min(2, pool.length - 1) : 0;
+  const reserve = cutReserve({ patchCap: patchCap(), dirtyPatches: dirtyPatches.size,
+    patchInflight, poolSize: pool.length });
   let free = 0;
   for (const x of pool) if (!x.busy) free++;
   if (free <= reserve) return false;
@@ -1395,7 +1396,7 @@ let patchSeq = 0, patchInflight = 0, patchPosted = 0, patchDropped = 0, patchOut
 // 0 threads 60 ms, 2 threads 29 ms, 4 threads 22 ms, 6 threads 15.7 ms (dist 400) and 23 -> 14.5 ms
 // (dist 150). But the same threads are the only thing meshing chunk detail, so the pool keeps two:
 // asking for 6 on a machine that started 4 workers gets 2, and a 2-worker pool cuts its own patches.
-const patchCap = () => Math.max(0, Math.min(S.patchWorkers, pool.length - 2));
+const patchCap = () => patchThreadCap({ poolSize: pool.length, want: S.patchWorkers });
 
 /**
  * Decide a patch cut without paying for it: tier, paint mode, the frames, and the two per-chunk
@@ -3720,7 +3721,7 @@ function buildPanel() {
         get: () => S.targetFps, set: (v) => { S.targetFps = Math.max(20, Math.min(120, v | 0)); } },
 
       { key: 'patchthreads', label: 'far cut threads', min: 0, max: 6, step: 1, live: true,
-        hint: 'How many of the meshing threads may take a far patch cut at once. A cut is 20-25 ms and a\nframe is 16, so it runs there instead of here. Across a 5 s drag the worst frame measured 60 ms\nwith 0 of these, 29 ms with 2 and 18 ms with 6; the settled view is the same either way (598\npatches, 6 309 216 verts). The pool keeps two threads for chunk detail, so a machine that started\n4 workers gets 2. URL: ?patchworkers',
+        hint: 'How many of the meshing threads may take a far patch cut at once. A cut is 20-25 ms and a\nframe is 16, so it runs there instead of here. Across a 5 s drag the worst frame measured 60 ms\nwith 0 of these, 29 ms with 2 and 18 ms with 6; the settled view is the same either way (598\npatches, 6 309 216 verts). Cuts are only ever posted up to this many at a time, so the pool keeps\nthe rest for chunk detail: reserving 7 of 8 for a queue that can hold 6 left detail chunks unmeshed\nfor 13 s after a pan. A machine that started 4 workers gets 2 cut threads. URL: ?patchworkers',
         get: () => patchCap(),
         set: (v) => { S.patchWorkers = Math.max(0, Math.min(6, v | 0)); } },
       { key: 'workers', label: 'meshing threads', min: 0, max: 8, step: 1, live: false,
