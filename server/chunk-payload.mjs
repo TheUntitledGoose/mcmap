@@ -302,6 +302,12 @@ export function packChunk(c) {
     + (hasH ? 512 : 0) + (hasHM ? 512 : 0) + beBytes;
 
   const buf = Buffer.allocUnsafe(size);
+  // A frame has to be canonical bytes. The alignment pad after the palette is skipped, not written, so
+  // on `allocUnsafe` it kept whatever that memory happened to hold: the same chunk decoded twice packed
+  // to buffers differing in 1-2 pad bytes (measured on 26 of 40 pairs of chunk 3,3). That is invisible
+  // to the reader and fatal to anything that compares payloads - a fingerprint, a dedupe, a
+  // "did this chunk change" test - so the pad is zeroed explicitly.
+  if (palPad) buf.fill(0, palEnd, palEnd + palPad);
   let p = 0;
   buf.write(CHUNK_MAGIC, p, 'ascii'); p += 8;
   buf.writeUInt16LE(c.version ?? CHUNK_VERSION, p); p += 2;

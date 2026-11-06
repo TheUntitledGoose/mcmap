@@ -21,6 +21,18 @@ const magicAt = (dv, at) => {
   return s;
 };
 
+/** FNV-1a over the frame, one u32 at a time (lengths are padded to 4 by the writer). */
+export function frameDigest(u8) {
+  let h = 0x811c9dc4;
+  const n = u8.length >>> 2;
+  const w = new Uint32Array(u8.buffer, u8.byteOffset, n);
+  for (let i = 0; i < n; i++) {
+    h ^= w[i];
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) || 1;             // 0 is reserved for "no payload"
+}
+
 /**
  * Walk a batch container (see world-service packBatch): u32 frame count, then per frame a u32
  * length and the bytes padded to 4. Returns absolute [offset, length] pairs; a zero length means
@@ -117,6 +129,11 @@ export function openChunk(buf, byteOffset = 0, length = buf.byteLength - byteOff
 
   return {
     cx, cz, yMin, yCount, palette, sections, height, heightMotion, blockEntities, unknownStates,
+    // A fingerprint of the bytes this chunk was read from. Two fetches of ground nobody edited give
+    // the same number, which is what lets the viewer say "I already have the triangles for this" -
+    // see web/js/mesh-key.js. Object identity cannot answer that: a refetch is a new object holding
+    // the same world.
+    digest: frameDigest(new Uint8Array(buf, (buf.byteOffset ?? 0) + byteOffset, length)),
     classicSections: !!(flags & FLAG_CLASSIC),
     /** the section covering a *world block* y, or null */
     sectionAt(y) { return byY.get(y >> 4) ?? null; },
