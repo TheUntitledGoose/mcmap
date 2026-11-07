@@ -4,6 +4,9 @@
 // Cave coordinates come from the payload cache, not a guess:
 //   node build/find-caves.mjs --near 150,170 --n 12
 //     chunk 127,175  surface 82  enclosed 838/838  lit 250  -> goto 2040,4,2808
+// SUPERSEDED by M14 (see HANDOFF `### M14`): this probed the M11 walking *camera*, which had no gravity,
+// no collision and no jump. `build/q_body.js` and `build/q_bodycave.js` are the body probes now, and their
+// expectations are Node-derived. Kept because HANDOFF `### M11` quotes the numbers this file produced.
 const w = window.__world;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const KEYS = ['view', 'mesh', 'refill', 'shell', 'ov', 'demote', 'count', 'render'];

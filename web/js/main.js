@@ -22,9 +22,13 @@ import { CH, maxZoomFor, cornerTan, zoomCeiling, frustumFor, groundReach, skinRa
   closestApproach, cellForPixels, budgetCell, detailRadius, detailReach, faceFactor, tierDistance,
   pickEvictions, aaDefault } from '../../shared/view.mjs';
 // M11 first-person rig. The arithmetic (keys, mouse-look, the wheel, standing on the ground) lives in
-// shared/walk.mjs next to the other view policies, so the tests cover it without a browser.
-import { EYE_DIST, PITCH_LIMIT, look as walkLook, step as walkStep, wheelReach, walkWant,
-  snapTo as walkSnapTo, floorUnder as walkFloor, riseToAir as walkRise } from '../../shared/walk.mjs';
+// shared/walk.mjs next to the other view policies, so the tests cover it without a browser. M14 puts a
+// real body under it: gravity, jumping, collision with the voxels, in shared/player.mjs.
+import { EYE_DIST, PITCH_LIMIT, look as walkLook, wish as walkWish, rising as walkUp,
+  descending as walkDown, sprinting as walkSprintKey, wheelReach, walkWant } from '../../shared/walk.mjs';
+import { BODY, C_FULL, C_PASS, C_UNKNOWN, FALL_MAX, FLY_V, SPRINT, WALK, dropToClear, newPlayer, place as placePlayer,
+  simulate as simulatePlayer, floorTop as playerFloorTop, hits as playerHits } from '../../shared/player.mjs';
+import { makeCellAt } from './collision.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -263,15 +267,21 @@ lodCellMaxPx: Math.max(1, num('lodcellmax', 8)),
   // this exists to remove. URL: ?nopatchdetail
   patchDetail: params.has('nopatchdetail') ? 0 : (num('patchdetail', 1) ? 1 : 0),
   invert: params.has('invert'),       // orbit drag direction: mouse-look (default) vs grab-the-world
-  // ---- M11: walking (first person) ---------------------------------------------------------
-  // Same rig, distance driven to about zero, so the orbit target becomes the eye. The wheel stops
-  // meaning zoom and starts meaning how far ahead of the eye the world stays drawn.
-  // URL: ?view=walk (or ?view=fly), ?reach=, ?wspeed=, ?wsprint=, ?nosnap, ?look=
-  walk: /walk|fly|first/i.test(params.get('view') ?? '') ? 1 : 0,
+  // ---- M11/M14: walking (first person), with a body that has weight ----------------------------
+  // Same rig, distance driven to about zero, so the orbit target becomes the eye, and the wheel stops
+  // meaning zoom and starts meaning how far ahead of the eye the world stays drawn. What stands on the
+  // ground is a 0.6 x 1.8 body with gravity and voxel collision (shared/player.mjs), not an eye that
+  // hopes the floor is where the heightmap says it is.
+  // URL: ?view=walk, ?view=fly (no gravity, no walls), ?reach=, ?wspeed=, ?wsprint=, ?gravity=,
+  //      ?jump=, ?look=
+  walk: /walk|fly|first|spect/i.test(params.get('view') ?? '') ? 1 : 0,
+  walkFly: /fly|spect/i.test(params.get('view') ?? '') || params.has('noclip') ? 1 : 0,
   walkReach: clampInt(num('reach', 420), 96, 1600),   // blocks of world kept drawn ahead of the eye
-  walkSpeed: Math.max(1, num('wspeed', 14)),          // blocks/s on foot (in-game is ~4.3)
-  walkSprint: Math.max(1, num('wsprint', 2.6)),       // held Ctrl
-  walkSnap: params.has('nosnap') ? 0 : 1,             // stand the eye on the ground under it
+  walkSpeed: Math.max(0.5, num('wspeed', 4.317)),     // blocks/s on foot: what a player walks in-game
+  walkSprint: Math.max(1, num('wsprint', 1.3)),       // held Ctrl; in-game 5.613 / 4.317
+  walkGravity: Math.max(0, num('gravity', 32)),       // blocks/s^2: the game's 0.08 blocks per tick^2
+  walkJump: Math.max(0, num('jump', 8.4)),            // blocks/s upward: 1.25 blocks of clearance
+  walkSneak: Math.max(0.2, num('wsneak', 1.3)),       // blocks/s with Shift: what you crawl at
   walkSens: Math.max(0.0004, num('look', 0.0025)),    // pointer-lock mouse-look, rad per pixel
   worldSpan: 0,        // blocks across the loaded part of this dimension, filled in at boot
   maxZoom: 1200,       // wheel ceiling, recomputed from worldSpan + skinCap
@@ -298,7 +308,7 @@ function setReadouts(on) {
 // Two key lines, because the keys change: an orbit is dragged and zoomed, a walk is driven.
 const HELP_ORBIT = '<b>drag</b> orbit &nbsp; <b>right-drag</b> pan &nbsp; <b>wheel</b> zoom &nbsp; <b>WASD</b> move'
   + ' &nbsp; <b>V</b> walk &nbsp; <b>P</b> settings &nbsp; <b>F</b> whole world &nbsp; <b>H</b> readouts';
-const HELP_WALK = '<b>WASD</b> walk &nbsp; <b>Space</b>/<b>Shift</b> up/down &nbsp; <b>Ctrl</b> sprint'
+const HELP_WALK = '<b>WASD</b> walk &nbsp; <b>Space</b> jump &nbsp; <b>Ctrl</b> sprint &nbsp; <b>Shift</b> sneak'
   + ' &nbsp; <b>click</b> look with the mouse &nbsp; <b>wheel</b> view depth &nbsp; <b>V</b> orbit again';
 function setHelp(on) {
   const h = $('help');
@@ -396,35 +406,71 @@ const rig = { target: new THREE.Vector3(0, 100, 0), yaw: 0.7, pitch: 0.42, dist:
 // starts reading "from the eye" for free. What the mode has to supply instead is what to *ask for*:
 // an orbit sizes the world from the frame's corners at the target, and with the target in the eye
 // that square is a point, so a walker sizes it by view depth (`reach`) instead.
-const walk = { on: 0, reach: 0, distWas: 40 };
-// What is solid in the column under the eye, as a test on a world Y. Voxel truth when that chunk is
-// held; the shell's `ground` plane when only the shell is held. That plane is the right one for a
-// walker: the viewer's heightmap is WORLD_SURFACE, whose top is the canopy, and standing a walker on
-// it stands them in the tree tops. `groundAt` is the paint block under a plant, canopy or lake.
-// null means nothing is held there, and no answer must ever move the camera.
-function eyeSolidAt() {
-  const [cx, cz] = centerChunk();
-  const lx = Math.floor(rig.target.x) & 15, lz = Math.floor(rig.target.z) & 15;
-  const c = store ? store.get(cx, cz) : null;
-  if (c && assets) {
-    return (y) => {
-      const id = c.stateAt(lx, y, lz);           // 1-based global state id, 0 = unknown/absent
-      return id !== 0 && assets.stateAir[id - 1] !== 1 && assets.stateFilm[id - 1] !== 1;
-    };
+const walk = { on: 0, reach: 0, distWas: 40, fly: 0, frozenFrames: 0, landed: 0,
+  embedded: 0, unstuck: 0, placed: 0 };
+// The body. Feet position, velocity, and what the last physics step concluded; the eye is derived
+// from it (`player.y + BODY.eye`), never the other way round, or standing on a slab and falling into a
+// cave become camera decisions instead of collisions.
+const player = newPlayer(0, 0, 0);
+
+/**
+ * The collision answer for one block coordinate. The rule - and the reason a cell below the stored
+ * range is a floor while a cell whose chunk has not streamed is unknown - lives in web/js/collision.js
+ * next to the other payload readers, where tests/web-player.test.mjs can put it against real region
+ * bytes. A body that meets C_UNKNOWN stops rather than integrates blind: an unloaded chunk is not a
+ * hole in the world, and a walker that free-falls through un-streamed rock and lands inside a mountain
+ * is worse than one that waits a fifth of a second for the bytes.
+ */
+const cellAt = makeCellAt((cx, cz) => (store ? store.get(cx, cz) : null), () => assets);
+
+/** The bottom of the world under the feet, when that column is held. */
+function worldBottomY() {
+  const c = store ? store.get(player.x >> 4, player.z >> 4) : null;
+  return c ? c.yMin * 16 : NaN;
+}
+
+/** Put the body where the eye is, out of walls and down onto a floor if one is close. */
+function standPlayer(maxDrop = 8) {
+  const y = placePlayer(cellAt, player, player.x, player.y, player.z, { maxRise: 3, maxDrop });
+  if (Number.isFinite(y)) { rig.target.set(player.x, player.y + BODY.eye, player.z); walk.placed = 1; }
+  return y;
+}
+
+// The body does not belong where it is - a `?goto=` into a mountainside, flight that ended inside a
+// roof, bytes that arrived around it. Two answers, in the order they move it least: step up out of what
+// it is standing in, then fall to the first clear box below. Looking only up was the bug - the height a
+// link gives you is often inside the hill, and the ground you want is under your feet, not over them.
+// If neither answers, the voxels are not known yet, and waiting is better than guessing.
+function recoverBody() {
+  if (Number.isFinite(standPlayer(8))) return 1;
+  if (Number.isFinite(dropToClear(cellAt, player))) {
+    walk.placed = 1;
+    syncEye(); updateCamera(); updateView();
+    standPlayer(8);
+    return 1;
   }
-  const sh = shellAt(cx, cz);
-  if (sh) { const g = sh.groundAt(lx, lz); return (y) => y <= g; }
-  return null;
+  return 0;
 }
-let walkFloorY = NaN;           // last floor found under the eye, for the readout and the probes
-let walkFloorTry = 0;           // when the floor was last asked for outside a movement step
-function walkStand() {
-  const solid = eyeSolidAt();
-  if (!solid) { walkFloorY = NaN; return; }
-  if (S.walkSnap) rig.target.y = walkRise(solid, rig.target.y);
-  walkFloorY = walkFloor(solid, rig.target.y);
-  if (S.walkSnap) rig.target.y = walkSnapTo(walkFloorY, rig.target.y, { on: true });
+function syncEye() { rig.target.set(player.x, player.y + BODY.eye, player.z); }
+// Free flight is the same mover with the cell probes off: gravity is still integrated, walls are not.
+// Leaving flight clears the placement latch so the voxels get to say where the body belongs again,
+// rather than leaving it hanging at whatever height the mode let it reach.
+function setFly(on) {
+  S.walkFly = on ? 1 : 0;
+  walk.fly = walk.on ? S.walkFly : 0;
+  player.vy = 0;
+  if (!walk.fly) {
+    // Leaving flight hands the body back to the world. Flight can have left it inside a mountain, and a
+    // collision resolver will not push a body out of solid rock - every move is refused and the viewer
+    // has a statue - so the mode switch itself asks for the first clear position under where it was.
+    walk.embedded = 0;
+    walk.placed = 0;
+    if (walk.on) recoverBody();
+  }
+  if (panel) panel.refresh();
+  return walk.fly;
 }
+
 function setWalk(on) {
   on = !!on;
   if (on === !!walk.on) return walk.on;
@@ -432,9 +478,16 @@ function setWalk(on) {
   if (on) {
     walk.distWas = rig.dist;
     walk.reach = S.walkReach;
+    walk.fly = S.walkFly;
     rig.dist = EYE_DIST;
     rig.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, rig.pitch));
-    walkStand();
+    // The body starts at the eye: feet where the eye was, then let the voxels say where the feet
+    // really belong. A `?goto=` into a tree canopy or into rock is a normal thing to do from a link.
+    player.x = rig.target.x; player.z = rig.target.z;
+    player.y = rig.target.y - BODY.eye;
+    player.vy = 0;
+    walk.placed = 0; walk.embedded = 0;
+    standPlayer();
   } else {
     if (document.pointerLockElement) document.exitPointerLock();
     rig.dist = Math.max(2, Math.min(S.maxZoom, walk.distWas || 40));
@@ -518,7 +571,12 @@ function updateView() {
   const fogWant = S.fog > 0 ? Math.max(320, rig.dist * 1.35) * S.fog : Infinity;
   // A walker has no frame corners to size the skin by - the target is the eye, so the square this
   // maths produces is a point. The view depth from the wheel is what the skin is asked to cover.
-  const want = walk.on ? walkWant(walk.reach, S.fog) : Math.max(frameWant, Math.min(groundWant, fogWant));
+  // A walker sizes the world by view depth, and a walker who is falling or mining downward wants the
+  // depth to reach down with them: the depth below the eye is what a hole in the ground is made of.
+  const want = walk.on
+    ? walkWant(walk.reach, S.fog,
+        (player.vy < -1 || (walk.fly && walkDown(rig.keys)) || player.climbing) ? walk.reach * 0.6 : 0)
+    : Math.max(frameWant, Math.min(groundWant, fogWant));
   const r = skinRadius(rig.dist, want, { min: S.skinFloor, cap: S.skinCap });
   // Grow straight away - a missing ring is a hole in the view. Shrink only once it is clearly
   // wider than needed, so nudging the pitch does not thrash the request ring and re-mesh patches.
@@ -638,7 +696,10 @@ addEventListener('keydown', (e) => {
   // The panel holds inputs; WASD belongs to the camera only while nothing is being typed into.
   if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
   rig.keys.add(e.code);
-  if (e.code === 'KeyR') { rig.target.set(SPAWN[0], SPAWN[1], SPAWN[2]); rig.dist = 40; }
+  if (e.code === 'KeyR') {
+    if (walk.on) { player.x = SPAWN[0]; player.y = SPAWN[1] - BODY.eye; player.z = SPAWN[2]; player.vy = 0; standPlayer(); }
+    else { rig.target.set(SPAWN[0], SPAWN[1], SPAWN[2]); rig.dist = 40; }
+  }
   if (e.code === 'KeyP' && panel) panel.toggle();
   if (e.code === 'KeyF') fitWorld();
   if (e.code === 'KeyX') groups.forEach((g) => g.traverse((o) => { if (o.material) o.material.wireframe = !o.material.wireframe; }));
@@ -646,20 +707,58 @@ addEventListener('keydown', (e) => {
   // Space and the arrows are walk keys here; the page must not scroll out from under them.
   if (walk.on && (e.code === 'Space' || e.code.startsWith('Arrow'))) e.preventDefault();
   if (e.code === 'KeyH') setReadouts(!readouts);   // instruments and the key line, together
-  if (e.code === 'BracketLeft') rig.target.y -= 4;
-  if (e.code === 'BracketRight') rig.target.y += 4;
+  if (e.code === 'BracketLeft') nudgeY(-4);
+  if (e.code === 'BracketRight') nudgeY(4);
 });
 addEventListener('keyup', (e) => rig.keys.delete(e.code));
 
+/** `[` / `]`: four blocks of altitude. In orbit that is the target; in walk mode it is the body, and
+ *  the body then has to be set back down properly rather than dropped into a floor. */
+function nudgeY(dy) {
+  if (walk.on) { player.y += dy; standPlayer(2); }
+  else rig.target.y += dy;
+  updateView(); requestAround();
+}
+
 function stepKeys(dt) {
   if (walk.on) {
-    // shared/walk.mjs owns the arithmetic - yaw plane only, a diagonal is not faster, Space up and
-    // Shift down (Shift is *down* here, not the orbit speed boost), Ctrl sprints - which is where it
-    // is unit-tested. The eye is the target, so moving the target is moving the eye.
-    const s = walkStep({ keys: rig.keys, yaw: rig.yaw, dt, speed: S.walkSpeed, sprint: S.walkSprint });
-    if (s.dx || s.dy || s.dz) {
-      rig.target.x += s.dx; rig.target.z += s.dz; rig.target.y += s.dy;
-      walkStand();
+    // One physics call, one truth: shared/player.mjs owns gravity, collision, jumping, ladders and
+    // swimming, and shared/walk.mjs owns what the keys mean. Space jumps, Ctrl sprints, Shift sneaks
+    // (slower, and it does not fall off a ledge); in water or on a ladder Shift means down instead.
+    const w = walkWish({ keys: rig.keys, yaw: rig.yaw });
+    const x0 = player.x, y0 = player.y, z0 = player.z;
+    const out = simulatePlayer(player, {
+      fx: w.fx, fz: w.fz, jump: walkUp(rig.keys), down: walkDown(rig.keys),
+      sneak: walk.fly ? 0 : walkDown(rig.keys),
+      sprint: walkSprintKey(rig.keys), fly: walk.fly,
+    }, dt, cellAt, {
+      gravity: S.walkGravity, jumpV: S.walkJump, speed: S.walkSpeed, sprintMul: S.walkSprint,
+      sneakMul: S.walkSneak / S.walkSpeed,
+      flyV: S.walkSpeed * 4, flySprint: S.walkSpeed * 4 * S.walkSprint, minY: worldBottomY(),
+    });
+    walk.frozenFrames = out.frozen ? walk.frozenFrames + 1 : 0;
+    if (out.landed) walk.landed = out.landed;
+    // The body's box must never overlap a solid voxel. When it does, the usual cause is boot order: the
+    // page puts the body at the ?goto= height before the bytes for that column have streamed, and the
+    // height it was given is inside the ground. The honest repair is what the tests already assert -
+    // climb out and stand on the floor - done on a slow timer so it cannot thrash, and counted so a
+    // probe can see it happened rather than being handed a body that quietly sits in a rock.
+    if (!walk.fly) {
+      // Until the bytes under the body arrive there is nothing to stand on, so keep asking every frame
+      // rather than integrating blind: the first frame that knows the column puts the feet on its floor.
+      if (!walk.placed && recoverBody()) walk.unstuck++;
+      const embed = playerHits(cellAt, player.x, player.y, player.z);
+      walk.embedded = embed ? walk.embedded + 1 : 0;
+      // Repair a body at rest inside a solid, which is what late bytes around it leave. A body moving fast
+      // is not repaired: that is a fall arriving in a chunk that loaded under it, and the collision in
+      // moveAxis already stops it there - yanking it to a floor mid-fall would be the bug, not the fix.
+      if (embed > 0 && Math.abs(player.vy) < 6 && walk.embedded >= 20 && (walk.embedded - 20) % 30 === 0) {
+        if (recoverBody()) walk.unstuck++;
+      }
+    }
+    syncEye();
+    if (Math.abs(player.x - x0) + Math.abs(player.y - y0) + Math.abs(player.z - z0) > 1e-4 || out.frozen) {
+      updateView(); requestAround();
     }
     return;
   }
@@ -671,6 +770,10 @@ function stepKeys(dt) {
   if (rig.keys.has('KeyE')) rig.target.y += speed;
   if (rig.keys.has('KeyQ')) rig.target.y -= speed;
 }
+
+// Free flight is not a second mover: it is the same simulate() with `fly` set, which skips the cell
+// probes entirely. That is what the mode is for - looking at a mountain from outside it - and it is
+// also why flight never freezes over a chunk that has not streamed, while walking does.
 
 // ---- data ------------------------------------------------------------------
 let assets = null, atlasTex = null, atlasPixels = null, materials = null, shellMat = null,
@@ -2933,13 +3036,15 @@ function frameBody(now) {
   pT = performance.now();
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
-  stepKeys(dt);
-  // A `?view=walk&goto=...` boot asks for the floor before the chunk under the eye has streamed in, so
-  // the first scan answers "no idea" and the eye stays at the literal goto height - in the ground or in
-  // the air - until a key is pressed. Ask again while the answer is unknown. A column that genuinely has
-  // no floor within reach (the walker is over a gorge) keeps answering NaN, and the cost of asking is
-  // ten palette reads a quarter-second.
-  if (walk.on && !Number.isFinite(walkFloorY) && now - walkFloorTry > 250) { walkFloorTry = now; walkStand(); }
+  // A clamped frame time: tabbing back in after a two minute pause must not throw a body through the
+  // floor. The integration itself runs at a fixed substep inside shared/player.mjs.
+  stepKeys(walk.on ? Math.min(dt, walk.fly ? 0.25 : 0.05) : dt);
+  // A body that cannot see its own column waits rather than guesses, and that is worth a line on
+  // screen, because it looks exactly like a stuck game until the bytes arrive.
+  if (walk.on && !walk.fly) {
+    if (walk.frozenFrames > 20) hud.msg.textContent = 'waiting for the world under your feet to load, rather than falling through it';
+    else if (hud.msg.textContent.startsWith('waiting for the world')) hud.msg.textContent = '';
+  }
   updateCamera();
   updateView();
   // If the setting asks for mesh workers and the pool is somehow empty (a failed start, a reset that
@@ -3386,10 +3491,16 @@ window.__world = {
       chunks: store ? store.loaded : 0, inflight: store ? store.inflight : -1,
       queued: store ? store.queue.length : -1, missing: store ? store.missing.size : -1,
       dirty: store ? store.dirty.size : -1, dist: rig.dist, dim: hud.dim.value,
-      // M11: the walking mode, in the readout, because "is the eye really the target?" is the first
+      // M11/M14: the walking body, in the readout, because "is the eye really standing on something,
+      // and is it standing because of a collision or because it is waiting on bytes?" is the first
       // thing a walk measurement has to be able to prove.
-      walkOn: walk.on, walkReach: walk.reach, walkSpeed: S.walkSpeed, walkSprint: S.walkSprint,
-      walkSnap: S.walkSnap, eye: [rig.target.x, rig.target.y, rig.target.z],
+      walkOn: walk.on, walkFly: walk.fly, walkReach: walk.reach, walkSpeed: S.walkSpeed,
+      walkSprint: S.walkSprint, walkGravity: S.walkGravity, walkJump: S.walkJump, walkSneak: S.walkSneak,
+      eye: [rig.target.x, rig.target.y, rig.target.z],
+      feet: +player.y.toFixed(3), onGround: player.onGround ? 1 : 0, vy: +player.vy.toFixed(3),
+      fell: +(player.fell ?? 0).toFixed(2), lastFall: +walk.landed.toFixed(2), frozenFrames: walk.frozenFrames,
+      embeddedFrames: walk.embedded, unstuck: walk.unstuck,
+      floorY: playerFloorTop(cellAt, player.x, player.y, player.z),
       yaw: +rig.yaw.toFixed(4), pitch: +rig.pitch.toFixed(4),
       // [held chunks inside the sharp ring with no mesh, how many of those are queued].
       // `ringStuck[0] > 0 && ringStuck[1] === 0` is the failure, not a slow queue: work that
@@ -3783,19 +3894,45 @@ window.__world = {
   // so no Node test can import it, and a silently missing control is the failure mode of every
   // find-and-replace over the settings list.
   panelKeys: () => (panel ? panel.keys() : []),
-  // M11 walk mode, in the shape a probe needs it: on/off, how far ahead the world is kept, where the
-  // eye actually is, and a way to put the eye somewhere without a keyboard.
+  // M11/M14 walk mode, in the shape a probe needs it: on/off, how far ahead the world is kept, where
+  // the eye actually is, and a way to put the body somewhere without a keyboard.
   walk: (...a) => (a.length ? setWalk(!!a[0]) : walk.on),
+  // Flight is not a second mover, so a probe switches the same flag the panel and ?view=fly set.
+  fly: setFly,
   reach: (...a) => (a.length ? setReach(+a[0]) : walk.reach),
   eye: () => ({ x: rig.target.x, y: rig.target.y, z: rig.target.z, yaw: rig.yaw, pitch: rig.pitch,
-    locked: document.pointerLockElement === canvas, reach: walk.reach,
-    // Scanned on demand. `walkFloorY` is refreshed only when the walker moves, so a step that crossed
-    // into a chunk still streaming left it NaN even though the same column answers a frame later - and
-    // a probe reading a stale NaN is how a working floor scan looks broken.
-    floor: (() => { const s = eyeSolidAt(); return s ? walkFloor(s, rig.target.y) : NaN; })() }),
+    locked: document.pointerLockElement === canvas, reach: walk.reach, fly: walk.fly,
+    // The body's own facts, asked of the voxels on demand rather than remembered from the last frame:
+    // a column that was not held a frame ago answers differently now, and a probe reading a stale
+    // answer is how working collision looks broken.
+    feet: player.y, onGround: player.onGround, frozenFrames: walk.frozenFrames, vy: player.vy,
+    cell: cellAt(Math.floor(player.x), Math.floor(player.y), Math.floor(player.z)),
+    // 0 means the whole 0.6 x 1.8 box is clear of every solid voxel. Anything else says which kind of
+    // cell the body is standing inside, and it is the invariant a walk measurement has to hold.
+    clear: playerHits(cellAt, player.x, player.y, player.z),
+    floor: playerFloorTop(cellAt, player.x, player.y, player.z) }),
+  body: () => ({ x: player.x, y: player.y, z: player.z, vy: player.vy, onGround: player.onGround,
+    frozen: player.frozen, climbing: player.climbing, inWater: player.inWater,
+    // `fell` is how far this body has dropped since it last stood, so it reads 0 the moment it lands.
+    // `lastFall` is the fall it just finished - the number a fall probe has to quote.
+    fell: +(player.fell ?? 0).toFixed(2), lastFall: +walk.landed.toFixed(2),
+    embeddedFrames: walk.embedded, unstuck: walk.unstuck }),
+  stand: (drop = 8) => standPlayer(drop),
+  // Put the body somewhere by its FEET and let go: no snapping to the floor, no guessing. This is how
+  // a fall is measured - from a known height, with vy 0, and then frame by frame.
+  drop: (x, feetY, z) => {
+    if (!walk.on) setWalk(1);
+    player.x = +x; player.y = +feetY; player.z = +z;
+    player.vy = 0; player.onGround = 0; player.frozen = 0; player.fell = 0;
+    walk.embedded = 0; walk.placed = 1;
+    syncEye(); updateCamera(); updateView(); requestAround();
+    return [player.x, player.y, player.z];
+  },
   walkTo: (x, y, z) => {
-    rig.target.set(+x, +y, +z);
-    if (walk.on) walkStand();
+    if (walk.on) {
+      player.x = +x; player.z = +z; player.y = +y - BODY.eye; player.vy = 0;
+      standPlayer();
+    } else rig.target.set(+x, +y, +z);
     updateCamera(); updateView(); requestAround();
     return [rig.target.x, rig.target.y, rig.target.z];
   },
@@ -3808,6 +3945,7 @@ window.__world = {
   presetKeys: () => Object.fromEntries(Object.entries(PRESETS).map(([k, p]) => [k, Object.keys(p.s)])),
   set: (k, v) => {
     if (k === 'dist') { rig.dist = Math.max(2, Math.min(S.maxZoom, +v)); updateView(); requestAround(); return rig.dist; }
+    if (k === 'walk' || k === 'walkfly') { if (panel) panel.set(k === 'walk' ? 'walk' : 'wfly', v); return walk.on; }
     const key = { far: 'skinCap', detail: 'radius', world: 'dim' }[k] ?? k;
     return panel ? panel.set(key, v) : undefined;
   },
@@ -4077,12 +4215,13 @@ function buildPanel() {
         get: () => currentDim(), set: (v) => switchDim(v) },
       { key: 'walk', label: 'walk around (V)', kind: 'check', live: false,
         fmt: (v) => (v ? `on - ${Math.round(walk.reach)} m` : 'off - orbit'),
-        hint: `First person: the eye goes to head height at the place you were looking at, WASD walks,
-Space up and Shift down, held Ctrl sprints. The wheel stops meaning zoom and starts meaning how much
-world stays drawn ahead of you. Click the picture to look with the mouse (Escape gives the cursor
-back) - or drag, which has always worked. Nothing is faked for this mode: the block-by-block ring, the
-far grid's tier and the baked world all follow the eye instead of the orbit point, which is what
-looking out over a valley costs. URL: ?view=walk, ?reach=`,
+        hint: `You walk in a body: 0.6 blocks wide, 1.8 tall, eye at 1.62, with weight and voxel
+collision - a jump that clears one block, and a step that climbs a stair but not a fence. WASD walks,
+Space jumps, held Ctrl sprints, Shift sneaks (down, and off a ledge). The wheel stops meaning zoom and
+starts meaning how much world stays drawn ahead of you. Click the picture to look with the mouse
+(Escape gives the cursor back) - or drag, which has always worked. Nothing is faked for this mode: the
+block-by-block ring, the far grid's tier and the baked world all follow the eye instead of the orbit
+point, which is what looking out over a valley costs. URL: ?view=walk, ?view=fly, ?reach=`,
         get: () => !!walk.on, set: (v) => setWalk(v) },
       { key: 'reach', label: 'walk view depth', min: 96, max: 1600, step: 32, live: false,
         fmt: (v) => `${v | 0} m`,
@@ -4151,19 +4290,31 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         ? 'the wheel is how much world stays drawn ahead - click the picture to look with the mouse'
         : 'zoom with the mouse wheel - drag on empty sky to look around') },
       { kind: 'section', key: 'sec_walk', label: 'walking', open: false,
-        hint: 'The first-person rig: how fast the eye moves, whether it stands on the ground, and how\nfar ahead the world is kept drawn.' },
-      { key: 'wspeed', label: 'walk speed', min: 2, max: 60, step: 1, live: false,
-        fmt: (v) => `${v | 0} blocks/s`,
-        hint: 'In-game a player walks about 4.3 blocks/s and sprints about 5.6. This eye has no\ncollision and no gravity, so the default is faster than the game on purpose: 14 crosses a chunk in a\nlittle over a second, which keeps the streaming and the meshing in the cheap close-pan case the viewer\nis already good at. Set it to 4 to walk at game speed. URL: ?wspeed=',
-        get: () => S.walkSpeed, set: (v) => { S.walkSpeed = Math.max(1, +v); } },
-      { key: 'wsprint', label: 'sprint multiplier (Ctrl)', min: 1, max: 6, step: 0.2, live: false,
-        fmt: (v) => `${(+v).toFixed(1)}x`,
-        hint: 'Held Ctrl multiplies walk speed. Shift is the down key, the way it is in the game.\nURL: ?wsprint=',
+        hint: 'The body you walk in: how fast it moves, how heavy it is, and what it collides with.' },
+      { key: 'wspeed', label: 'walk speed', min: 1, max: 24, step: 0.1, live: false,
+        fmt: (v) => `${(+v).toFixed(1)} blocks/s`,
+        hint: 'A player in the game walks 4.317 blocks/s and sprints 5.613, and that is the default.\nAbove about that a 0.6 block wide body stops feeling like it is walking. URL: ?wspeed=',
+        get: () => S.walkSpeed, set: (v) => { S.walkSpeed = Math.max(0.5, +v); } },
+      { key: 'wsprint', label: 'sprint multiplier (Ctrl)', min: 1, max: 3, step: 0.05, live: false,
+        fmt: (v) => `${(+v).toFixed(2)}x`,
+        hint: 'Held Ctrl. The game sprints at 5.613 / 4.317 = 1.30x. URL: ?wsprint=',
         get: () => S.walkSprint, set: (v) => { S.walkSprint = Math.max(1, +v); } },
-      { key: 'wsnap', label: 'stand on the ground', kind: 'check', live: false,
-        fmt: (v) => (v ? 'eye on the floor' : 'free flight'),
-        hint: 'A nudge, not a physics engine: if the surface under the eye is within 2.4 blocks, the\neye is put on it. If it is further - flying, swimming, or already deep in a mine - the eye stays where\nyou left it, because a rule that teleports you out of the tunnel you walked into is worse than no\nrule. URL: ?nosnap',
-        get: () => !!S.walkSnap, set: (v) => { S.walkSnap = v ? 1 : 0; if (walk.on) walkStand(); } },
+      { key: 'wgravity', label: 'gravity', min: 0, max: 64, step: 1, live: false,
+        fmt: (v) => `${v | 0} b/s\u00b2`,
+        hint: 'The game falls at 0.08 blocks per tick per tick = 32 blocks/s\u00b2, which is the default.\nZero means you hover: no jump arc, no fall, and a floor stops meaning much. URL: ?gravity=',
+        get: () => S.walkGravity, set: (v) => { S.walkGravity = Math.max(0, +v); } },
+      { key: 'wjump', label: 'jump', min: 0, max: 16, step: 0.2, live: false,
+        fmt: (v) => `${(+v).toFixed(1)} b/s up`,
+        hint: 'Space. The game leaves the ground at 8.4 blocks/s, which with gravity 32 clears 1.25\nblocks - exactly one block of step, which is why a player can climb a stair and not a fence. URL: ?jump=',
+        get: () => S.walkJump, set: (v) => { S.walkJump = Math.max(0, +v); } },
+      { key: 'wsneak', label: 'sneak speed (Shift)', min: 0.2, max: 4.317, step: 0.05, live: false,
+        fmt: (v) => `${(+v).toFixed(2)} blocks/s`,
+        hint: 'Shift on foot: you crawl, and the body will not walk off the edge of a block. In the game\nthat is 1.3 blocks/s. In water, on a ladder or in flight, Shift means down instead. URL: ?wsneak=',
+        get: () => S.walkSneak, set: (v) => { S.walkSneak = Math.max(0.2, +v); } },
+      { key: 'wfly', label: 'free flight', kind: 'check', live: false,
+        fmt: (v) => (v ? 'no gravity, no walls' : 'weight and collision'),
+        hint: 'The same mover with the collision probes off: gravity is still there, walls are not. Good\nfor looking at a mountain from above without climbing it, and what ?view=fly / ?noclip start in.\nComing back out of flight lets the voxels place the body again. URL: ?view=fly',
+        get: () => !!S.walkFly, set: (v) => setFly(v) },
       { key: 'wlook', label: 'mouse-look speed', min: 0.0005, max: 0.01, step: 0.0005, live: false,
         fmt: (v) => `${(+v).toFixed(4)} rad/px`,
         hint: 'Click-to-lock mouse-look only; a drag has always been 0.006 rad/px and still is.\nURL: ?look=',

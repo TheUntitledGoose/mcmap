@@ -10,6 +10,9 @@
 //   5. did the work FINISH (settle), or only move elsewhere?
 // Frame cost comes from __world.profTotals() raw sums, so per-frame numbers are derived from measured
 // totals rather than from differencing rounded means.
+// SUPERSEDED by M14 (see HANDOFF `### M14`): this probed the M11 walking *camera*, which had no gravity,
+// no collision and no jump. `build/q_body.js` and `build/q_bodycave.js` are the body probes now, and their
+// expectations are Node-derived. Kept because HANDOFF `### M11` quotes the numbers this file produced.
 const w = window.__world;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const KEYS = ['view', 'mesh', 'refill', 'shell', 'ov', 'demote', 'count', 'render'];

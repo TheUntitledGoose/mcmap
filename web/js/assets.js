@@ -13,6 +13,7 @@
 // into the page, which is what lets the atlas be repacked without touching geometry.
 
 import { CANON_RING, decodeFaceCode, classifyStates } from '../../shared/cube-path.mjs';
+import { collisionTable, stateFootprints, stateHeights, C_FULL } from '../../shared/player.mjs';
 
 export const GEO_MAGIC = 'DVGEO12 ';
 
@@ -60,7 +61,41 @@ export class Assets {
     this.stateCube = cls.cube;
     this.stateOpaque = cls.opaque;
     this.stateFilm = cls.film;
+
+    // What stops a walking body, and how far up inside its cell it reaches. The save stores no
+    // collision boxes, so the heights come from the baked quads themselves: a half slab's geometry tops
+    // out at 8 model units of 16 and is steppable, a cube's at 16 and is not. This table is the only
+    // collision authority for the player physics - see shared/player.mjs.
+    const unitsOfPos = this.posScale / 16;          // pos units per model unit (16 model units = 1 block)
+    const geomsOf = (s) => {
+      if (!s.g) return [];
+      const out = [];
+      for (const arm of s.g) for (const qi of arm) out.push(this.ref[qi * 2]);
+      return out;
+    };
+    const maxYOf = (gi) => {
+      const b = gi * 12;
+      let m = 0;
+      for (let k = 1; k < 12; k += 3) if (this.pos[b + k] > m) m = this.pos[b + k];
+      return m / unitsOfPos;
+    };
+    // A quad lies flat when all four of its corners sit at one height. That single test separates
+    // "has a top you can stand on" (cube, slab, fence post) from "is a plant" (crossed vertical quads),
+    // without a per-mod list of which names are plants.
+    const horizOf = (gi) => {
+      const b = gi * 12;
+      let lo = this.pos[b + 1], hi = lo;
+      for (let k = 4; k < 12; k += 3) { const v = this.pos[b + k]; if (v < lo) lo = v; else if (v > hi) hi = v; }
+      return hi === lo;
+    };
+    this.stateHeight = stateHeights(this.states, geomsOf, maxYOf, 16);
+    this.stateFoot = stateFootprints(this.states, geomsOf, horizOf);
+    this.stateCollision = collisionTable(this.states, this.stateAir, this.stateFilm, this.stateHeight,
+      this.stateFoot);
   }
+
+  /** Collision byte for a 1-based global state id; 0 is "the table does not know this state". */
+  collisionOf(id) { return id === 0 ? C_FULL : this.stateCollision[id - 1]; }
 
   /** State index for a chunk palette key; -1 when the state was never baked. */
   indexOf(key) { return this.stateIndex.get(key) ?? -1; }

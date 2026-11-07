@@ -35,6 +35,28 @@ export function look({ yaw = 0, pitch = 0, dx = 0, dy = 0, sens = 0.0025, invert
 export const sprinting = (keys) => keys.has('ControlLeft') || keys.has('ControlRight');
 
 /**
+ * The wish direction for one frame, in the yaw plane, normalised: a diagonal is not faster than a
+ * straight line. The physics body (shared/player.mjs) takes this as `fx`/`fz`; the old free-flight
+ * `step()` below is the same numbers times a speed and a dt.
+ */
+export function wish({ keys = [], yaw = 0 } = {}) {
+  const s = Math.sin(yaw), c = Math.cos(yaw);
+  let fx = 0, fz = 0;
+  if (keys.has('KeyW') || keys.has('ArrowUp')) { fx += s; fz += c; }
+  if (keys.has('KeyS') || keys.has('ArrowDown')) { fx -= s; fz -= c; }
+  // rightOf() is (-cos yaw, sin yaw), the same basis __world.axes measures the screen with
+  if (keys.has('KeyD') || keys.has('ArrowRight')) { fx -= c; fz += s; }
+  if (keys.has('KeyA') || keys.has('ArrowLeft')) { fx += c; fz -= s; }
+  const h = Math.hypot(fx, fz);
+  return h > 0 ? { fx: fx / h, fz: fz / h, moving: 1 } : { fx: 0, fz: 0, moving: 0 };
+}
+
+/** Is Shift held? On the ground that is sneak, in the air it is descend. */
+export const descending = (keys) => keys.has('ShiftLeft') || keys.has('ShiftRight');
+/** Space: jump on foot, up in flight, up a ladder, up through water. */
+export const rising = (keys) => keys.has('Space');
+
+/**
  * One frame of walking. Returns the offset to add to the anchor, in blocks.
  *
  * Horizontal movement is in the yaw plane only - pitch does not tilt the walk, or looking up would
@@ -43,13 +65,7 @@ export const sprinting = (keys) => keys.has('ControlLeft') || keys.has('ControlR
  */
 export function step({ keys = [], yaw = 0, dt = 0, speed = 14, sprint = 2.6, vertical = true } = {}) {
   const v = speed * (sprinting(keys) ? sprint : 1) * dt;
-  const s = Math.sin(yaw), c = Math.cos(yaw);
-  let fx = 0, fz = 0;
-  if (keys.has('KeyW') || keys.has('ArrowUp')) { fx += s; fz += c; }
-  if (keys.has('KeyS') || keys.has('ArrowDown')) { fx -= s; fz -= c; }
-  // rightOf() is (-cos yaw, sin yaw), the same basis __world.axes measures the screen with
-  if (keys.has('KeyD') || keys.has('ArrowRight')) { fx -= c; fz += s; }
-  if (keys.has('KeyA') || keys.has('ArrowLeft')) { fx += c; fz -= s; }
+  const { fx, fz } = wish({ keys, yaw });
   const h = Math.hypot(fx, fz);
   let dy = 0;
   if (vertical) {
@@ -72,10 +88,16 @@ export function wheelReach(reach, deltaY = 0, { min = REACH_MIN, max = REACH_MAX
  * How much world the skin is asked for while walking. An orbit sizes that from the frame's corners at
  * the orbit target; with the eye on the target the frame is a point, so the reach is the answer -
  * shortened only when fog is on, because fog past the skin edge is the thing it is there to hide.
+ *
+ * `descend` is how far below the eye the body is going or likely to go: a walker who is falling, or
+ * flying down, or climbing a ladder, is about to need the world under them, and asking for it a second
+ * later is what makes a dive outrun the bytes. The ring is square, so reaching down also reaches up -
+ * the cost is real and bounded by the skin cap.
  */
-export function walkWant(reach, fog = 0) {
+export function walkWant(reach, fog = 0, descend = 0) {
   const r = Number.isFinite(reach) ? Math.max(0, reach) : 0;
-  return fog > 0 ? Math.min(r, Math.max(320, r * 1.35) * fog) : r;
+  const need = r + (Number.isFinite(descend) ? Math.max(0, descend) : 0);
+  return fog > 0 ? Math.min(need, Math.max(320, need * 1.35) * fog) : need;
 }
 
 /**
