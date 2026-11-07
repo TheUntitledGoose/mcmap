@@ -209,6 +209,10 @@ const S = {
   // motionless for a month and then blur; an event-driven one builds at a rate the eye can read.
   timeCls: Math.max(0, Math.min(7, num('timecls', 2))),             // 0 = any change, 2 = block place
   timeLimit: Math.max(0, num('timelimit', 0)),                      // 0 = draw every row of the filter
+  // The settings panel's own width in CSS pixels, because a panel that hides its own numbers behind
+  // an ellipsis is a bug you can now resize: drag the panel's left edge, or set this. The value
+  // column is what needs the room - the time machine prints a date stamp there. URL: ?panelw=440
+  panelW: Math.max(360, Math.min(760, num('panelw', 396))),
   // 9.6's two rules together, for A/B: skip a mesh whose payload and known border already answer it,
   // and hold a chunk while a neighbour is still in flight. 0 = mesh on every dirty mark (?meshkey=0).
   meshKey: num('meshkey', 1) ? 1 : 0,
@@ -4756,6 +4760,7 @@ window.__world = {
   // so no Node test can import it, and a silently missing control is the failure mode of every
   // find-and-replace over the settings list.
   panelKeys: () => (panel ? panel.keys() : []),
+  panelWidth: () => (panel ? panel.widthPx() : 0),
   // M11/M14 walk mode, in the shape a probe needs it: on/off, how far ahead the world is kept, where
   // the eye actually is, and a way to put the body somewhere without a keyboard.
   walk: (...a) => (a.length ? setWalk(!!a[0]) : walk.on),
@@ -5221,7 +5226,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         fmt: () => (S.time ? `on - ${(TLAYER.drawn ?? 0).toLocaleString()} / ${(TLAYER.quads || 0).toLocaleString()}` : 'off'),
         get: () => !!S.time, set: (v) => setTime(v),
         hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one decal per\nlogged change that has happened by the playhead. Costs one 4.7 MB request per dimension\n(/ledger/timeline) and one mesh; moving the playhead is a draw range, not a rebuild, so two years of\nhistory play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole dimension,\n35 ms for one player. M. URL: ?time=1' },
-      { key: 'timeAt', label: 'playhead', min: 0, max: 1000, step: 1, live: false,
+      { key: 'timeAt', label: 'playhead', min: 0, max: 1000, step: 1, live: false, valw: 132,
         get: () => timePermille(), set: (v) => timeSeekRow(timeRowAt(+v)),
         fmt: () => (TLAYER.tl ? timeStamp(playhead(TLAYER.tl, TLAYER.sec).ms) : '-'),
         hint: 'Permille of THIS FILTER\'s rows drawn, oldest first - deliberately not a date slider, because a\ndate slider shows nothing at all across the 60% of days with no logged change. The value column is the\nwall clock at the playhead. Drag to scrub, K to play. URL: ?timeat=<seconds since the first row>' },
@@ -5379,8 +5384,13 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
       { key: 'invert', label: 'invert orbit drag', kind: 'check',
         hint: 'Off (default) is mouse-look: drag right and the view turns right. On grabs the world and\nspins it with the cursor, like right-drag pan. URL: ?invert',
         get: () => S.invert, set: (v) => { S.invert = v; } },
+      { key: 'panelW', label: 'panel width', min: 360, max: 760, step: 2,
+        fmt: (v) => `${v} px`,
+        hint: 'How wide this panel is, in CSS pixels. Drag its left edge for the same thing. The value\ncolumn is what needs the room: the time machine prints a date and a row count there, and a\nvalue too long for the column comes back as an ellipsis. URL: ?panelw=440',
+        get: () => S.panelW, set: (v) => { S.panelW = Math.max(360, Math.min(760, Math.round(+v || 396))); } },
   ];
   panel = mountPanel({ title: 'settings  (P)', items,
+    width: { min: 360, max: 760, get: () => S.panelW, set: (v) => panel.set('panelW', v) },
     actions: [
       { label: 'whole world', run: () => preset('whole world'),
         hint: 'the whole save in the frame, at the coarsest far setting that still holds shape:\nbaked far tiles on, live far grid capped, the close ring kept' },

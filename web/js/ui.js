@@ -23,9 +23,12 @@ const el = (tag, cls, text) => {
  *           next section. Sections exist so the six settings people actually use are not buried
  *           under twenty that only matter for tuning the renderer.
  *   actions [{ label, run, hint }]
+ *   width   { get, set, min, max } - the panel's own width in px, when the page wants it remembered.
+ *           Dragging the left edge changes it live and commits on release; the page's value is applied
+ *           on every refresh, so a stored or URL-seeded width lands on boot.
  * @returns {{ refresh: () => void, busy: () => boolean, toggle: (on?: boolean) => void, set: (key, v) => void }}
  */
-export function mountPanel({ title = 'settings', items = [], actions = [] } = {}) {
+export function mountPanel({ title = 'settings', items = [], actions = [], width = null } = {}) {
   const root = el('div', 'panel');
   const head = el('div', 'panel-head');
   head.append(el('span', 'panel-title', title));
@@ -76,6 +79,9 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
     }
 
     const row = el('label', `panel-row panel-${it.kind ?? 'range'}`);
+    // One row can ask for a wider value column than the rest. The time machine prints a date stamp and
+    // a row count in the same column, and the ellipsis is not an acceptable answer for a timestamp.
+    if (it.valw) row.style.gridTemplateColumns = `var(--panel-labw) 1fr ${it.valw}px`;
     const lab = el('span', 'panel-label', it.label);
     if (it.hint) lab.title = it.hint;
     const out = el('b', 'panel-val');
@@ -130,6 +136,7 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
   }
 
   const refresh = () => {
+    if (width && !drag) applyW(+width.get());
     for (const n of notes) { const t = noteText(n.it); if (n.node.textContent !== t) n.node.textContent = t; }
     for (const { it, input, out, fmt, max, stops } of rows.values()) {      const v = it.get();
       if (it.kind === 'check') {
@@ -160,6 +167,43 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
   window.addEventListener('pointercancel', () => { busy = false; });
   window.addEventListener('blur', () => { busy = false; });
 
+  // The panel's own width. A strip down the left edge drags it; the number belongs to the page, so it
+  // is remembered, URL-seedable and probeable like every other setting, and a drag commits on release
+  // instead of writing a store entry per pointermove.
+  const wmin = width?.min ?? 300, wmax = width?.max ?? 760;
+  const clampW = (v) => Math.max(wmin, Math.min(wmax, Math.round(+v || wmin)));
+  const applyW = (v) => { root.style.setProperty('--panelw', `${clampW(v)}px`); };
+  let drag = null;
+  if (width) {
+    const grip = el('div', 'panel-grip');
+    grip.title = 'drag to resize the panel (or use the panel width row)';
+    root.append(grip);
+    grip.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      // Capture so a fast drag that leaves the strip keeps working. A synthetic pointer (a probe) has
+      // no active pointer to capture, and the browser says so - which must not cost the drag.
+      try { grip.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
+      grip.classList.add('dragging');
+      drag = { x: e.clientX, w: clampW(width.get()), moved: false };
+      applyW(drag.w);
+    });
+    grip.addEventListener('pointermove', (e) => {
+      if (!drag) return;
+      // The panel is anchored to the right edge of the window, so pulling left is what widens it.
+      const w = clampW(drag.w + (drag.x - e.clientX));
+      if (w !== drag.w) { drag.w = w; drag.moved = true; }
+      applyW(w);
+    });
+    const end = () => {
+      if (!drag) return;
+      grip.classList.remove('dragging');
+      if (drag.moved) width.set(drag.w);
+      drag = null;
+    };
+    grip.addEventListener('pointerup', end);
+    grip.addEventListener('pointercancel', end);
+  }
+
   refresh();
 
   const setOpen = (on) => {
@@ -173,6 +217,7 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
   return {
     refresh,
     keys: () => [...rows.keys()],
+    widthPx: () => Math.round(root.getBoundingClientRect().width),
     busy: () => busy,
     toggle: (on) => setOpen(on === undefined ? root.classList.contains('collapsed') : !!on),
     set: (key, v) => {
