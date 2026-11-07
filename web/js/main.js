@@ -4309,12 +4309,16 @@ function histEditsOf(cx, cz) {
     hit.gen = HIST.gen;
     return hit;
   }
-  let e = { gen: HIST.gen, stamp, edits: EMPTY_EDITS, unknown: 0, truncated: 0 };
+  let e = { gen: HIST.gen, stamp, edits: EMPTY_EDITS, unknown: 0, truncated: 0, changes: 0 };
   if (HIST.on && HIST.ids && stamp) {
     const ci = HIST.cellsAt.get(k);
     const rows = ci === undefined ? null : HIST.byCell.get(ci) ?? null;
     const got = editsForCell(TLAYER.tl, rows, HIST.sec, (nm) => HIST.ids.get(nm) ?? 0, S.timeTerrainLimit);
-    e = { gen: HIST.gen, stamp, edits: got.edits, unknown: got.unknown, truncated: got.truncated };
+    // `changes` is kept because the block-change class is invisible in the edit list: a path being put
+    // back to grass looks exactly like a block being un-placed. Counting it is what makes the class,
+    // and its cost, a number rather than an impression.
+    e = { gen: HIST.gen, stamp, edits: got.edits, unknown: got.unknown, truncated: got.truncated,
+      changes: got.changeRows };
     if (got.truncated) HIST.err = 'a chunk needed more than ' + S.timeTerrainLimit
       + ' voxel writes to reach that moment; the rest of it still shows today';
   }
@@ -4434,15 +4438,15 @@ function histSync(force = false) {
  * would report zero blocks undone for a scrub that was about to undo thousands.
  */
 function histTotals() {
-  let chunks = 0, edits = 0, unknown = 0, truncated = 0, truncChunks = 0;
+  let chunks = 0, edits = 0, unknown = 0, truncated = 0, truncChunks = 0, changes = 0;
   for (const e of HIST.marks.values()) {
     if (e.gen !== HIST.gen || !e.edits.length) continue;
-    chunks++; edits += e.edits.length >> 1; unknown += e.unknown;
+    chunks++; edits += e.edits.length >> 1; unknown += e.unknown; changes += e.changes || 0;
     // `truncated` counts VOXELS the per-chunk cap left showing today (an undo is one edit per voxel, so a
     // row count would overstate it); truncChunks says how many chunks hit the cap.
     if (e.truncated) { truncated += e.truncated; truncChunks++; }
   }
-  return { chunks, edits, unknown, truncated, truncChunks };
+  return { chunks, edits, unknown, truncated, truncChunks, changes };
 }
 
 /** What the terrain time machine costs and claims, in one object a probe can diff. */
@@ -4464,7 +4468,8 @@ function histNote() {
   return 'the blocks in view are as they were: '
     + `${t.chunks.toLocaleString()} chunk${t.chunks === 1 ? '' : 's'} re-cut, `
     + `${t.edits.toLocaleString()} block${t.edits === 1 ? '' : 's'} undone, `
-    + `${t.unknown.toLocaleString()} row${t.unknown === 1 ? '' : 's'} naming nothing the atlas can draw`
+    + `${t.changes.toLocaleString()} of them a logged block change (a path back to grass, a stripped log)`
+    + `, ${t.unknown.toLocaleString()} row${t.unknown === 1 ? '' : 's'} naming nothing the atlas can draw`
     + (t.truncated ? ` (${t.truncated.toLocaleString()} voxel${t.truncated === 1 ? '' : 's'} in ${t.truncChunks}`
       + ` chunk${t.truncChunks === 1 ? '' : 's'} still showing today, past the per-chunk cap)` : '')
     + ` - ${HIST.marked.toLocaleString()} chunk${HIST.marked === 1 ? '' : 's'} marked, `

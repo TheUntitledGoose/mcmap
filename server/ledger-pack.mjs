@@ -75,14 +75,13 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
   tl.sort((a, b) => (a[0] - b[0]) || (a[2] - b[2]));
 
   const dimKeyBuf = Buffer.from(dimKey, 'utf8');
-  // Name table for the timeline. A row names the block it is about: for a break that is the block that
-  // left (old_object_id), for everything else the object the action is attached to. Interning per
-  // dimension is what keeps the column a u16: the log knows 22,341 objects, this one uses a fraction.
+  // Name table for the timeline, holding BOTH blocks a row knows about: the one the action is about and
+  // the one that stood there before it (the ledger's old_object_id). For a break those are the same
+  // string and intern to the same slot. Interning per dimension is what keeps each column a u16: the
+  // log knows 22,341 objects, this one uses a fraction.
   const nameIdx = new Map();          // object id string -> 1-based slot
   const nameList = [];
-  const blockNameOf = (i) => {
-    const aid = L.actionId(i);
-    const key = aid === 3 ? L.oldObjectId(i) : L.objectId(i);
+  const intern = (key) => {
     const s = key ? L.objects.get(key)?.id ?? '' : '';
     if (!s) return 0;
     let n = nameIdx.get(s);
@@ -93,10 +92,16 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
     }
     return n;
   };
+  const blockNameOf = (i) => intern(L.actionId(i) === 3 ? L.oldObjectId(i) : L.objectId(i));
+  const wasNameOf = (i) => intern(L.oldObjectId(i));
   // Intern before allocating: the name table's byte size is part of the buffer size and of the header,
   // so it has to be finished before a single row is written.
   const tlName = new Uint16Array(tl.length);
-  for (let k = 0; k < tl.length; k++) tlName[k] = blockNameOf(tl[k][2]);
+  const tlWas = new Uint16Array(tl.length);
+  for (let k = 0; k < tl.length; k++) {
+    tlName[k] = blockNameOf(tl[k][2]);
+    tlWas[k] = wasNameOf(tl[k][2]);
+  }
   const nameBufs = nameList.map((s) => Buffer.from(s, 'utf8'));
   let namesBytes = 0;
   for (const b of nameBufs) namesBytes += b.length + 2;
@@ -177,6 +182,7 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
       dv.setUint8(p + 9, pid ? pid - 1 : TL_NO_PLAYER, true);
       dv.setUint32(p + 10, sec - (tMin === Infinity ? 0 : tMin), true);
       dv.setUint16(p + 14, tlName[k], true);
+      dv.setUint16(p + 16, tlWas[k], true);
       p += TL_REC;
     }
   }

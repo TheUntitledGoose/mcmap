@@ -28,8 +28,9 @@ import { tlX, tlY, tlZ } from '../../shared/ledger-pack.mjs';
 
 // Action classes as the timeline stores them (`aid - 1`, 6 = an id outside the six).
 export const TL_ACT_OTHER = 6;
-export const isBreak = (actionByte) => actionByte === 2;    // aid 3
-export const isPlace = (actionByte) => actionByte === 1;    // aid 2
+export const isBreak = (actionByte) => actionByte === 2;    // aid 3  block-break
+export const isPlace = (actionByte) => actionByte === 1;    // aid 2  block-place
+export const isChange = (actionByte) => actionByte === 0;   // aid 1  block-change
 
 /**
  * Group a filtered row set by chunk cell, keeping time order.
@@ -74,11 +75,28 @@ export const rowsAfterCount = (tl, rows, sec) => rows.length - firstAfter(tl, ro
  * The question is not "which rows are newer than the playhead" - it is "what stood in that voxel AT the
  * playhead", and that is whatever the LAST row not newer than it left behind:
  *
- *   last row <= playhead is a place -> the block that row put there
- *   last row <= playhead is a break -> air, the block was gone by then
- *   no row <= playhead at all       -> the log never saw it before the playhead, so fall back on the
- *                                      OLDEST row: a place means "not yet placed" (that is what lets a base
- *                                      un-build itself), a break means "it was standing, and got broken".
+ * A row carries both halves of what it did, and the playhead asks for one of them:
+ *
+ *   at or BEHIND a row   -> the AFTER block: a place's block, a change's new block, air for a break
+ *   read BACK past a row -> the BEFORE block: a break's removed block, a change's old block, and for a
+ *                           place whatever it covered
+ *
+ * Reading backwards is what un-builds a world, and reading forwards is what builds it back. In this save
+ * the two columns turn out to be worth very different amounts, which is worth writing down because it
+ * decides what a future timeline version should carry:
+ *
+ *   block-break   (202,826 rows) before == the block that left, which is what `name` already holds
+ *   block-place    (90,045 rows) before is minecraft:air for EVERY one of them - the log never records
+ *                                what a placement covered, so an un-build cannot reveal ground it never
+ *                                saw. A torch placed on generated dirt un-builds to air.
+ *   block-change   (36,787 rows) before differs from after in 36,676 of them (99.7%), and the top pair
+ *                                is grass_block -> dirt (35,581 rows: tilling, paths, trampling). So
+ *                                modelling this class is the whole gain of the second column: scrub back
+ *                                over a path and the grass it was cut from comes back.
+ *
+ * Only voxels with at least one row NEWER than the playhead get an edit: if nothing in the log after that
+ * moment touched the voxel, what the payload says is already what stood there. One edit per voxel - a chunk
+ * whose 4,254 rows fall on 8,501 voxels costs 8,501 edits, not 4,254 writes in sequence.
  *
  * Only voxels with at least one row NEWER than the playhead get an edit: if nothing in the log after that
  * moment touched the voxel, what the payload says is already what stood there. One edit per voxel - a chunk
@@ -93,7 +111,10 @@ export const rowsAfterCount = (tl, rows, sec) => rows.length - firstAfter(tl, ro
  */
 export function editsForCell(tl, rows, sec, stateIdFor, limit = 0) {
   const start = firstAfter(tl, rows, sec);
-  const none = { edits: new Int32Array(0), breakRows: 0, placeRows: 0, otherRows: 0, unknown: 0, truncated: 0 };
+  const none = {
+    edits: new Int32Array(0), breakRows: 0, placeRows: 0, changeRows: 0, otherRows: 0, unknown: 0,
+    truncated: 0,
+  };
   if (start === rows.length) return none;
   // The rows ascend, so one pass over the cell's rows gives three facts per voxel: the newest row at or
   // behind the playhead, the oldest row that ever touched it, and whether anything happens after the
@@ -106,34 +127,36 @@ export function editsForCell(tl, rows, sec, stateIdFor, limit = 0) {
     if (!first.has(c)) first.set(c, r);
     if (k < start) behind.set(c, r); else newer.add(c);
   }
-  let breakRows = 0, placeRows = 0, otherRows = 0, unknown = 0, truncated = 0;
+  let breakRows = 0, placeRows = 0, changeRows = 0, otherRows = 0, unknown = 0, truncated = 0;
   const edits = new Int32Array(newer.size * 2);
   let w = 0;
   for (const c of newer) {
     const back = behind.get(c);
     const use = back === undefined ? first.get(c) : back;
+    const atOrBehind = back !== undefined;
     const act = tl.action[use];
     if (isBreak(act)) breakRows++;
     else if (isPlace(act)) placeRows++;
-    else { otherRows++; continue; }
-    // Which side of that row is the playhead on? A place's record names what it left standing, so a place
-    // at/behind the playhead is a block that WAS there and a place after it is a block that was NOT. A
-    // break's record names what it removed, so it is the mirror image.
-    const wantName = back === undefined ? isBreak(act) : isPlace(act);
-    if (!wantName) { edits[w++] = c; edits[w++] = 0; }
-    else {
-      // A block that stood at the playhead but whose name the log does not give: leave the payload alone
-      // rather than guess, and count it.
-      const id = stateIdFor(tl.nameOf(use));
-      if (!id) { unknown++; continue; }
-      edits[w++] = c; edits[w++] = id;
-    }
+    else if (isChange(act)) changeRows++;
+    else { otherRows++; continue; }        // an item, a kill: no claim on a voxel
+    // AFTER is what the row left standing (air for a break, since a break's record names what left);
+    // BEFORE is what it replaced, which for a break is again the block it removed, and for a place or a
+    // change is the row's second name column. A pre-v3 slice has no second column, so reading backwards
+    // over a place or a change knows nothing and leaves the payload alone.
+    const name = atOrBehind
+      ? (isBreak(act) ? '' : tl.nameOf(use))
+      : (isBreak(act) ? tl.nameOf(use) : (tl.wasOf ? tl.wasOf(use) : ''));
+    const id = stateIdFor(name);
+    if (id) { edits[w++] = c; edits[w++] = id; }
+    else if (atOrBehind && isBreak(act)) { edits[w++] = c; edits[w++] = 0; }        // a break leaves air
+    else if (!atOrBehind && isPlace(act)) { edits[w++] = c; edits[w++] = 0; }       // it had not arrived
+    else unknown++;      // the log names a block the atlas does not model, or knows nothing
     if (limit && w / 2 >= limit) { truncated = 1; break; }
   }
   // "Bounded" is a number a note can print, not a flag: say how many of the voxels it needed to touch were
   // left showing today.
   if (truncated) truncated = newer.size - w / 2;
-  return { edits: edits.subarray(0, w), breakRows, placeRows, otherRows, unknown, truncated };
+  return { edits: edits.subarray(0, w), breakRows, placeRows, changeRows, otherRows, unknown, truncated };
 }
 
 

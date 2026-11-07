@@ -62,15 +62,31 @@ export const MAX_PLAYERS_IN_MASK = 32;
 
 // --- the timeline section (version 3) -------------------------------------------------------------
 export const TL_MAGIC = 'LEDTL1  ';
-export const TL_VERSION = 2;
+export const TL_VERSION = 3;
 export const TL_HEADER = 36;         // magic, version, count, timeBase, span, dimKeyLen, nameCount, namesBytes
-export const TL_REC = 16;            // + u16 name index (1-based into the section's own name table)
-// Version 1 is still readable. It has no name table and a 14 B record, and it cannot answer "what
-// block was here", which is the whole question the terrain time machine asks; a v1 slice therefore
-// decodes with an empty name table and the terrain layer refuses to run on it.
+export const TL_REC = 18;            // + u16 name index, + u16 "was" index (1-based into the same table)
+// A row names TWO blocks, because that is all the ledger ever says about a voxel: the block the action
+// is ABOUT, and the block that stood there BEFORE it (old_object_id). For a break both are the block
+// that left; for a place, "about" is what arrived and "was" is what it covered - and the log carries
+// that for all 90,045 overworld place rows, which is what lets a base un-build into grass instead of
+// into a hole.
+//
+// Version 2 (16 B rows, name but no "was") and version 1 (14 B, no names at all, so no answer to
+// "what block was here") are still readable; their missing columns decode as zeros.
+export const TL_VERSION_2 = 2;
+export const TL_REC_2 = 16;
 export const TL_VERSION_1 = 1;
 export const TL_HEADER_1 = 28;
 export const TL_REC_1 = 14;
+
+/** Header size and row size of a timeline version. An unknown version is an error, not a guess. */
+export function tlSizes(version) {
+  if (version === TL_VERSION || version === TL_VERSION_2) {
+    return { head: TL_HEADER, rec: version === TL_VERSION ? TL_REC : TL_REC_2 };
+  }
+  if (version === TL_VERSION_1) return { head: TL_HEADER_1, rec: TL_REC_1 };
+  throw new Error(`timeline version ${version}`);
+}
 export const TL_NO_PLAYER = 255;
 export const Y_BIAS = 4096;          // packed y covers -4096..4095; this log spans -512..299
 
@@ -96,17 +112,13 @@ export function decodeTimeline(buf) {
   const magic = new TextDecoder('latin1').decode(new Uint8Array(view.buffer, view.byteOffset, 8));
   if (magic !== TL_MAGIC) throw new Error(`timeline: magic ${JSON.stringify(magic)}`);
   const version = dv.getUint32(8, true);
-  if (version !== TL_VERSION && version !== TL_VERSION_1) {
-    throw new Error(`timeline: version ${version}, expected ${TL_VERSION} or ${TL_VERSION_1}`);
-  }
-  const recSize = version === 1 ? TL_REC_1 : TL_REC;
-  const headSize = version === 1 ? TL_HEADER_1 : TL_HEADER;
+  const { head: headSize, rec: recSize } = tlSizes(version);   // throws on a version this build cannot read
   const count = dv.getUint32(12, true);
   const timeBaseSec = dv.getUint32(16, true);
   const spanSec = dv.getUint32(20, true);
   const dimKeyLen = dv.getUint32(24, true);
-  const nameCount = version === 1 ? 0 : dv.getUint32(28, true);
-  const namesBytes = version === 1 ? 0 : dv.getUint32(32, true);
+  const nameCount = recSize >= 16 ? dv.getUint32(28, true) : 0;
+  const namesBytes = recSize >= 16 ? dv.getUint32(32, true) : 0;
   const dimKey = new TextDecoder('utf-8').decode(
     new Uint8Array(view.buffer, view.byteOffset + headSize, dimKeyLen));
   const at = headSize + dimKeyLen;
@@ -129,6 +141,7 @@ export function decodeTimeline(buf) {
   const cell = new Uint32Array(count), coord = new Uint32Array(count);
   const action = new Uint8Array(count), player = new Uint8Array(count), sec = new Uint32Array(count);
   const name = new Uint16Array(count);
+  const was = new Uint16Array(count);        // zeros on a pre-v3 timeline
   for (let i = 0; i < count; i++) {
     const p = recAt + i * recSize;
     cell[i] = dv.getUint32(p, true);
@@ -136,7 +149,8 @@ export function decodeTimeline(buf) {
     action[i] = dv.getUint8(p + 8);
     player[i] = dv.getUint8(p + 9);
     sec[i] = dv.getUint32(p + 10, true);
-    name[i] = recSize === TL_REC ? dv.getUint16(p + 14, true) : 0;
+    name[i] = recSize >= 16 ? dv.getUint16(p + 14, true) : 0;
+    was[i] = recSize >= 18 ? dv.getUint16(p + 16, true) : 0;
   }
   // The rows are the playhead, so "ascending second" is not a detail of the writer, it is the thing
   // the page depends on. Say so in code that runs in the browser, not only in the bake.
@@ -153,12 +167,14 @@ export function decodeTimeline(buf) {
     return [lower(fromSec), lower(toSec + 1)];
   };
   return {
-    version, dimKey, count, timeBaseSec, spanSec, cell, coord, action, player, sec, name, names, range,
+    version, dimKey, count, timeBaseSec, spanSec, cell, coord, action, player, sec, name, was, names, range,
     x: (i) => tlX(coord[i]), y: (i) => tlY(coord[i]), z: (i) => tlZ(coord[i]),
     second: (i) => timeBaseSec + sec[i],
     cellOf: (i) => cell[i],
     /** the block name this row is about, or '' when the row carries none (a v1 slice always answers '') */
     nameOf: (i) => (name[i] ? names[name[i] - 1] ?? '' : ''),
+    /** what stood in that voxel BEFORE this row; '' on a pre-v3 timeline */
+    wasOf: (i) => (was[i] ? names[was[i] - 1] ?? '' : ''),
   };
 }
 
@@ -234,14 +250,14 @@ export function readPack(buf) {
   let tlBytes = null;
   if (tlCount > 0) {
     const where = (m) => { throw new Error(`ledger pack: ${m} bytes needed, got ${view.byteLength}`); };
-    if (view.byteLength < tlAt + TL_HEADER) where('timeline header');
+    if (view.byteLength < tlAt + 8) where('timeline header');
     const magic = new TextDecoder('latin1').decode(new Uint8Array(view.buffer, view.byteOffset + tlAt, 8));
     if (magic !== TL_MAGIC) throw new Error(`ledger pack: timeline magic ${JSON.stringify(magic)}`);
-    const tlDimKeyLen = dv.getUint32(tlAt + 24, true);
     const tlVer = dv.getUint32(tlAt + 8, true);
-    const tlNameBytes = tlVer === 1 ? 0 : dv.getUint32(tlAt + 32, true);
-    const need = tlAt + (tlVer === 1 ? TL_HEADER_1 : TL_HEADER) + tlDimKeyLen + tlNameBytes
-      + tlCount * (tlVer === 1 ? TL_REC_1 : TL_REC);
+    const { head: tlHead, rec: tlRec } = tlSizes(tlVer);
+    const tlDimKeyLen = dv.getUint32(tlAt + 24, true);
+    const tlNameBytes = tlRec >= 16 ? dv.getUint32(tlAt + 32, true) : 0;
+    const need = tlAt + tlHead + tlDimKeyLen + tlNameBytes + tlCount * tlRec;
     if (view.byteLength < need) where('timeline');
     tlBytes = [tlAt, need];
   }

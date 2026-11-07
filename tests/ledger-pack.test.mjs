@@ -5,7 +5,10 @@
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import test from 'node:test';
-import { LEDPACK_MAGIC, LEDPACK_VERSION, NCLASS, TL_HEADER, TL_NO_PLAYER, TL_REC, decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
+import {
+  LEDPACK_MAGIC, LEDPACK_VERSION, NCLASS, TL_HEADER, TL_NO_PLAYER, TL_REC, TL_VERSION,
+  decodeTimeline, readPack, tlSizes,
+} from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import { readLedger } from '../shared/ledger-format.mjs';
 import { fakeLog } from './fake-ledger.mjs';
@@ -168,16 +171,47 @@ test('the timeline names the block each row is about, which is what lets terrain
   const { buf, nameCount } = buildPack(L, 1, 'region');
   const P = readPack(buf);
   const TL = decodeTimeline(buf.subarray(P.tlBytes[0], P.tlBytes[1]));
-  assert.equal(TL.version, 2);
+  assert.equal(TL.version, TL_VERSION);
   assert.deepEqual([...TL.name], [1, 2, 0, 1], 'interned, deduplicated, and 0 means the row names nothing');
-  assert.equal(TL.names.length, 2, 'the table is per dimension, and repeats cost nothing');
-  assert.equal(nameCount, 2);
+  assert.equal(TL.names.length, 3, 'stone, the stairs, and the air the stairs stood on: per dimension, '
+    + 'and a break naming the same block twice costs nothing');
+  assert.equal(nameCount, 3);
   assert.equal(TL.nameOf(0), 'minecraft:stone', 'a break reads its old object, not the air left behind');
   assert.equal(TL.nameOf(1), 'minecraft:oak_stairs[facing=north]');
   assert.equal(TL.nameOf(2), '', 'a row that names nothing answers the empty string, not undefined');
   assert.equal(TL.nameOf(3), 'minecraft:stone');
+  // The second column is what a place COVERED, and it is what lets terrain un-build into ground
+  // instead of into a hole. For a break it is the same slot as the name, so it costs no table entries.
+  assert.deepEqual([...TL.was], [1, 3, 0, 1], 'and the block that stood there before');
+  assert.equal(TL.wasOf(1), 'minecraft:air', 'the stairs stood on air');
+  assert.equal(TL.wasOf(0), 'minecraft:stone', 'a break undoes into the block it removed');
   // The name table sits between the dim key and the rows, so a slice cut inside it is a broken file.
   assert.throws(() => decodeTimeline(buf.subarray(P.tlBytes[0], P.tlBytes[0] + 60)), /bytes needed/);
+});
+
+test('an older pack still reads: v2 has no "was" column and v1 has no names at all', () => {
+  // Re-cut a baked v3 slice into v2 (16 B rows) and into v1 (28 B header, 14 B rows). A page that has
+  // not re-baked yet must keep working, with the missing columns answering empty rather than guessing.
+  const L = fakeLog([[1, 5, 64, 5, 2, 2, T(40), 'minecraft:stone', 'minecraft:dirt']]);
+  const { buf } = buildPack(L, 1, 'region');
+  const P = readPack(buf);
+  const src = new Uint8Array(buf.subarray(P.tlBytes[0], P.tlBytes[1]));
+  const dv = new DataView(src.buffer, src.byteOffset, src.byteLength);
+  const headEnd = TL_HEADER + dv.getUint32(24, true) + dv.getUint32(32, true);
+
+  const v2 = new Uint8Array(headEnd + 16);
+  v2.set(src.subarray(0, headEnd), 0);
+  v2.set(src.subarray(headEnd, headEnd + 16), headEnd);
+  new DataView(v2.buffer).setUint32(8, 2, true);
+  const t2 = decodeTimeline(v2);
+  assert.equal(t2.count, 1);
+  assert.equal(t2.nameOf(0), 'minecraft:stone');
+  assert.equal(t2.wasOf(0), '', 'v2 knows nothing about what a place covered');
+
+  assert.throws(() => tlSizes(4), /timeline version 4/, 'a version nobody wrote is an error');
+  assert.deepEqual(tlSizes(1), { head: 28, rec: 14 });
+  assert.deepEqual(tlSizes(2), { head: TL_HEADER, rec: 16 });
+  assert.deepEqual(tlSizes(TL_VERSION), { head: TL_HEADER, rec: TL_REC });
 });
 
 test('a timeline that stops short is refused, not read as a shorter history', () => {

@@ -31,8 +31,9 @@ const timeline = (rows) => {
   const L = fakeLog(rows);
   const { buf } = buildPack(L, 1, 'region', { heightOf: () => 64 });
   const P = readPack(buf);
-  const tl = decodeTimeline(buf.subarray(P.tlBytes[0], P.tlBytes[1]));
-  return { tl, P, ph: (s) => Math.floor(T(s) / 1000) - tl.timeBaseSec };
+  const tlBuf = buf.subarray(P.tlBytes[0], P.tlBytes[1]);
+  const tl = decodeTimeline(tlBuf);
+  return { tl, P, tlBuf, ph: (s) => Math.floor(T(s) / 1000) - tl.timeBaseSec };
 };
 
 // Chunk-shaped the way payload.js hands one over: a palette of global state ids, and sparse sections
@@ -143,11 +144,53 @@ test('a uniform section expands, and a section the payload omitted is invented a
   assert.equal(out.sectionAt(80) !== undefined, true);
 });
 
+test('taking back a place uncovers what it covered, because the log recorded that too', () => {
+  // A block placed on top of another block. Scrub before the place: the thing underneath should appear,
+  // not a hole. The ledger knows what a place covered - old_object_id is filled for all 90,045 overworld
+  // place rows - and timeline v3 carries it as a second name column.
+  const { tl, ph } = timeline([[1, 4, 70, 4, 2, 1, T(200), 'minecraft:dirt', 'minecraft:stone']]);
+  assert.equal(tl.version, 3, 'the bake writes v3 rows');
+  assert.equal(tl.nameOf(0), 'minecraft:dirt', 'what arrived');
+  assert.equal(tl.wasOf(0), 'minecraft:stone', 'what it covered');
+  const vox = new Uint16Array(4096).fill(1);
+  const ch = chunkOf([[4, vox]]);
+  const got = editsForCell(tl, Int32Array.from([0]), ph(100), idFor);
+  assert.deepEqual([...got.edits], [tlPackCoord(4, 70, 4), STONE], 'the stone it covered, not a hole');
+  const out = applyEdits(ch, got.edits, { withAccessors, airId: AIR });
+  assert.equal(out.stateAt(4, 70, 4), STONE, 'uncovered');
+  assert.equal(out.stateAt(5, 70, 4), STONE, 'and the block next to it untouched');
+});
+
+// Rebuild a v3 slice as a v2 one (16 B rows, no "was" column) to check the page still reads an old pack.
+const asV2 = (src) => {
+  const u = new Uint8Array(src);
+  const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+  const count = dv.getUint32(12, true);
+  const headEnd = 36 + dv.getUint32(24, true) + dv.getUint32(32, true);
+  const out = new Uint8Array(headEnd + count * 16);
+  out.set(u.subarray(0, headEnd), 0);
+  for (let i = 0; i < count; i++) {
+    out.set(u.subarray(headEnd + i * 18, headEnd + i * 18 + 16), headEnd + i * 16);
+  }
+  new DataView(out.buffer).setUint32(8, 2, true);
+  return out;
+};
+
+test('a pre-v3 timeline has no "was" column, so an un-arrived place still becomes air', () => {
+  const { tlBuf, ph } = timeline([[1, 4, 70, 4, 2, 1, T(200), 'minecraft:dirt', 'minecraft:stone']]);
+  const v2 = decodeTimeline(asV2(tlBuf));
+  assert.equal(v2.version, 2);
+  assert.equal(v2.nameOf(0), 'minecraft:dirt', 'v2 still names the block the action is about');
+  assert.equal(v2.wasOf(0), '', 'and knows nothing about what it covered');
+  const got = editsForCell(v2, Int32Array.from([0]), ph(100), idFor);
+  assert.deepEqual([...got.edits], [tlPackCoord(4, 70, 4), 0], 'not arrived, and nothing known underneath');
+});
+
 test('names the renderer has no state for change nothing, and other actions are left alone', () => {
   const { tl, ph } = timeline([
     [1, 0, 64, 0, 3, 1, T(50), '', 'minecraft:zombie'],     // a kill logged as a break
     [1, 1, 64, 0, 4, 1, T(50), 'minecraft:chest', ''],      // a container action
-    [1, 2, 64, 0, 1, 1, T(50), 'minecraft:air', ''],        // an action class with no block meaning
+    [1, 2, 64, 0, 6, 1, T(50), 'minecraft:zombie', ''],     // an entity kill: no claim on a voxel
   ]);
   const ch = chunkOf([[4, 'minecraft:air']]);
   const got = editsForCell(tl, Int32Array.from([0, 1, 2]), ph(1), idFor);
@@ -156,6 +199,31 @@ test('names the renderer has no state for change nothing, and other actions are 
   assert.equal(got.otherRows, 2);
   const out = applyEdits(ch, got.edits, { withAccessors, airId: AIR });
   assert.equal(out.stateAt(0, 64, 0), AIR);
+});
+
+test('a logged block change puts back the block that stood before it', () => {
+  // The top pair among this save's 36,787 overworld block-change rows is grass_block -> dirt (35,581 of
+  // them: tilling, paths, trampling). Those rows are neither a place nor a break, and the first version
+  // skipped the class, so every path a player cut stayed in the picture at every playhead. The row's
+  // second name column is what fixes it.
+  const { tl, ph } = timeline([
+    [1, 9, 64, 9, 1, 1, T(500), 'minecraft:dirt', 'minecraft:stone'],   // a change: dirt over stone
+    [1, 9, 64, 9, 3, 1, T(900), '', 'minecraft:dirt'],                  // and much later it was broken
+  ]);
+  const vox = new Uint16Array(4096).fill(1);
+  const ch = chunkOf([[4, vox]]);
+  const mapOf = (g) => {
+    const m = new Map();
+    for (let i = 0; i < g.edits.length; i += 2) m.set(g.edits[i], g.edits[i + 1]);
+    return m;
+  };
+  const g1 = editsForCell(tl, Int32Array.from([0, 1]), ph(100), idFor);
+  assert.equal(g1.changeRows, 1, 'the class is counted, not lumped in with items');
+  assert.equal(mapOf(g1).get(tlPackCoord(9, 64, 9)), STONE, 'scrub back over the change: the stone is back');
+  const g2 = editsForCell(tl, Int32Array.from([0, 1]), ph(700), idFor);
+  assert.equal(mapOf(g2).get(tlPackCoord(9, 64, 9)), DIRT, 'past the change, before the break: dirt stands');
+  const out = applyEdits(ch, g1.edits, { withAccessors, airId: AIR });
+  assert.equal(out.stateAt(9, 64, 9), STONE, 'and the voxel really changes');
 });
 
 test('a row limit keeps a loud chunk bounded, and says it was bounded', () => {
