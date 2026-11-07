@@ -17,3 +17,10 @@ build/*
 .DS_Store
 
 logs/
+# The save and the server root it came with: 3.6 GB of region files, mod jars, crash logs and
+# a copy of the Mojang client jar. It is the viewer's input, not its source, and none of it is ours to
+# push anywhere. Point --world at wherever the save lives on the server; the path is a flag, not a constant.
+DarkRPG/
+
+# deploy/ is what tools/deploy-pack.mjs stages for shipping; derived, and huge if you let it be.
+deploy/

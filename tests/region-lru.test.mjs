@@ -68,8 +68,9 @@ test('a far pan cannot starve the eviction list of evictable entries', () => {
 });
 
 test('a region file that appears later is still found', async () => {
+  let world = null;
   try {
-    const world = fs.mkdtempSync(path.join(fs.realpathSync('.'), 'build', 'newworld-'));
+    world = fs.mkdtempSync(path.join(fs.realpathSync('.'), 'build', 'newworld-'));
     const regDir = path.join(world, 'region');
     fs.mkdirSync(regDir, { recursive: true });
     fs.writeFileSync(path.join(world, 'level.dat'), Buffer.alloc(0));
@@ -84,9 +85,12 @@ test('a region file that appears later is still found', async () => {
     assert.ok(after && after.length > 100, 'a region written after the miss must be read once the miss expires');
     // Windows will not delete a file another handle still has open, so hand the region files back first.
     for (const e of s.regions.values()) { try { e.rgn?.close(); } catch { } }
-    fs.rmSync(world, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
   } catch (e) {
     if (!fs.existsSync(path.join('DarkRPG', 'world', 'region', 'r.0.0.mca'))) throw e;
     throw e;
+  } finally {
+    // In a finally, not at the end of the try: an assertion that fails must not leave a synthetic
+    // world sitting in build/ for the next run to trip over.
+    if (world) fs.rmSync(world, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
   }
 });

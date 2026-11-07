@@ -1,7 +1,7 @@
 // Shell packs (server/shell-pack.mjs): the precomputed far view. Two things have to be true or the
 // whole layer is a lie - a pack must answer exactly what deriving the shell from the chunk would have
 // answered, and it must refuse to serve when the atlas (and therefore every state id in it) moved on.
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -306,4 +306,7 @@ test('overview mesh: one top per cell, cliffs on the steps, nothing under the sk
   assert.ok(checked > 100, `only ${checked} quads had a sprite to check`);
 });
 
-test.after?.('cleanup', () => fs.rmSync(tmp, { recursive: true, force: true }));
+// `test.after?.()` looked safe and was a no-op: the default export of node:test has no `.after`, so
+// the optional chain skipped the call and left 245 build/tmp-pack-* trees behind over a month of runs.
+// `after` is the named export, and it runs even when a test in the file fails.
+after(() => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }));
