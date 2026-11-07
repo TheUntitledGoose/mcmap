@@ -9,7 +9,7 @@ import { ShellStore } from './shell-store.js';
 import { LodStore } from './lod-store.js';
 import { pickLodRung, LOD_CELL } from '../../shared/lod-format.mjs';
 import { openOverview, withAccessors } from './payload.js';
-import { applyEdits, editsForCell, histStamp, rowsByCell, stateIdsByName } from './ledger-terrain.mjs';
+import { applyEdits, editsForCell, histStamp, rowsByCell, scanFromCentre, stateIdsByName } from './ledger-terrain.mjs';
 import { sectionIndex, idToState, voxelId } from './lookup.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
 import { PATCH_REACH, packPatchFrames, packPatchPolicy, patchFrameGetter, patchPolicy } from './shell-batch.js';
@@ -218,7 +218,7 @@ const S = {
   timeTerrain: num('timeterrain', num('time', 0) ? 1 : 0) ? 1 : 0,  // undo the log in the VOXELS too
   timeTouched: params.has('timeterrain') ? 1 : 0,
   timeTerrainStep: Math.max(1, num('timeterrainstep', 64)),         // rows the playhead may jump before the terrain re-syncs
-  timeTerrainLimit: Math.max(0, num('timeterrainlimit', 1200)),     // newest-first rows undone per chunk; 0 = all
+  timeTerrainLimit: Math.max(0, num('timeterrainlimit', 4096)),     // voxels one chunk may rewrite; 0 = all
   timeTerrainMax: Math.max(1, num('timeterrainmax', 192)),          // chunks re-cut per playhead sync
   timeTiles: num('timetiles', 1) ? 1 : 0,                           // the per-change tiles; the playhead works without them
   decalOp: Math.max(0, Math.min(1, num('decalop', 0.45))),           // how solid BOTH ledger overlays are
@@ -1285,7 +1285,18 @@ function attachChunkMesh(cx, cz, geos, stats, wasCovered, mk = null) {
   // Replace whatever is here, in this call. The worker path leaves the previous mesh drawing while it
   // computes, so this is the one moment the two can be swapped without a frame in between; parking the
   // old bytes (only while the time machine runs) is what makes the move back cheap instead of another cut.
-  if (HIST.on && S.keepMesh) dropChunkMesh(`${cx},${cz}`, true);
+  // This line used to read `if (HIST.on && S.keepMesh) dropChunkMesh(`${cx},${cz}`, true)`, and it was
+  // wrong twice over. The guard made the swap conditional on the time machine running, and - worse - the
+  // call handed `dropChunkMesh` a COMPOSED "cx,cz" STRING where it wants two numbers, so the key it
+  // looked up was `"-4,-9,undefined"`: it found nothing, removed nothing, and the `meshes.set` below
+  // then overwrote the record of the mesh that was on screen. Every re-cut left its predecessor drawing
+  // underneath it. Measured at the house in the user's screenshot: two identical 8 032-vertex `detail0`
+  // meshes over chunk -4,-9, 70 drawn vertices inside a block the replay had turned to air, and 0 changed
+  // pixels. So the corrected wall did get built and installed, and the wall from before the playhead kept
+  // painting it from the same spot forever - which is exactly "the house doesn't disappear". It is also
+  // why the keep-mesh flicker fix measured `dipFrames 0`: nothing was ever taken away, so nothing could
+  // dip. The swap is unconditional now, and parking stays a time-machine affordance.
+  dropChunkMesh(cx, cz, !!(HIST.on && S.keepMesh));
   // An empty answer is still an answer, so it is recorded: `meshes.has` is what `detailHere` asks, and
   // the mk short-circuit in the mesh drain is what stops the next dirty mark from meshing it again.
   // Six chunks in a void column (surface sentinel -2048, air top to bottom) were the whole of the
@@ -4395,33 +4406,43 @@ function histSync(force = false) {
       HIST.airId = (assets.stateIndex.get('minecraft:air') ?? 0) + 1;
     }
   }
-  let marked = 0, capped = 0;
-  const room = () => marked < S.timeTerrainMax;
+  let marked = 0, capped = 0, restore = 0;
+  const room = () => (marked - restore) < S.timeTerrainMax;
+  const inRing = (cx, cz) => inDetailRing(cx, cz, 1) && store?.has(cx, cz);
+  const did = new Set();
   // Chunks carrying history at the OLD playhead have to be re-marked even if they carry none at the new
-  // one: undoing nothing is exactly the operation that makes a block stand again.
+  // one: undoing nothing is exactly the operation that makes a block stand again. This loop is NOT paid
+  // out of the budget below, because a chunk it skips keeps showing a corrected block that no longer
+  // belongs to the moment on screen - that is a lie, not a saving. Its size is bounded by the previous
+  // sync's marks, so it cannot run away either.
   for (const k of before) {
-    if (!room()) { capped = 1; break; }
     const comma = k.indexOf(',');
     const cx = +k.slice(0, comma), cz = +k.slice(comma + 1);
-    if (inDetailRing(cx, cz, 1) && store?.has(cx, cz)) { markChunk(k, 'history'); marked++; }
+    if (!inRing(cx, cz)) continue;
+    markChunk(k, 'history'); marked++; restore++; did.add(k);
   }
   if (on) {
     const [ccx, ccz] = centerChunk();
-    const r = Math.min(detailR, Math.ceil(Math.sqrt(S.timeTerrainMax)));
-    // The cap is checked per chunk, not per row of the scan: checking it only between rows let one row of
-    // 29 chunks walk past it (measured 197 against a cap of 192), and a cap that leaks is not a budget.
-    scan:
-    for (let dz = -r; dz <= r; dz++) {
-      for (let dx = -r; dx <= r; dx++) {
-        if (!room()) { capped = 1; break scan; }
-        const cx = ccx + dx, cz = ccz + dz, k = `${cx},${cz}`;
-        if (!histStampOf(cx, cz)) continue;              // the log never touched it: the bulk of the map
-        if (!inDetailRing(cx, cz, 1) || !store?.has(cx, cz)) continue;
-        markChunk(k, 'history'); marked++;
-      }
-    }
+    // Ring order, not square order, and this is the whole point of the budget: it buys the nearest thing
+    // first. The old walk ran a square from its far corner, and before that it spent the entire cap on
+    // whatever the PREVIOUS syncs had marked, in insertion order. Measured at the framing in the user's
+    // screenshot: 192 marks, capped, median distance 7 chunks, and the house under the eye (chunk -4,-9,
+    // 2,180 of its 2,543 deepslate blocks placed AFTER this moment) never got a mesh job at this
+    // playhead - so it stood exactly as it is today while the panel claimed thousands of blocks undone.
+    scanFromCentre(ccx, ccz, Math.min(detailR + 1, 64), (cx, cz) => {
+      // The cap is checked per chunk, not per ring: a cap that leaks is not a budget.
+      if (!room()) { capped = 1; return false; }
+      const k = `${cx},${cz}`;
+      if (did.has(k)) return true;                       // the loop above already paid for it
+      const stamp = histStampOf(cx, cz);
+      if (!stamp && !HIST.marks.has(k)) return true;      // the log never touched it, and it never showed history
+      if (!inRing(cx, cz)) return true;
+      markChunk(k, 'history'); marked++;
+      return true;
+    });
   }
   HIST.marked = marked;
+  HIST.restore = restore;
   HIST.capped = capped;
   HIST.syncMs = performance.now() - t0;
   HIST.patches = 0;
@@ -4439,8 +4460,18 @@ function histSync(force = false) {
  */
 function histTotals() {
   let chunks = 0, edits = 0, unknown = 0, truncated = 0, truncChunks = 0, changes = 0;
-  for (const e of HIST.marks.values()) {
-    if (e.gen !== HIST.gen || !e.edits.length) continue;
+  // What makes a held mark still describe THIS playhead is its stamp - the count of rows newer than the
+  // playhead - not the generation it happened to be computed in. Requiring `gen` equality threw those
+  // marks away, and the panel then said "0 chunks, 0 blocks" over terrain that had plainly changed
+  // (measured at the first row of the log: 361 chunks marked, 360 rebuilt, vertex count moved by 158 920,
+  // and the sentence claimed nothing was undone). Same rule `histEditsOf` uses, so the number and the
+  // mesh agree instead of the number lagging a generation behind the picture.
+  for (const [k, e] of HIST.marks) {
+    if (!e.edits.length) continue;
+    if (e.gen !== HIST.gen) {
+      const comma = k.indexOf(',');
+      if (e.stamp !== histStampOf(+k.slice(0, comma), +k.slice(comma + 1))) continue;
+    }
     chunks++; edits += e.edits.length >> 1; unknown += e.unknown; changes += e.changes || 0;
     // `truncated` counts VOXELS the per-chunk cap left showing today (an undo is one edit per voxel, so a
     // row count would overstate it); truncChunks says how many chunks hit the cap.
@@ -4453,6 +4484,7 @@ function histTotals() {
 const histStats = () => ({
   on: !!HIST.on, wanted: histWanted(), sec: HIST.sec, cur: HIST.cur, gen: HIST.gen,
   touched: HIST.cellsAt ? HIST.cellsAt.size : 0, marked: HIST.marked, capped: !!HIST.capped,
+  restore: HIST.restore || 0,
   ...histTotals(), workerPatches: HIST.workerPatches, workerPatchMs: +HIST.workerPatchMs.toFixed(1),
   workerPatchTotalMs: +HIST.workerPatchTotalMs.toFixed(1),
   builds: HIST.builds, buildTotal: HIST.buildTotal, skipped: HIST.skipped,
@@ -4637,6 +4669,11 @@ function setTime(on) {
   S.time = on ? 1 : 0;
   TLAYER.err = '';
   if (!S.time) { S.timePlay = 0; clearTimeMesh(); if (panel) panel.refresh(); return false; }
+  // Ticking "time machine" is one decision, and what a viewer expects from it is the world at that moment,
+  // not tiles painted over today. `?time=1` already armed the voxel undo; the panel path used to leave it
+  // off, so the same feature looked broken from the URL and working from the checkbox. An explicit choice
+  // (URL `?timeterrain=` or the checkbox) still wins and is never re-armed.
+  if (!S.timeTouched && !S.timeTerrain) S.timeTerrain = 1;
   if (!LEDGER.meta?.available) {
     TLAYER.err = LEDGER.meta?.why ?? 'no ledger in this world';
     if (panel) panel.refresh();
@@ -5043,6 +5080,28 @@ window.__world = {
       states: [...new Set(s.state.filter((v) => v))].length };
   },
   patches: () => [...shellMeshes.keys()],
+  // One chunk's whole mesh decision, in one object: what the triangles on screen answer, what the
+  // dirty set and the wave think, what a mesh WOULD answer now, and what the time machine asks of it.
+  // A "marked but not re-cut" bug has exactly these suspects and no others.
+  meshDiag: (cx, cz) => {
+    const k = `${cx},${cz}`;
+    const seq = jobForKey.get(k);
+    return {
+      mk: meshKeyFor(cx, cz),
+      installed: meshes.get(k)?.mk ?? null,
+      empty: meshes.has(k) && !meshes.get(k).list.length,
+      done: meshDone.get(k) ?? null,
+      parked: meshBytes.get(k)?.mk ?? null,
+      dirty: store?.dirty.has(k) ?? null,
+      inWave: wave.indexOf(k) >= 0, waveAt,
+      held: !!store?.get(cx, cz),
+      inRing: inDetailRing(cx, cz, 1), ring: detailR,
+      suffix: histSuffix(cx, cz), stamp: histStampOf(cx, cz),
+      markGen: HIST.marks.get(k)?.gen ?? null, histGen: HIST.gen,
+      jobLive: seq !== undefined, jobHistGen: seq === undefined ? null : jobs.get(seq)?.histGen ?? null,
+      meshed: meshes.has(k),
+    };
+  },
   // The baked far layer: which tile covers a block, how many are held/drawn, and what was refused.
   lodDiag: () => ({
     on: lodActive() ? 1 : 0, avail: lodAvail ? 1 : 0, cap: S.lodCap,
@@ -5744,7 +5803,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
       { key: 'time', label: 'time machine', kind: 'check',
         fmt: () => (S.time ? `on - ${(TLAYER.drawn ?? 0).toLocaleString()} / ${(TLAYER.quads || 0).toLocaleString()}` : 'off'),
         get: () => !!S.time, set: (v) => setTime(v),
-        hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one decal per\nlogged change that has happened by the playhead. Costs one 4.7 MB request per dimension\n(/ledger/timeline) and one mesh; moving the playhead is a draw range, not a rebuild, so two years of\nhistory play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole dimension,\n35 ms for one player. M. URL: ?time=1' },
+        hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one decal per\nlogged change that has happened by the playhead. Costs one 6.4 MB request for this dimension\n(/ledger/timeline, 351,531 rows) and one mesh; moving the playhead is a draw range, not a rebuild, so two\nyears of history play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole\ndimension, 35 ms for one player. Ticking this also arms "undo the log in the blocks too" unless you have\ntoggled that yourself - tiles painted over today are only half of the feature. M. URL: ?time=1' },
       { key: 'timeTiles', label: 'draw the change tiles', kind: 'check',
         fmt: () => (S.timeTiles ? `${(TLAYER.drawn ?? 0).toLocaleString()} tiles` : 'off - the blocks speak'),
         get: () => !!S.timeTiles, set: (v) => setTiles(v),
@@ -5777,7 +5836,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
       { key: 'timeTerrain', label: 'undo the log in the blocks too', kind: 'check',
         fmt: () => (S.timeTerrain ? `${histTotals().chunks.toLocaleString()} chunks, ${histTotals().edits.toLocaleString()} blocks` : 'off'),
         get: () => !!S.timeTerrain, set: (v) => { S.timeTerrain = v ? 1 : 0; S.timeTouched = 1; histSync(true); },
-        hint: 'Not a decal: the voxels. Walking the playhead back re-cuts the detail chunks in view with every\nlogged change after it reversed - a block broken after the playhead stands again, a block placed after it\nis gone - which is the difference between watching dots appear and watching the house get built. The answer is asked per voxel: what the last logged change at or\nbefore the playhead left standing there. Rows after it are undone\nnewest first, and the work is bounded by the LOG per chunk rather than by the size of the world: this\ndimension has 20,322 touched chunks and its loudest holds 4,254 rows. Only the sharp layer is corrected:\nthe baked far tiles and the heightmap skin keep showing today, so zoom out and you see today. Two limits\ncome from the log itself, not from this viewer - block_state is filled for 2,828 of its 424,599 rows, so a\nrestored block is chosen by NAME and gets the plainest state the atlas holds (a stair comes back facing a\ndefault way, not the way it was placed); and light is not re-simulated, so a block coming back inside a\ntunnel is lit by the light that cell has today. It follows the row filter above, so "one player\'s places"\nthen means "the world as that player left it". URL: ?timeterrain=1, and the costs behind it stay URL-only:\n?timeterrainstep= (rows the playhead may jump per re-sync), ?timeterrainlimit= (voxels one chunk may rewrite),\n?timeterrainmax= (chunks re-cut per re-sync).' },
+        hint: 'Not a decal: the voxels. Walking the playhead back re-cuts the detail chunks in view with every\nlogged change after it reversed - a block broken after the playhead stands again, a block placed after it\nis gone - which is the difference between watching dots appear and watching the house get built. The answer is asked per voxel: what the last logged change at or\nbefore the playhead left standing there - or, if none did, what its OLDEST row covered, which is what a block\nthat had not arrived yet was sitting on. Only rows in the filter above count, so the default "block place"\nfilter un-builds but leaves what was broken alone: switch "replay which action" to "any change" for both.\nThe work is bounded by the LOG per chunk rather than by the size of the world: this\ndimension has 20,322 touched chunks and its loudest holds 4,254 rows. Only the sharp layer is corrected:\nthe baked far tiles and the heightmap skin keep showing today, so zoom out and you see today. Two limits\ncome from the log itself, not from this viewer - block_state is filled for 2,828 of its 424,599 rows, so a\nrestored block is chosen by NAME and gets the plainest state the atlas holds (a stair comes back facing a\ndefault way, not the way it was placed); and light is not re-simulated, so a block coming back inside a\ntunnel is lit by the light that cell has today. It follows the row filter above, so "one player\'s places"\nthen means "the world as that player left it". URL: ?timeterrain=1, and the costs behind it stay URL-only:\n?timeterrainstep= (rows the playhead may jump per re-sync), ?timeterrainlimit= (voxels one chunk may rewrite),\n?timeterrainmax= (chunks re-cut per re-sync).' },
       { kind: 'note', key: 'note_time', text: () => timeNote(),
         hint: 'The one sentence that answers "am I watching a bug, or an empty decade?". Unattributed rows -\n269,358 of this dimension\'s 351,531, most of them water, fire, growth and mobs - belong to anybody:\nfiltering to one player is a much smaller claim, and it costs 35 ms to re-cut instead of 100.' },      { kind: 'note', text: () => ledgerNote() },
       { kind: 'note', key: 'note_hist', text: () => histNote() },

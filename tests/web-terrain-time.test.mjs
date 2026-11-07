@@ -6,7 +6,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import { withAccessors } from '../web/js/payload.js';
 import {
-  applyEdits, editsForCell, firstAfter, histStamp, rowsAfterCount, rowsByCell, stateIdsByName,
+  applyEdits, editsForCell, firstAfter, histStamp, rowsAfterCount, rowsByCell, scanFromCentre,
+  stateIdsByName,
 } from '../web/js/ledger-terrain.mjs';
 import { decodeTimeline, tlPackCoord, tlX, tlY, tlZ } from '../shared/ledger-pack.mjs';
 import { sectionIndex, voxelId } from '../web/js/lookup.js';
@@ -430,3 +431,21 @@ if (existsSync(realSave) && existsSync(packPath)) {
     assert.notEqual(patched.digest, ch.digest, 'a different world has a different fingerprint');
   });
 }
+
+// The mark budget is the policy, and the policy is an ordering. This is the walk that decides which
+// chunks the replay is allowed to undo, so it is worth its own test rather than a paragraph.
+test('the playhead spends its chunk budget nearest the view first', () => {
+  const seen = [];
+  assert.equal(scanFromCentre(0, 0, 2, (cx, cz) => { seen.push([cx, cz]); }), true);
+  assert.equal(seen.length, 25, 'a radius-2 square is 5x5, visited once each');
+  const d = seen.map(([cx, cz]) => Math.max(Math.abs(cx), Math.abs(cz)));
+  for (let i = 1; i < d.length; i++) assert.ok(d[i] >= d[i - 1], 'distance never decreases: centre first');
+  assert.deepEqual(seen[0], [0, 0], 'the chunk under the view is the first thing marked');
+  assert.equal(seen[24].join(','), '2,2', 'the last corner is the far one');
+
+  // Stopping early must stop the walk, because that is how the cap ends a sync.
+  const part = [];
+  assert.equal(scanFromCentre(3, -4, 9, (cx, cz) => { part.push([cx, cz]); return part.length < 5; }), false);
+  assert.equal(part.length, 5, 'the visit that says stop ends the scan at 5 chunks');
+  assert.deepEqual(part[0], [3, -4]);
+});

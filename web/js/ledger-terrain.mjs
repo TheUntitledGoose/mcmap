@@ -2,16 +2,15 @@
 //
 // Tier 1 draws a dot where something happened. This answers a harder question: stand at time T and
 // what would the terrain look like? The page already holds the present voxels, and the ledger timeline
-// now names the block each row is about, so the present is corrected backwards - undo every logged
-// action newer than the playhead:
+// now names the block each row is about, so the present is corrected backwards.
 //
-//   a block broken after T      -> put it back, using the name the log recorded
-//   a block placed after T      -> take it away
-//   anything else (signs, containers, kills, dispensers) -> left alone and counted
+// The question is per VOXEL, not per row: "what stood in this voxel at T?" Not "undo every newer row one
+// at a time" - that made a block vanish at the moment it was placed, because the undo of a second
+// placement blanks the voxel that the first placement filled. For each voxel the timeline touches:
 //
-// Rows for one voxel are undone newest first, so the value that survives is the effect of the *oldest*
-// row after the playhead, which is what the world looked like immediately after that event - and no
-// event between it and T touched that voxel.
+//   a row at/behind T            -> its effect: a break leaves air, a place/change leaves its `name`
+//   no row at/behind T           -> the `was` of its oldest row: what it covered before it arrived
+//   no newer row at all          -> no edit: today's voxel is already the answer
 //
 // What this deliberately does not pretend:
 //   The log fills `block_state` for 2,828 of 424,599 rows, so a restored block is known by *name*, not
@@ -286,3 +285,27 @@ export const histStamp = (tl, rows, sec) => {
   const n = rowsAfterCount(tl, rows, sec);
   return n ? `x${n}` : '';
 };
+
+/**
+ * Visit a square of chunks from the middle outwards, until `visit` says stop.
+ *
+ * The playhead's mark budget is small (192 chunks) and the square it is spent on is as wide as the detail
+ * ring - 71x71 at a zoomed-out framing - so the walk ORDER is the policy, not an optimisation. Walking the
+ * square row by row from its far corner spent the whole budget on chunks 35 chunks away and left the house
+ * under the user's eye showing today. Ring order means the budget always buys what the camera is looking
+ * at first, and a chunk that is not re-cut is a chunk the replay never claims to have undone.
+ *
+ * `visit(cx, cz)` returning false stops the walk, and the return value says whether the square finished.
+ */
+export function scanFromCentre(cx0, cz0, r, visit) {
+  for (let d = 0; d <= r; d++) {
+    for (let dz = -d; dz <= d; dz++) {
+      for (let dx = -d; dx <= d; dx++) {
+        // Only the border of this Chebyshev ring: the inside was visited by an earlier d.
+        if (Math.max(Math.abs(dx), Math.abs(dz)) !== d) continue;
+        if (visit(cx0 + dx, cz0 + dz) === false) return false;
+      }
+    }
+  }
+  return true;
+}
