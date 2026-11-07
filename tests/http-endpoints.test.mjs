@@ -100,6 +100,34 @@ test('the ledger answers cells and timeline as two sizes, and both decode', asyn
   assert.equal((await get('/ledger/timeline?dim=not:a:dimension')).code, 404);
 });
 
+// The click path. `/ledger/rows` used to walk a chunk's rows in pack order and stop at `limit`, so a click
+// on a late row in a busy chunk produced "no ledger row touches -54, 82, -127" about a chunk holding 3,280
+// of them. That sentence was an artefact of the query, and it looked like a fact about the log.
+test('a click query with near= answers the voxel it was aimed at', async () => {
+  const busy = JSON.parse((await get('/ledger/rows?dim=minecraft:overworld&cx=-4&cz=-8&limit=200')).text);
+  assert.ok(Array.isArray(busy.rows), 'the rows answer is JSON with a rows array');
+  const last = busy.rows[busy.rows.length - 1];
+  assert.ok(busy.total > 400, `this test wants a genuinely busy chunk, and -4,-8 holds ${busy.total}`);
+
+  const aimed = JSON.parse((await get(`/ledger/rows?dim=minecraft:overworld&cx=-4&cz=-8&limit=1&near=${last.x},${last.y},${last.z}`)).text);
+  assert.deepEqual([aimed.rows[0].x, aimed.rows[0].y, aimed.rows[0].z], [last.x, last.y, last.z],
+    'the voxel that was aimed at comes back first, even 3,000 rows into the chunk');
+  assert.ok(aimed.nearAt >= 1, 'and the answer counts the rows that sit exactly on it');
+  assert.equal(aimed.scanned, busy.total, 'every row of the chunk was looked at');
+  assert.equal(aimed.total, busy.total, 'the chunk total is unchanged by asking near');
+
+  const plain = JSON.parse((await get('/ledger/rows?dim=minecraft:overworld&cx=-4&cz=-8&limit=5')).text);
+  assert.equal(plain.nearAt, null, 'a query that named no voxel claims no "exactly here"');
+
+  // A malformed near is a 400, not a silently dropped parameter: dropping it is what produced the
+  // confident wrong sentence above.
+  for (const bad of ['near=-54,82', 'near=-54,82,-127,9', 'near=x,y,z', 'near=']) {
+    const r = await get(`/ledger/rows?dim=minecraft:overworld&cx=-4&cz=-8&limit=5&${bad}`);
+    assert.equal(r.code, 400, `${bad} answered ${r.code}: ${r.text.slice(0, 80)}`);
+    assert.match(r.text, /near/);
+  }
+});
+
 test('the log stays quiet enough to read', () => {
   // The heartbeat and slow-request log are the point of the instrumentation; a boot this short
   // should not have produced any of it.

@@ -330,8 +330,23 @@ const server = http.createServer(async (req, res) => {
         player: +q.get('player') || 0,
         limit: Math.min(500, +q.get('limit') || 0),
       };
+      // `near=x,y,z` (BLOCK coordinates) asks for the rows closest to a voxel. A malformed one is a 400
+      // rather than a silent drop: the answer would otherwise look like "no row touches here", which is the
+      // exact wrong answer to give someone who is holding the card that shows their typo.
+      let near = null;
+      const nearQ = q.get('near');
+      // !== null, not truthiness: `near=` is a caller that meant to aim and sent nothing, and answering
+      // that as "no aim" is what made the old reply look like a fact about the log.
+      if (u.pathname === '/ledger/rows' && nearQ !== null) {
+        const parts = nearQ.split(',');
+        const nums = parts.map((s) => +s);
+        if (parts.length !== 3 || nums.some((n) => !Number.isFinite(n))) {
+          return send(req, res, 400, `near: expected x,y,z block coordinates, got '${nearQ}'`, 'text/plain');
+        }
+        near = { x: nums[0], y: nums[1], z: nums[2] };
+      }
       const body = u.pathname === '/ledger/rows'
-        ? ledger.rowsAt(dim, +q.get('cx'), +q.get('cz'), { ...opt, limit: opt.limit || 120 })
+        ? ledger.rowsAt(dim, +q.get('cx'), +q.get('cz'), { ...opt, limit: opt.limit || 120, near })
         : ledger.topCells(dim, { ...opt, limit: opt.limit || 40, near: q.has('nearx')
           ? { cx: +q.get('nearx') >> 4, cz: +q.get('nearz') >> 4, r: +q.get('r') || 32 } : null });
       if (!body) return send(req, res, 404, 'no ledger index for that dimension', 'text/plain');

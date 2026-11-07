@@ -129,23 +129,48 @@ export class LedgerService {
   }
 
   /**
-   * Rows for one chunk, oldest first, optionally narrowed to one action class or one player.
-   * `limit` protects a click on a chunk with 4,254 rows from shipping all of them.
+   * Rows for one chunk, optionally narrowed to one action class or one player.
+   *
+   * `limit` protects a click on a chunk with 4,254 rows from shipping all of them - but taking the first
+   * `limit` in pack order is only defensible while nobody asks about a place. A viewer who clicks a change
+   * marker at the 2,000th row of its own chunk got "no ledger row touches here": the row existed, the query
+   * simply never walked that far. So a caller that knows the voxel passes `near: {x, y, z}`, EVERY row of
+   * the chunk is walked (cheap: three integer reads and a max per row), and the ones closest to that voxel
+   * are the ones returned - the rows on the voxel itself first. `nearAt` counts those, so the card can say
+   * how many rows sit exactly where it was clicked rather than how many rows the chunk holds.
    */
-  rowsAt(dim, cx, cz, { limit = 120, cls = 0, player = 0 } = {}) {
+  rowsAt(dim, cx, cz, { limit = 120, cls = 0, player = 0, near = null } = {}) {
     const p = this.packFor(dim);
     if (!p) return null;
     const hit = p.findChunk(cx, cz);
     if (!hit) return { rows: [], total: 0, truncated: false };
     const L = this.loadLog();
     if (!L) return { rows: [], total: hit.rowCount, truncated: false, why: 'log export missing' };
-    const out = [];
-    for (let k = 0; k < hit.rowCount && out.length < limit; k++) {
+    const picked = [];
+    let nearAt = 0, nearMax = 0, scanned = 0;
+    for (let k = 0; k < hit.rowCount; k++) {
       const i = p.rowIdx(hit.rowStart + k);
       const aid = L.actionId(i);
       if (cls && aid !== cls) continue;
       const pid = L.playerId(i);
       if (player && pid !== player) continue;
+      scanned++;
+      if (near) {
+        const d = Math.max(Math.abs(L.x(i) - near.x), Math.abs(L.y(i) - near.y), Math.abs(L.z(i) - near.z));
+        if (!d) nearAt++;
+        picked.push([d, i]);
+      } else if (picked.length < limit) picked.push([0, i]);
+    }
+    if (near) {
+      // Stable sort: same distance means same pack order, so the card still reads oldest-first inside a
+      // block face, which is what made the old output easy to follow by eye.
+      picked.sort((a, b) => a[0] - b[0]);
+      if (picked.length > limit) picked.length = limit;
+      nearMax = picked.length ? picked[picked.length - 1][0] : 0;
+    }
+    const out = [];
+    for (const [, i] of picked) {
+      const aid = L.actionId(i);
       const obj = L.objects.get(L.objectId(i))?.id ?? '';
       const old = L.objects.get(L.oldObjectId(i))?.id ?? '';
       out.push({
@@ -156,14 +181,20 @@ export class LedgerService {
         block: aid === 3 ? old : obj,     // a break names the block that left
         now: obj,                        // what the log says is there afterwards
         was: old,
-        player: pid ? (this.meta.players.find((x) => x.id === pid)?.name ?? `#${pid}`) : '',
+        player: L.playerId(i) ? (this.meta.players.find((x) => x.id === L.playerId(i))?.name ?? `#${L.playerId(i)}`) : '',
         source: L.sources.get(L.sourceId(i))?.id ?? '',
         props: L.blockStrId(i) ? L.strings[L.blockStrId(i)] : '',
         extra: L.extraStrId(i) ? L.strings[L.extraStrId(i)] : '',
       });
     }
     this.stats.rowQueries++;
-    return { rows: out, total: hit.rowCount, truncated: out.length >= limit && hit.rowCount > out.length };
+    return {
+      rows: out, total: hit.rowCount, scanned,
+      // null, not 0, when nobody asked: "no row sits on that voxel" and "nobody named a voxel" are
+      // different answers, and the card's sentence depends on telling them apart.
+      nearAt: near ? nearAt : null, nearMax: near ? nearMax : null,
+      truncated: scanned > out.length,
+    };
   }
 
   /**

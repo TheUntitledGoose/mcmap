@@ -45,7 +45,8 @@ import { decodeTimeline, readPack, tlPackCoord } from '../../shared/ledger-pack.
 // M12b: the time machine's data half - filters, decal geometry and the playhead index, all of it
 // testable without a browser (tests/web-timemachine.test.mjs). This page owns the mesh and the
 // scrubber; the numbers in the readouts come from the tested functions.
-import { actionName, buildTimeQuads, filterRows, playhead, quadAt, rowForBlock, voxelRows } from './ledger-time.mjs';
+import { actionName, buildTimeQuads, filterRows, playhead, quadAt, rowForBlock, voxelKey, voxelRows } from './ledger-time.mjs';
+import { buildTimeBlocks, markerOfIndex, resetMarkerLift } from './ledger-blocks.mjs';
 
 
 const $ = (id) => document.getElementById(id);
@@ -53,6 +54,17 @@ const params = new URLSearchParams(location.search);
 const num = (name, def) => {
   const v = params.get(name);
   return v === null || v === '' || !Number.isFinite(+v) ? def : +v;   // +null is 0, so test first
+};
+/** A word parameter, checked against the values that are actually implemented. A typo in ?timelook=
+ *  must not silently become the default look, because then the picture and the panel disagree. */
+const word = (name, def, allowed) => {
+  const v = (params.get(name) ?? '').trim().toLowerCase();
+  if (!v) return def;
+  if (!allowed.includes(v)) {
+    console.warn(`?${name}=${v} is not one of ${allowed.join('/')}; using ${def}`);
+    return def;
+  }
+  return v;
 };
 
 // Slider values arrive as floats; most of these settings are counts or must stay inside a range the
@@ -205,6 +217,9 @@ const S = {
   time: num('time', 0) ? 1 : 0,
   timeAt: Math.max(0, num('timeat', 0)),
   timePlay: num('timeplay', 0) ? 1 : 0,
+  // Whether anyone ASKED for a play state. Arming the time machine plays by default (see timeRebuild);
+  // a URL that says ?timeplay=0, or a hand on the play row, is an answer to that and is never overruled.
+  playTouched: params.has('timeplay') ? 1 : 0,
   timeSpeed: Math.max(0.05, Math.min(5e6, num('timespeed', 20000))),  // LOGGED CHANGES per wall-clock second
   // Not days per second. This dimension logged changes on 9 of the 822 days its log spans, with 99 % of
   // its rows inside the first week and 83,101 of them on one day. A calendar-driven playhead would sit
@@ -220,7 +235,21 @@ const S = {
   timeTerrainStep: Math.max(1, num('timeterrainstep', 64)),         // rows the playhead may jump before the terrain re-syncs
   timeTerrainLimit: Math.max(0, num('timeterrainlimit', 4096)),     // voxels one chunk may rewrite; 0 = all
   timeTerrainMax: Math.max(1, num('timeterrainmax', 192)),          // chunks re-cut per playhead sync
-  timeTiles: num('timetiles', 1) ? 1 : 0,                           // the per-change tiles; the playhead works without them
+  timeTiles: num('timetiles', 1) ? 1 : 0,                           // the per-change markers; the playhead works without them
+  // M12b tier 3: what a logged change LOOKS like, and the ceiling that decides whether it can afford to.
+  // Measured over the whole overworld filter (build/dbg-ghostcost.mjs, real atlas, real timeline):
+  //   90,045 place rows  = 553,726 quads / 66 MB as the block's own model, 117,651 quads / 14 MB as a
+  //                        textured top face, 90,045 quads / 11 MB as a flat coloured tile
+  //   351,531 any-change = 2.94M quads / 352 MB as blocks, 1.65M quads / 198 MB as plates
+  // so blocks are tried first and the look steps DOWN when it would not fit timeGeomMb, in the panel's
+  // line of sight rather than silently. URL: ?timelook=plates, ?timegeommb=256
+  timeLook: word('timelook', 'blocks', ['blocks', 'plates', 'tiles']),
+  timeGeomMb: Math.max(2, Math.min(2048, num('timegeommb', 128))),
+  // A line around the voxel under the cursor. Cheap by policy, not by luck: one reusable 24-vertex box
+  // and one raycast at `hoverMs` intervals, because a highlight that allocates a mesh per hover is a
+  // hitch per hover. URL: ?nohover, ?hoverms=60
+  hover: num('hover', 1) ? 1 : 0,
+  hoverMs: Math.max(16, Math.min(1000, num('hoverms', 90))),
   decalOp: Math.max(0, Math.min(1, num('decalop', 0.45))),           // how solid BOTH ledger overlays are
   decalShrink: Math.max(0.2, Math.min(1, num('decalshrink', 0.82))), // a tile as a fraction of what it covers
   // The settings panel's own width in CSS pixels, because a panel that hides its own numbers behind
@@ -756,12 +785,12 @@ canvas.addEventListener('click', (e) => {
 // M12: a click in orbit mode asks the ledger about the block under the cursor - "who placed this".
 // A click that was really a drag is not a click (same 6 px rule as pointer lock), and walk mode keeps
 // its click for the pointer, so there the question is asked with T at the crosshair instead.
+// `askAt` loads /ledger/meta on demand: the click is an entry point, not a side effect of having turned
+// on an overlay, and a handler that required meta to be already present answered a click with silence.
 canvas.addEventListener('click', (e) => {
-  if (walk.on || !LEDGER.meta?.available) return;
+  if (walk.on) return;
   if (pressXY && Math.hypot(e.clientX - pressXY[0], e.clientY - pressXY[1]) > 6) return;
-  const p = pickState(e.clientX, e.clientY);
-  if (!p || !p.block) { closeLedgerCard(); return; }      // clicking the sky closes the card
-  ledgerAsk(p.block[0], p.block[1], p.block[2]);
+  askAt(e.clientX, e.clientY);
 });
 
 canvas.addEventListener('mousemove', (e) => {
@@ -3207,6 +3236,8 @@ function frameBody(now) {
 
   drainMeshes(now);
   lap('mesh');
+  hoverPass(now);
+  lap('hover');
   // Refill when idle: request() skips coordinates already held, so this converges on the radius
   // around the camera instead of storming the server every frame. It used to run on every idle
   // frame, which at skin 96 is a 37 000-key scan and sort per frame - about 10 ms of pure
@@ -3609,7 +3640,10 @@ const LEDGER = {
   bytes: 0, fetchMs: 0, buildMs: 0,
   top: null, topIdx: 0,  // the "find the bases" tour
   card: null, cardRows: 0, cardTotal: 0,
-  err: '', asks: 0,
+  err: '', asks: 0, askWhy: '',
+  // What the LAST click query got back from the wire, so a probe can check the answer rather than the
+  // sentence drawn over it: `nearAt` is the number that says "this voxel really is in the log".
+  last: null,
 };
 
 // Deliberately not inside `groups`: pickState raycasts those to answer "what block is under the
@@ -3832,26 +3866,289 @@ function gotoLedger(x, y, z, dist = 48) {
 function ledgerAsk(x, y, z) {
   if (!LEDGER.meta?.available) { showLedger(`no ledger: ${LEDGER.meta?.why ?? 'not asked for'}`); return null; }
   const cx = Math.floor(x) >> 4, cz = Math.floor(z) >> 4;
+  const bx = Math.floor(x), by = Math.floor(y), bz = Math.floor(z);
+  // `near` is the whole point of this query: a chunk can hold thousands of rows, and asking for the
+  // chunk's first 200 used to answer a click on row 2,000 with "no row touches here".
   const url = `/ledger/rows?dim=${encodeURIComponent(currentDim())}&cx=${cx}&cz=${cz}`
-    + `&cls=${S.ledgerCls}&player=${S.ledgerWho}&limit=${S.ledgerRows}`;
+    + `&cls=${S.ledgerCls}&player=${S.ledgerWho}&limit=${S.ledgerRows}&near=${bx},${by},${bz}`;
   LEDGER.asks++;
   return fetch(url).then((r) => {
     if (!r.ok) { showLedger(`/ledger/rows: HTTP ${r.status}`); return null; }
     return r.json();
   }).then((out) => {
     if (!out) return null;
-    const bx = Math.floor(x), by = Math.floor(y), bz = Math.floor(z);
+    LEDGER.last = {
+      voxel: [bx, by, bz], chunk: [cx, cz],
+      total: out.total ?? 0, shown: (out.rows ?? []).length, scanned: out.scanned ?? null,
+      nearAt: out.nearAt ?? null, nearMax: out.nearMax ?? null, truncated: !!out.truncated,
+    };
     const here = nearRows(out.rows ?? [], bx, by, bz, S.ledgerNear);
     showLedgerCard({ block: [bx, by, bz], rows: here, out });
     return { here: here.length, shown: (out.rows ?? []).length, total: out.total };
   }).catch((e) => { showLedger(`/ledger/rows: ${e.message}`); return null; });
 }
 
-/** T: ask about the middle of the screen - the crosshair when walking, the orbit target otherwise. */
-function ledgerAskCentre() {
-  const p = pickState(innerWidth / 2, innerHeight / 2);
-  if (!p || !p.block) { showLedger('nothing is drawn at the middle of the view to ask about'); return null; }
+/**
+ * The voxel a timeline row describes. A row carries a chunk INDEX plus a packed local coordinate, so
+ * answering "where is this change" needs the pack's chunk table - and it must NOT be answered by looking
+ * at what stands there today: a break marks a voxel that is empty now, and a place under a playhead that
+ * has taken the block back is empty too.
+ */
+function timeRowWorld(row) {
+  const tl = TLAYER.tl;
+  const c = LEDGER.pack?.cell?.(tl.cellOf(row));
+  if (!c) return null;
+  return [c.cx * 16 + tl.x(row), tl.y(row), c.cz * 16 + tl.z(row)];
+}
+
+/**
+ * Does the pixel land on the time layer, and on which logged change?
+ *
+ * The time layer is deliberately not in `groups` (nothing else should raycast the overlay), which is why
+ * a click on a marker used to fall straight through to the terrain behind it and ask about a voxel the
+ * pointer was never on. three honours `geometry.drawRange` in its raycast, so a marker the playhead has
+ * not reached yet cannot be hit - the answer is about what is on screen, not about the whole buffer.
+ */
+function timeHitAt(x, y) {
+  if (!TLAYER.mesh || !TLAYER.mesh.visible || !TLAYER.tl) return null;
+  camera.updateMatrixWorld();
+  const rc = new THREE.Raycaster();
+  rc.setFromCamera(new THREE.Vector2((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1), camera);
+  rc.far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
+  const t0 = performance.now();
+  const hit = rc.intersectObject(TLAYER.mesh, false)[0];
+  TLAYER.hitMs = performance.now() - t0;          // 42 ms on a whole-dimension buffer: a click's cost
+  if (!hit) return null;
+  // One triangle per face of a marker: the geometry is indexed, and a flat tile is one quad = 6 indices.
+  const q = hit.faceIndex;
+  let row = -1, item = -1;
+  // `quadRow` is the row mapping for BOTH looks, and `markerEnd` only exists when an item is bigger than
+  // one quad. Naming them separately (markerRow) once made this read an undefined array.
+  if (TLAYER.markerEnd) {
+    // A triangle is 3 indices and a quad is 2 triangles, so a hit triangle sits at quad*6 = floor(q/2)*6
+    // in the index buffer. Asking with q*6 asks at twice the offset and returns a marker further along
+    // the buffer: the probe saw a ray aimed at row 350222 answer row 301547.
+    item = markerOfIndex(TLAYER.markerEnd, Math.floor(q / 2) * 6);
+    if (item >= 0) row = TLAYER.quadRow?.[item] ?? -1;
+  } else {
+    row = TLAYER.quadRow?.[Math.floor(q / 2)] ?? -1;   // a flat tile is 2 triangles, so halve the triangle
+  }
+  if (row < 0) return null;
+  const xyz = timeRowWorld(row);
+  if (!xyz) return null;
+  return { row, item, xy: [x, y], voxel: xyz, sec: TLAYER.tl.sec[row], action: TLAYER.tl.action[row],
+    look: TLAYER.look, point: [+hit.point.x.toFixed(2), +hit.point.y.toFixed(2), +hit.point.z.toFixed(2)] };
+}
+
+/**
+ * What a click (or T) should ask about at a screen point. A marker wins over the terrain behind it,
+ * because the thing a person pointed at is the thing they can see.
+ *
+ * The `/ledger/meta` fetch happens here rather than behind the overlay checkbox: clicking a block is an
+ * entry point of its own, and a page that never turned on an overlay used to answer the click with
+ * nothing at all - which is exactly the report this replaces.
+ */
+async function askAt(x, y) {
+  if (!LEDGER.meta) await ledgerMetaLoad();
+  if (!LEDGER.meta?.available) {
+    LEDGER.askWhy = `no ledger: ${LEDGER.meta?.why ?? 'this world has no log'}`;
+    showLedger(`no ledger: ${LEDGER.meta?.why ?? 'this world has no log'}`);
+    return null;
+  }
+  const t = timeHitAt(x, y);
+  if (t) { LEDGER.askWhy = `the ${TLAYER.look} marker for row ${t.row}`; return ledgerAsk(t.voxel[0], t.voxel[1], t.voxel[2]); }
+  const p = pickState(x, y);
+  if (!p || !p.block) { LEDGER.askWhy = 'the pixel hit no drawn block'; closeLedgerCard(); return null; }
+  LEDGER.askWhy = `${p.drawn ?? 'detail'} block ${p.block.join(', ')}`;
   return ledgerAsk(p.block[0], p.block[1], p.block[2]);
+}
+
+/** T: ask about the middle of the screen - the crosshair when walking, the orbit target otherwise. */
+function ledgerAskCentre() { return askAt(innerWidth / 2, innerHeight / 2); }
+
+/**
+ * Debug/probe: find a pixel that IS a drawn marker, without guessing at coordinates. Projects the most
+ * recently drawn changes into the viewport, takes the one nearest the middle, and confirms it with the
+ * same raycast a click uses. Cheap on purpose: a screen-grid sweep would ray-scan a 3.3 M-index buffer
+ * hundreds of times.
+ */
+function timeHitProbe(limit = 600) {
+  if (!TLAYER.mesh || !TLAYER.mesh.visible || !TLAYER.tl) return { ok: 0, why: 'no time layer on screen' };
+  const items = TLAYER.quadRow;
+  const n = Math.min(items?.length ?? 0, TLAYER.drawn);
+  if (!n) return { ok: 0, why: 'the playhead has drawn nothing' };
+  updateCamera();
+  const v = new THREE.Vector3();
+  // A candidate must be somewhere a CLICK could actually land. `project()` happily hands back an on-screen
+  // pixel for a point BEHIND the eye (the perspective divide flips both signs), and this timeline spans
+  // 19 km of world, so the first version of this probe "found" a change 12 km the wrong way round and
+  // then reported the honest marker under that pixel as a mismatch.
+  const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
+  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  const far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
+  let best = null;
+  for (let k = n - 1; k >= (limit > 0 ? Math.max(0, n - limit) : 0); k--) {
+    const row = items[k];
+    const xyz = timeRowWorld(row);
+    if (!xyz) continue;
+    v.set(xyz[0] + 0.5, xyz[1] + 0.5, xyz[2] + 0.5);
+    const off = v.clone().sub(eye);
+    if (off.dot(fwd) < 4 || off.lengthSq() > far * far) continue;
+    v.project(camera);
+    if (v.z > 1 || v.z < -1) continue;
+    const sx = (v.x * 0.5 + 0.5) * innerWidth, sy = (-v.y * 0.5 + 0.5) * innerHeight;
+    if (sx < 8 || sy < 8 || sx > innerWidth - 8 || sy > innerHeight - 8) continue;
+    const d = (sx - innerWidth / 2) ** 2 + (sy - innerHeight / 2) ** 2;
+    if (d > 90 * 90) continue;      // somewhere a person would plausibly click
+    const dist = off.length();
+    // Prefer the CLOSEST such marker. Among tens of thousands of drawn changes the middle of the view can
+    // hold a change 12 km away as easily as one 20 blocks away, and a ray at that pixel answers with
+    // whatever is nearest the eye - so aim where the ray and the expectation agree.
+    if (!best || dist < best.dist) best = { dist, d, xy: [Math.round(sx), Math.round(sy)], row, xyz };
+  }
+  if (!best) return { ok: 0, why: 'no drawn marker projects inside the viewport', drawn: n };
+  const t = timeHitAt(best.xy[0], best.xy[1]);
+  if (!t) return { ok: 0, why: 'no marker under that pixel', drawn: n, probe: best.xy, expects: best.row };
+  // The property worth asserting is NOT "the ray found the item whose CENTRE we projected": with tens of
+  // thousands of markers drawn, whatever owns a pixel is the one closest to the eye, and the centre of a
+  // further marker can land on the same pixel. It is that the answer a click got describes the pixel it
+  // was aimed at - so project the ANSWER's voxel and see where it lands.
+  v.set(t.voxel[0] + 0.5, t.voxel[1] + 0.5, t.voxel[2] + 0.5).project(camera);
+  const hx = (v.x * 0.5 + 0.5) * innerWidth, hy = (-v.y * 0.5 + 0.5) * innerHeight;
+  return { ok: 1, drawn: n, probe: best.xy, expects: best.row, voxel: best.xyz, distance: Math.round(Math.hypot(
+    best.xyz[0] - eye.x, best.xyz[1] - eye.y, best.xyz[2] - eye.z)),
+    hit: { row: t.row, item: t.item, voxel: t.voxel, sec: t.sec, action: t.action, point: t.point },
+    hitPixel: [Math.round(hx), Math.round(hy)],
+    offPx: Math.round(Math.hypot(hx - best.xy[0], hy - best.xy[1])),
+    hitDrawn: t.item < n, same: t.row === best.row };
+}
+
+// ---- the cursor's outline ------------------------------------------------------------------------
+// "Which block am I pointing at?" needs an edge, not a colour: tint the block and you have hidden the
+// block. So this is a wire box around the one voxel the cursor is on, drawn twice - a pale outer edge
+// and a dark inner one - because a single-colour outline disappears on either bright grass or dark
+// deepslate. One geometry, two LineSegments, reused every pass: a highlight that allocates per hover is
+// a hitch per hover, and this viewer has already been told about those.
+let hoverBox = null;
+const HOVER = { at: null, from: '', changes: 0, why: '', ms: 0, last: 0, passes: 0, skips: 0, boxMs: 0 };
+let pointerXY = null, pointerOut = false, pointerDown = false;
+let hoverSig = '', hoverDirty = true;
+canvas.addEventListener('pointermove', (e) => { pointerXY = [e.clientX, e.clientY]; pointerOut = false; hoverDirty = true; });
+canvas.addEventListener('pointerleave', () => { pointerOut = true; });
+canvas.addEventListener('pointerdown', () => { pointerDown = true; });
+addEventListener('pointerup', () => { pointerDown = false; hoverDirty = true; });
+
+/** Cheap stand-in for "did the picture change": the camera's own pose, to two decimal places. */
+function camSig() {
+  const p = camera.position, q = camera.quaternion;
+  return `${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}|${q.x.toFixed(4)},${q.y.toFixed(4)},${q.z.toFixed(4)},${q.w.toFixed(4)}`;
+}
+
+function hoverBoxOf() {
+  if (hoverBox) return hoverBox;
+  const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));   // 12 edges, once
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(edges.attributes.position.array, 3));
+  edges.dispose();
+  const grp = new THREE.Group();
+  const pale = new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+    color: 0xf4f7fa, transparent: true, opacity: 0.7, depthTest: true, fog: false }));
+  const dark = new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+    color: 0x0a0b0d, depthTest: true, fog: false }));
+  // Inflated a hair rather than exactly on the voxel: coplanar lines over coplanar faces z-fight, and
+  // this is the same contest the marker layer's polygonOffset exists to settle.
+  pale.scale.setScalar(1.024);
+  dark.scale.setScalar(1.006);
+  pale.renderOrder = 948; dark.renderOrder = 949;                          // over every world layer
+  pale.frustumCulled = dark.frustumCulled = false;
+  grp.add(pale); grp.add(dark);
+  grp.name = 'hover';
+  grp.visible = false;
+  scene.add(grp);
+  hoverBox = grp;
+  return grp;
+}
+
+/**
+ * Does the drawn change set touch this voxel, and how many times?
+ *
+ * The other way to answer that is a raycast against the marker buffer, and that buffer can hold 3.3 M
+ * indices: measured 42 ms a hit, which a click can afford and a hover loop running ten times a second
+ * cannot. Two Map lookups answer the same question, and they are exact, because rows are stored in time
+ * order so a row is on screen exactly when its quad position sits below TLAYER.drawn.
+ */
+function timeDrawnAt(x, y, z) {
+  if (!TLAYER.tl || !TLAYER.drawn) return null;
+  const ci = HIST.cellsAt?.get(`${Math.floor(x) >> 4},${Math.floor(z) >> 4}`);
+  if (ci === undefined) return null;
+  const g = timeVoxelIndex();
+  if (!g) return null;
+  const list = g.get(voxelKey(ci, tlPackCoord(Math.floor(x) & 15, Math.floor(y), Math.floor(z) & 15)));
+  if (!list) return null;
+  let n = 0, last = -1;
+  for (const q of list) if (q < TLAYER.drawn) { n++; last = q; }
+  return n ? { n, row: TLAYER.quadRow?.[last] ?? -1, sec: TLAYER.quadSec?.[last] ?? 0 } : null;
+}
+
+/**
+ * The voxel under a screen point, and how many drawn changes sit on it.
+ *
+ * The outline follows the drawn world rather than the marker buffer on purpose: the marker raycast costs
+ * 42 ms, and an outline that hitches the frame every 90 ms is a worse highlight than no outline. A click
+ * still asks the marker buffer, because one 42 ms click is nothing next to an answer the user asked for.
+ */
+function hoverVoxel(x, y) {
+  const p = pickState(x, y);
+  if (!p || !p.block) return null;
+  const t = S.time ? timeDrawnAt(p.block[0], p.block[1], p.block[2]) : null;
+  return { voxel: p.block, from: p.drawn ?? 'detail', changes: t ? t.n : 0, row: t ? t.row : -1 };
+}
+
+/** One pass per `hoverMs`, from the frame loop. Cheap when the cursor has not moved and nothing moved. */
+function hoverPass(now) {
+  const g = hoverBoxOf();
+  if (!S.hover) { g.visible = false; HOVER.at = null; HOVER.why = 'off'; return; }
+  // Walking keeps the question at the crosshair, because that is where the cursor is locked.
+  const xy = walk.on ? [Math.round(innerWidth / 2), Math.round(innerHeight / 2)] : pointerXY;
+  if (!xy || (pointerOut && !walk.on)) { g.visible = false; HOVER.at = null; HOVER.why = 'no cursor'; return; }
+  if (now - HOVER.last < S.hoverMs) return;
+  // A pick costs what a pick costs: measured 17.5 ms at the house framing with 11 M vertices of world
+  // geometry under the ray. Running that every 90 ms while nobody and nothing moved is how a highlight
+  // turns into the stutter this viewer exists to avoid, and during an orbit drag the cursor is not
+  // pointing at anything. So re-pick on movement only - cursor, camera, or the playhead.
+  if (pointerDown) { HOVER.skips++; HOVER.why = 'dragging'; return; }
+  const sig = camSig();
+  // A skip is a decision, so it gets a reason: a stale 'off' left over from the last time the highlight
+  // was switched off reads as a setting the viewer never made.
+  if (!hoverDirty && sig === hoverSig) { HOVER.skips++; HOVER.why = 'nothing moved'; return; }
+  hoverDirty = false; hoverSig = sig;
+  HOVER.last = now;
+  HOVER.passes++;
+  const t0 = performance.now();
+  const h = hoverVoxel(xy[0], xy[1]);
+  HOVER.ms = performance.now() - t0;
+  if (!h) { g.visible = false; HOVER.at = null; HOVER.why = 'nothing under the cursor'; return; }
+  HOVER.at = h.voxel;
+  HOVER.from = h.from;
+  HOVER.changes = h.changes || 0;
+  HOVER.why = '';
+  g.visible = true;
+  g.position.set(h.voxel[0] + 0.5, h.voxel[1] + 0.5, h.voxel[2] + 0.5);
+  // The outline takes the place-green of the change layer when a drawn change sits on this voxel, so the
+  // wire box and the block it describes read as one thing rather than two coincidences.
+  g.children[0].material.color.setHex(h.changes ? 0x6fe08a : 0xf4f7fa);
+}
+
+/**
+ * Debug: put the outline on a pixel and report what it found, ignoring the throttle. A probe that has to
+ * synthesize a pointermove to test a highlight is testing the wrong thing, and the pixel it wants is one
+ * a marker happens to be drawn on, which `timeHitProbe` already knows.
+ */
+function hoverAtPixel(x, y) {
+  pointerXY = [x, y]; pointerOut = false; hoverDirty = true; HOVER.last = 0;
+  hoverPass(performance.now());
+  return { at: HOVER.at, from: HOVER.from, changes: HOVER.changes, ms: +HOVER.ms.toFixed(2),
+    visible: !!(hoverBoxOf().visible && S.hover) };
 }
 
 function setLedger(on) {
@@ -3901,10 +4198,13 @@ function showLedgerCard({ block, rows, out }) {
   const head = document.createElement('div');
   head.className = 'lcard-head';
   const at = block.join(', ');
+  // `nearAt` counts rows sitting on THIS voxel, which is a different claim from the number of rows the
+  // card chose to show: a busy chunk returns its nearest `limit` rows, not all of them.
+  const exact = out.nearAt ? ` - ${out.nearAt} exactly here` : '';
   head.append(document.createTextNode(
     rows.length
-      ? `${rows.length} of ${out.total} ledger rows in chunk ${block[0] >> 4},${block[2] >> 4} touched ${at}`
-      : `no ledger row touches ${at}${out.total ? ` - this chunk holds ${out.total}, none within ${S.ledgerNear} blocks` : ''}`));
+      ? `${rows.length} of ${out.total} ledger rows in chunk ${block[0] >> 4},${block[2] >> 4} touched ${at}${exact}`
+      : `no ledger row touches ${at}${out.total ? ` - this chunk holds ${out.total} rows, none within ${S.ledgerNear} blocks` : ''}`));
   const x = document.createElement('button');
   x.className = 'lcard-x'; x.textContent = '\u00d7'; x.title = 'close (Esc)';
   x.addEventListener('click', closeLedgerCard);
@@ -4031,11 +4331,17 @@ const TLAYER = {
   quads: 0, verts: 0, drawn: 0, sec: 0,
   cur: 0,                        // the playhead as a ROW INDEX into the current filter
   quadRow: null,         // which timeline row each drawn quad came from (buildTimeQuads)
+  // Block-shaped markers (M12b tier 3) are not quads: a cube is 36 indices, a plant model 12 or 24.
+  // itemEnd is the cumulative INDEX count per drawn item, which is what a draw range becomes then;
+  // look says what was actually built, and lookWhy says why a requested look was refused.
+  itemEnd: null, look: '', lookWhy: '', markerEnd: null,
   voxel: null,           // Map block -> its quads, built on the first click on a block card
+  hitMs: 0,              // one raycast of the marker buffer, which is why a hover does not do it
   voxelFrom: null, voxelMs: 0, jumpMs: 0,
   cellsAt: null, cellsPack: null,   // "cx,cz" -> cell index, for a card that names a chunk
   activeDays: 0, busyDay: 0, busyN: 0,   // how much of the calendar the log actually covers
   rows: 0, other: 0, truncated: false,
+  freshArm: 0,           // the tick that armed the machine, waiting for its first mesh
   bytes: 0, fetchMs: 0, filterMs: 0, buildMs: 0,
   err: '',
 };
@@ -4060,6 +4366,35 @@ function timeMat() {
   return timeDecalMat;
 }
 
+let timeBlockMat = null;
+/**
+ * A marker that is meant to look like the block it marks samples the same atlas the world's own meshes
+ * sample. The vertex colour carries the action wash (green for a place, red for a break) times the face
+ * shade, so a cube still reads as a solid object rather than a flat sticker; the sprite does the rest.
+ *
+ * polygonOffset is not decoration. A marker occupies the voxel it describes, so where that block is
+ * still standing its faces are COPLANAR with the world's own faces, and coplanar geometry z-fights: the
+ * block flickers between its own colour and the wash. A depth bias of a couple of units toward the
+ * camera makes the marker win that contest everywhere, at every zoom, with no shadow acne behind it.
+ */
+function timeBlockMatOf() {
+  if (!timeBlockMat) {
+    timeBlockMat = new THREE.MeshBasicMaterial({
+      map: atlasTex, vertexColors: true, side: THREE.DoubleSide,   // cross-model plants need both faces
+      alphaTest: S.alphaTest,                                      // the atlas holds cutout sprites too
+      fog: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2,
+    });
+  }
+  timeBlockMat.map = atlasTex;                                    // the atlas texture is rebuilt on reload
+  timeBlockMat.alphaTest = S.alphaTest;
+  // A marker wearing a block's face IS a block, so it obeys walls: a hill in front of it hides it. The
+  // `see through terrain` switch is about flat map paint - the heat tiles and the plate/tile layer - and
+  // applying it here is what turns a place filter into a wall of green seen through a house.
+  timeBlockMat.depthTest = true;
+  timeBlockMat.opacity = 1;                                       // opaque: shape carries the message
+  return timeBlockMat;
+}
+
 function clearTimeMesh() {
   if (TLAYER.mesh) {
     ledgerGroup.remove(TLAYER.mesh);
@@ -4068,6 +4403,7 @@ function clearTimeMesh() {
   }
   TLAYER.quads = 0; TLAYER.verts = 0; TLAYER.drawn = 0; TLAYER.quadSec = null;
   TLAYER.quadRow = null; TLAYER.voxel = null; TLAYER.voxelFrom = null;
+  TLAYER.itemEnd = null; TLAYER.markerEnd = null;
 }
 
 /**
@@ -4077,6 +4413,10 @@ function clearTimeMesh() {
 async function timeLoad() {
   const gen = ++TLAYER.gen;
   TLAYER.tl = null; TLAYER.err = '';
+  // A fresh timeline is a fresh arm: the playhead decision (play from the first logged change, or show
+  // the whole filter when paused was asked for) belongs to the moment rows first exist, and that is here
+  // as much as in setTime - the boot path with ?time=1 never goes through setTime at all.
+  TLAYER.freshArm = 1;
   clearTimeMesh();
   if (!LEDGER.meta) await ledgerMetaLoad();
   if (gen !== TLAYER.gen) return null;                     // the dimension changed under this request
@@ -4145,23 +4485,65 @@ function timeRebuild() {
     return;
   }
   TLAYER.err = '';
+  // What the markers look like is a cost decision with measured numbers behind it (see S.timeLook).
+  // The requested look is tried, and if the geometry it produces would not fit the ceiling the look steps
+  // down - and says so in the panel, because a silently smaller claim is the failure this viewer keeps
+  // having to correct.
   const t1 = performance.now();
-  const g = buildTimeQuads(TLAYER.tl, LEDGER.pack, got.order, { shrink: S.decalShrink });
-  TLAYER.buildMs = performance.now() - t1;
-  TLAYER.quadSec = g.quadSec;
-  TLAYER.quadRow = g.quadRow;
-  TLAYER.quads = g.quads; TLAYER.verts = g.verts;
-  if (g.skipped) TLAYER.err = `${g.skipped.toLocaleString()} rows had no baked ground under them`;
+  const budget = S.timeGeomMb * 1024 * 1024;
+  let built = null, look = 'tiles', why = '';
+  if (S.timeLook !== 'tiles' && assets) {
+    const tries = S.timeLook === 'plates' ? ['plates'] : ['blocks', 'plates'];
+    for (const lk of tries) {
+      resetMarkerLift();
+      const b = buildTimeBlocks(TLAYER.tl, LEDGER.pack, got.order, assets, blockNameIds(),
+        { plates: lk === 'plates' });
+      const lastTried = lk === tries[tries.length - 1];
+      if (b.stats.bytes <= budget || lastTried) {
+        built = b; look = lk;
+        if (b.stats.bytes > budget) {
+          why = `${lk} at this filter is ${Math.round(b.stats.bytes / 1048576)} MB, over the`
+            + ` ?timegeommb= ${S.timeGeomMb} MB ceiling - drawing it anyway because you asked for it`;
+        }
+        break;
+      }
+    }
+  }
+  TLAYER.look = look;
+  TLAYER.lookWhy = why;
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(g.col, 3));
+  if (built) {
+    // One entry per DRAWABLE ITEM, whatever an item is: a marker, a plate or a tile. Everything that
+    // speaks "how far through the filter is the playhead" (timeSeekRow, timeStep, the card's rewind)
+    // reads quadSec/quadRow, so switching look must not change what a playhead means.
+    TLAYER.quadSec = built.markerSec;
+    TLAYER.quadRow = built.markerRow;
+    TLAYER.itemEnd = TLAYER.markerEnd = built.markerEnd;
+    TLAYER.quads = built.stats.markers; TLAYER.verts = built.stats.verts;
+    if (built.stats.unknown) TLAYER.err = `${built.stats.unknown.toLocaleString()} changes name something this atlas has no model for`;
+    geo.setAttribute('position', new THREE.BufferAttribute(built.pos, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(built.uv, 2));
+    // The wash went in as normalized u8 with the face shade, exactly as the detail pass carries it.
+    geo.setAttribute('color', new THREE.Uint8BufferAttribute(built.col, 4, true));
+    geo.setIndex(new THREE.BufferAttribute(built.idx, 1));
+  } else {
+    const g = buildTimeQuads(TLAYER.tl, LEDGER.pack, got.order, { shrink: S.decalShrink });
+    TLAYER.itemEnd = null; TLAYER.markerEnd = null;
+    TLAYER.quadSec = g.quadSec;
+    TLAYER.quadRow = g.quadRow;
+    TLAYER.quads = g.quads; TLAYER.verts = g.verts;
+    if (g.skipped) TLAYER.err = `${g.skipped.toLocaleString()} rows had no baked ground under them`;
+    geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(g.col, 3));
+    geo.setIndex(new THREE.BufferAttribute(g.idx, 1));
+  }
+  TLAYER.buildMs = performance.now() - t1;
   // The index goes on the geometry, never as an attribute (gotcha 132-134), and it is 32-bit here: a
   // whole dimension of rows is 1.4M corners, over the 65 535 a Uint16 would reach.
-  geo.setIndex(new THREE.BufferAttribute(g.idx, 1));
   // One mesh spanning a whole dimension. Let three compute a sphere from 1.4M positions and it spends the
   // frame on it, so hand it a sphere that covers the map and turn culling off anyway.
   geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 1e9);
-  const mesh = new THREE.Mesh(geo, timeMat());
+  const mesh = new THREE.Mesh(geo, look === 'tiles' ? timeMat() : timeBlockMatOf());
   mesh.name = 'ledger-time';
   mesh.renderOrder = 902;                                   // over the heat layer (900) and pins (901)
   mesh.frustumCulled = false;
@@ -4173,6 +4555,17 @@ function timeRebuild() {
   // The cursor follows the MOMENT, not the row number: switching from every change to one player mid-play
   // should keep showing the same point in the log and keep running forward from there.
   TLAYER.cur = Math.max(0, quadAt(TLAYER.quadSec, TLAYER.sec) - 1);
+  // The first arm of the machine gets a playhead decision, and it is not "second 0". Second 0 is the oldest
+  // calendar instant in the log, and this server logged NOTHING for the first 8.5 hours of it, so a viewer
+  // who ticks the box sees an empty map and cannot tell that from a broken feature - which is the report
+  // this replaces. Playing is the promised behaviour, so it starts at the first logged change; anyone who
+  // asked for paused (?timeplay=0, or the play row) gets the other honest starting point: the END of the
+  // filter, where every change it holds is drawn, and they scrub back from there.
+  if (TLAYER.freshArm) {
+    TLAYER.freshArm = 0;
+    if (S.playTouched) timeSeekRow(TLAYER.quads - 1);
+    else { S.timePlay = 1; timeSeekRow(0); }
+  }
   histSync(true);
   if (panel) panel.refresh();
 }
@@ -4188,13 +4581,16 @@ function timeApply() {
   if (!TLAYER.mesh || !TLAYER.quadSec) return 0;
   const ph = playhead(TLAYER.tl, S.timeAt);
   const n = quadAt(TLAYER.quadSec, ph.sec);
-  TLAYER.mesh.geometry.setDrawRange(0, n * 6);
+  // A flat tile layer is n items x 6 indices. A block-shaped layer is not: a cube is 36 indices and a
+  // cross-model plant is 12, so the prefix comes out of the build as a per-item cumulative count.
+  TLAYER.mesh.geometry.setDrawRange(0, TLAYER.itemEnd ? (n ? TLAYER.itemEnd[n - 1] : 0) : n * 6);
   // Tiles off is a real mode, not a cosmetic one: with the terrain undo on, the blocks themselves show
   // the playhead, and a tile per logged change over a canopy only hides that. The playhead, the date and
   // the voxel undo all keep working; only the decal mesh stops being drawn.
   TLAYER.mesh.visible = !!S.timeTiles && n > 0;
   TLAYER.drawn = n;
   TLAYER.sec = ph.sec;
+  hoverDirty = true;          // the outline follows the playhead, so a moving playhead re-picks
   histSync();
   // A playhead move is the one thing in this viewer that happens every frame, and the panel's full sweep
   // runs once a second (and not at all while a thumb is held). So name the rows and sentences this move can
@@ -4209,6 +4605,18 @@ function timeApply() {
  * has rows; half a block of inset on each side is enough to open the seams and let the terrain read.
  */
 const heatInset = () => Math.max(0, (16 * (1 - Math.max(0.02, Math.min(1, S.decalShrink)))) / 2);
+
+/**
+ * What a change looks like. Re-cutting the layer is the only way to change it: the shape, the texture
+ * and the material all differ, and the cost ceiling decides what is affordable at this filter.
+ */
+function setTimeLook(v) {
+  const want = ['blocks', 'plates', 'tiles'].includes(v) ? v : 'blocks';
+  S.timeLook = want;
+  if (S.time) timeRebuild();
+  if (panel) panel.refresh();
+  return S.timeLook;
+}
 
 /** Tiles on/off. The playhead, the date and the voxel undo are unaffected: this is the decal mesh only. */
 function setTiles(on) {
@@ -4381,6 +4789,20 @@ function histOverlayChunks(cx, cz) {
  * has moved `S.timeTerrainStep` rows, and marks only chunks whose history changed or which carried
  * history at the previous playhead (that second half is how a block comes back).
  */
+/**
+ * The timeline names BLOCKS ("minecraft:deepslate_bricks"); the atlas holds STATES, and a block usually
+ * has dozens. One map, kept for the life of the asset load, picks the plainest state for a name - which
+ * is an honest answer to "what was there" when the log recorded block_state for 2,828 of its 424,599
+ * rows. Both the voxel undo and the block-shaped markers ask the same question, so they share it.
+ */
+function blockNameIds() {
+  if (!HIST.ids && assets) {
+    HIST.ids = stateIdsByName(assets.states);
+    HIST.airId = (assets.stateIndex.get('minecraft:air') ?? 0) + 1;
+  }
+  return HIST.ids;
+}
+
 function histSync(force = false) {
   const on = histWanted() ? 1 : 0;
   const wantCur = on ? Math.floor(TLAYER.cur) : -1;
@@ -4401,10 +4823,7 @@ function histSync(force = false) {
         HIST.cellsAt.set(`${c.cx},${c.cz}`, i);
       }
     }
-    if (!HIST.ids && assets) {
-      HIST.ids = stateIdsByName(assets.states);
-      HIST.airId = (assets.stateIndex.get('minecraft:air') ?? 0) + 1;
-    }
+    if (!HIST.ids && assets) blockNameIds();
   }
   let marked = 0, capped = 0, restore = 0;
   const room = () => (marked - restore) < S.timeTerrainMax;
@@ -4657,6 +5076,7 @@ function rewindTo(rw, btn, noteEl) {
 
 function setTimePlay(on) {
   if (!TLAYER.tl) { showLedger('the timeline is still loading, or this dimension has none'); return false; }
+  S.playTouched = 1;
   S.timePlay = on ? 1 : 0;
   // Playing again after the end restarts at the first logged change, not at the first calendar second:
   // the log's oldest instant may precede anything being built by weeks.
@@ -4668,6 +5088,7 @@ function setTimePlay(on) {
 function setTime(on) {
   S.time = on ? 1 : 0;
   TLAYER.err = '';
+  TLAYER.freshArm = 1;
   if (!S.time) { S.timePlay = 0; clearTimeMesh(); if (panel) panel.refresh(); return false; }
   // Ticking "time machine" is one decision, and what a viewer expects from it is the world at that moment,
   // not tiles painted over today. `?time=1` already armed the voxel undo; the panel path used to leave it
@@ -4714,7 +5135,15 @@ function timeNote() {
     ? (LEDGER.meta?.players?.find((p) => p.id === S.ledgerWho)?.name ?? `player ${S.ledgerWho}`) : 'anybody';
   const span = TLAYER.tl.spanSec;
   const playSecs = TLAYER.quads / Math.max(1, S.timeSpeed);
-  return `${fmtLedger(ph.ms)} - ${(TLAYER.drawn ?? 0).toLocaleString()} of ${TLAYER.quads.toLocaleString()}`
+  const built = TLAYER.look
+    ? `
+${TLAYER.look === 'blocks' ? 'drawn as the blocks themselves'
+      : TLAYER.look === 'plates' ? 'drawn as one textured plate per block' : 'drawn as flat tiles'}`
+      + `, ${Math.round((TLAYER.verts ?? 0) / 1000)}k corners`
+    : '';
+  const refused = TLAYER.lookWhy ? `
+(${TLAYER.lookWhy})` : '';
+  return `${fmtLedger(ph.ms)} - ${(TLAYER.drawn ?? 0).toLocaleString()} of ${TLAYER.quads.toLocaleString()}${built}${refused}`
     + ` ${timeClsName()} rows by ${who}, of ${TLAYER.tl.count.toLocaleString()} in the log`
     + ` (${(TLAYER.filterMs).toFixed(0)}/${(TLAYER.buildMs).toFixed(0)} ms to re-cut, ${(TLAYER.bytes / 1048576).toFixed(1)} MB in ${(TLAYER.fetchMs / 1000).toFixed(2)} s)`
     + `\nthe log spans ${fmtLedger(ph.firstMs)} to ${fmtLedger(ph.lastMs)}, but only ${TLAYER.activeDays}`
@@ -5161,7 +5590,8 @@ window.__world = {
     meta: LEDGER.meta ? 'yes' : 'no', err: LEDGER.err, cells: LEDGER.cells.length, max: LEDGER.max, quads: LEDGER.quads,
     dropped: LEDGER.dropped, noHeight: LEDGER.noHeight, kb: (LEDGER.bytes / 1024) | 0,
     fetchMs: +LEDGER.fetchMs.toFixed(1), buildMs: +LEDGER.buildMs.toFixed(1),
-    asks: LEDGER.asks, cardRows: LEDGER.cardRows, cardTotal: LEDGER.cardTotal,
+    asks: LEDGER.asks, cardRows: LEDGER.cardRows, cardTotal: LEDGER.cardTotal, askWhy: LEDGER.askWhy,
+    lastAsk: LEDGER.last,
     top: LEDGER.top?.map((c) => [c.cx, c.cz, c.n]) ?? null, topIdx: LEDGER.topIdx,
     drawn: !!LEDGER.mesh, pins: !!LEDGER.pin, cls: S.ledgerCls, who: S.ledgerWho, minN: S.ledgerMin,
   }),
@@ -5179,10 +5609,27 @@ window.__world = {
     kb: (TLAYER.bytes / 1024) | 0, fetchMs: +TLAYER.fetchMs.toFixed(1),
     filterMs: +TLAYER.filterMs.toFixed(1), buildMs: +TLAYER.buildMs.toFixed(1),
     drawRange: TLAYER.mesh ? [TLAYER.mesh.geometry.drawRange.start, TLAYER.mesh.geometry.drawRange.count] : null,
-    depthTest: timeDecalMat ? timeDecalMat.depthTest : null, xray: !!S.ledgerXray,
+    look: TLAYER.look, lookWhy: TLAYER.lookWhy, lookWant: S.timeLook, geomMbCap: S.timeGeomMb,
+    markerGeoMb: TLAYER.mesh ? +(TLAYER.mesh.geometry.attributes.position.array.byteLength
+      / 1048576).toFixed(1) : 0,
+    // The ACTIVE material, not whichever one happens to exist: with look=blocks the tile material may
+    // never have been made, and a null here once read as "the layer has no depth test".
+    depthTest: TLAYER.mesh ? !!TLAYER.mesh.material.depthTest : null,
+    opacity: TLAYER.mesh ? TLAYER.mesh.material.opacity : null,
+    polyOffset: TLAYER.mesh ? !!TLAYER.mesh.material.polygonOffset : null,
+    xray: !!S.ledgerXray,
     bytes: TLAYER.mesh ? TLAYER.mesh.geometry.attributes.position.array.byteLength + TLAYER.mesh.geometry.index.array.byteLength : 0,
   }),
   timeLoad, timeRebuild, timeApply, timeGoto, timePermille, timeSeekRow, timeRowAt, setTime, setTimePlay, timeNote,
+  setTimeLook, blockNameIds, askAt, timeHitAt, timeHitProbe, timeRowWorld, timeDrawnAt,
+  hover: () => ({ ...HOVER, setting: !!S.hover, everyMs: S.hoverMs, clickRayMs: TLAYER.hitMs }),
+  // Counters are lifetime unless a probe zeroes them: "passes 1, skips 394" is only an IDLE measurement if
+  // the window being measured starts at zero.
+  hoverReset: () => { HOVER.passes = 0; HOVER.skips = 0; HOVER.ms = 0; HOVER.why = ''; return { ...HOVER }; },
+  hoverAt: hoverAtPixel,
+  setHover: (v) => {
+    S.hover = v ? 1 : 0; if (!S.hover && hoverBox) hoverBox.visible = false; return !!S.hover;
+  },
   // The card and the playhead: a probe has to be able to ask about a block and rewind to one of its rows
   // without owning the scene graph.
   ledgerAsk, ledgerAskCentre, ledgerRewind, rewindNote,
@@ -5794,17 +6241,31 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         get: () => S.ledgerMin, set: (v) => { S.ledgerMin = Math.max(0, +v || 0); ledgerRebuild(); },
         hint: 'throw away the quiet chunks. most touched chunks hold two or three rows of something\nfalling over, and they are the bulk of the 20,322 decals; the floor is how you find the few that\nmatter, and it costs fill rather than requests. Panel stops, URL exact (?ledgermin=).' },
       { key: 'ledgerXray', label: 'see through terrain', kind: 'check',
-        fmt: () => (S.ledgerXray ? 'decals paint over the world' : 'hills hide them'),
+        fmt: () => (S.ledgerXray ? 'flat paint shows through - blocks still obey walls' : 'hills hide them'),
         get: () => !!S.ledgerXray,
         set: (v) => { S.ledgerXray = v ? 1 : 0;
           if (ledgerHeatMat) ledgerHeatMat.depthTest = !S.ledgerXray;
           if (timeDecalMat) timeDecalMat.depthTest = !S.ledgerXray; },
-        hint: 'an overlay that sits on the ground is honest and unreadable at whole-world scale: the hill\nin front of the valley hides the valley. Painting through the terrain turns it into a map of the\nlog; turn it off to ask whether the activity is visible from where you are. URL: ?noledgerxray' },
+        hint: 'an overlay that sits on the ground is honest and unreadable at whole-world scale: the hill\nin front of the valley hides the valley. Painting through the terrain turns it into a map of the\nlog; turn it off to ask whether the activity is visible from where you are. This switch only moves\nthe FLAT layers (heat tiles, and change tiles if a change looks like a tile): a change drawn as its\nown block always obeys walls, because a block seen through a house is a lie. URL: ?noledgerxray' },
+      { key: 'hoverOn', label: 'outline under the cursor', kind: 'check', live: false,
+        fmt: () => (HOVER.at ? `${HOVER.at.join(', ')} - ${HOVER.from}` : (HOVER.why || 'off')),
+        hint: 'A wire box around the one block the cursor is on, so "what did I just point at" has an\nanswer without clicking. It turns the change-layer green when the playhead has a logged change drawn on\nthat voxel, which is a Map lookup (0.0005 ms) rather than a ray against the marker buffer (42 ms).\nThe pick itself is 17.5 ms at the house framing, so it only runs when the cursor, the camera or the\nplayhead moved, and never during an orbit drag. Two colours (pale outside, dark inside) because a\nsingle-colour outline vanishes on either grass or deepslate. One box, reused.\nURL: ?nohover, ?hoverms=',
+        get: () => !!S.hover, set: (v) => { S.hover = v ? 1 : 0; if (!S.hover && hoverBox) hoverBox.visible = false; if (panel) panel.refresh(); } },
       { key: 'time', label: 'time machine', kind: 'check',
         fmt: () => (S.time ? `on - ${(TLAYER.drawn ?? 0).toLocaleString()} / ${(TLAYER.quads || 0).toLocaleString()}` : 'off'),
         get: () => !!S.time, set: (v) => setTime(v),
-        hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one decal per\nlogged change that has happened by the playhead. Costs one 6.4 MB request for this dimension\n(/ledger/timeline, 351,531 rows) and one mesh; moving the playhead is a draw range, not a rebuild, so two\nyears of history play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole\ndimension, 35 ms for one player. Ticking this also arms "undo the log in the blocks too" unless you have\ntoggled that yourself - tiles painted over today are only half of the feature. M. URL: ?time=1' },
-      { key: 'timeTiles', label: 'draw the change tiles', kind: 'check',
+        hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one marker per\nlogged change that has happened by the playhead. Costs one 6.4 MB request for this dimension\n(/ledger/timeline, 351,531 rows) and one mesh; moving the playhead is a draw range, not a rebuild, so two\nyears of history play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole\ndimension, 35 ms for one player. Ticking this also arms "undo the log in the blocks too" unless you have\ntoggled that yourself, and it starts PLAYING at the first logged change: second 0 of this log is the oldest\ncalendar instant, and the server logged nothing for its first 8.5 hours, so an empty map at second 0 is\nwhat a tick used to look like. Ask for paused (?timeplay=0) and it starts at the end instead, with every\nchange the filter holds drawn, and you scrub back. M. URL: ?time=1' },
+      { key: 'timeLook', label: 'a change looks like', kind: 'select',
+        options: [{ value: 'blocks', label: 'the block itself, tinted' },
+          { value: 'plates', label: 'the top face of the block, tinted' },
+          { value: 'tiles', label: 'a flat coloured tile' }],
+        get: () => S.timeLook, set: (v) => setTimeLook(v),
+        hint: 'The baked model of the block itself, tinted green for a place or red for a break, is what\nmakes a marker readable close in: a green square on a roof does not say deepslate brick. It is also\nfour times the geometry, and it costs frames. Measured in the page over the 89,613-marker place\nfilter of this dimension: blocks 2.21 M verts / 38 MB / 0.2 s to build / 74 fps, plates 0.47 M verts / 8.1 MB /\n0.05 s / 179 fps, flat tiles 0.36 M verts / 6.2 MB / 0.01 s / 216 fps. Past "overlay memory" below the\nlook steps down on its own, and the sentence under the playhead says which it chose and why.\nURL: ?timelook=plates' },
+      { key: 'timeGeomMb', label: 'overlay memory', min: 4, max: 512, step: 4,
+        fmt: (v) => `${Math.round(v)} MB max`, get: () => S.timeGeomMb,
+        set: (v) => { S.timeGeomMb = Math.max(2, Math.min(2048, +v || 4)); if (S.time) timeRebuild(); },
+        hint: 'The ceiling a block-shaped replay may reach, in the MB the marker builder counts (MiB). The\nplace filter fits at the 128 default: 66 MB allocated, 38 MB of it positions plus indices on the GPU,\n0.2 s to build, 74 fps over this 12.6 M-vert scene. The break filter does not fit either way (245 MB as\nblocks, 170 MB as plates), so it steps to plates, says so under the playhead, and draws anyway because\nthat is what was asked - 37 fps with all 202,376 of them up. Set it to what your machine will hold.\nURL: ?timegeommb=' },
+      { key: 'timeTiles', label: 'draw the change markers', kind: 'check',
         fmt: () => (S.timeTiles ? `${(TLAYER.drawn ?? 0).toLocaleString()} tiles` : 'off - the blocks speak'),
         get: () => !!S.timeTiles, set: (v) => setTiles(v),
         hint: 'The time machine has two halves: flat tiles over every block the log touched, and the blocks\nthemselves corrected back to the playhead ("undo the log in the blocks too", below). Tiles are the cheap\nhalf - one mesh, a draw range per frame, 90,045 quads for this dimension\'s places - but a tile per\nlogged change over a canopy hides the very world it is describing. Off leaves the playhead, the date\nand the terrain undo working, which is the "watch the house get built" view with nothing in the way.\nM still brings the layer back. URL: ?timetiles=0' },
@@ -5832,7 +6293,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         hint: 'Logged changes per wall-clock second, because that is the only rate that works here: this\nserver logged activity on 9 of the 822 days its log spans, and one of those days holds 83,101 rows. A\nplayhead driven by the calendar would sit still for a month and then blur. The thumb names 15 rates\nfrom 1/s to 250,000/s, and the box beside it takes any number you type: at 1/s you watch one block\nappear per second, at 5/s one player\'s 9,651 places take half an hour, at 20,000/s the whole overworld\nlog plays in 18 s. The sentence below does that arithmetic. URL: ?timespeed=' },
       { key: 'timeCls', label: 'replay which action', kind: 'select', options: timeClassOptions(),
         get: () => S.timeCls, set: (v) => { S.timeCls = +v || 0; timeRebuild(); },
-        hint: 'Which rows get a decal, and what colour it is. Blocks only is the one that reads as building:\n90,045 place rows against 202,826 break rows. The playhead counts THIS filter, so switching mid-play\nkeeps the fraction of the filtered history, not the date. Any colour is 7.4 M triangles - the place set\nis 1.1 M.' },
+        hint: 'Which rows get a marker, and what colour it is. Blocks only is the one that reads as building:\n90,045 place rows against 202,826 break rows. The playhead counts THIS filter, so switching mid-play\nkeeps the fraction of the filtered history, not the date. Triangles as drawn here: the place set 1.1 M\n(74 fps), the break set 3.0 M as plates (37 fps), any change 3.3 M as plates (25 fps). Pick the filter for\nthe story you want, not for completeness.' },
       { key: 'timeTerrain', label: 'undo the log in the blocks too', kind: 'check',
         fmt: () => (S.timeTerrain ? `${histTotals().chunks.toLocaleString()} chunks, ${histTotals().edits.toLocaleString()} blocks` : 'off'),
         get: () => !!S.timeTerrain, set: (v) => { S.timeTerrain = v ? 1 : 0; S.timeTouched = 1; histSync(true); },

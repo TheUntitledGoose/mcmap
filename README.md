@@ -217,6 +217,9 @@ row also has a URL parameter, so a view is a link:
 ?noaa / ?aa=1         multisample (context flag: it is chosen at boot, not live)
 ?res=1.5              draw resolution (supersampling above 1)
 ?ledger=1             block-history overlay; ?ledgerwho=, ?ledgercls=, ?ledgermin=
+?time=1               the time machine; ?timecls=2 (kind), ?timeplay=0 (paused),
+                      ?timelook=blocks|plates|tiles, ?timegeommb=128, ?timetiles=0,
+                      ?timeterrain=0 (undo the log in the voxels), ?hover=0
 ?debug=1              instrument panel and HUD
 ```
 
@@ -228,7 +231,7 @@ the knobs that are only interesting while measuring.
 ## Tests and measurement
 
 ```bash
-npm test                # 323 tests: formats, codecs, stores, mesher, lighting, collision,
+npm test                # 384 tests: formats, codecs, stores, mesher, lighting, collision,
                         # pool split, ledger, coverage, HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds
 npm run browser:probe   # headless Chromium against a live server: eval, framebuffer, shot

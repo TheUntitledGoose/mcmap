@@ -229,7 +229,10 @@ export class VertexStream {
   }
 }
 
-const hash3 = (x, y, z) => {
+// Exported because a lone marker (web/js/ledger-blocks.mjs) has to pick the same variant of a block at the
+// same world position the world itself would show, and two hashes that disagree is a marker in the wrong
+// texture.
+export const hash3 = (x, y, z) => {
   let h = (x * 73856093) ^ (y * 19349663) ^ (z * 83492791);
   h ^= h >>> 15; h = Math.imul(h, 2246822519); h ^= h >>> 13;
   return h >>> 0;
@@ -472,7 +475,10 @@ export function faceColor(out, shadeMul, emissive, tint) {
 const _col = [0, 0, 0];
 const _col4 = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
 
-function emitCubeFace(stream, cell, code, bx, y, bz, lx, lz, f, state, occ, AOL, lit, LUT) {
+// Exported for the time layer's block-shaped markers: the only way a marker looks like the block it marks
+// is to run the same face/sprite code the world runs. Callers that pass occ/AOL/lit/LUT as null get a
+// flat-shaded sprite cube, which is what a claim about the log should be.
+export function emitCubeFace(stream, cell, code, bx, y, bz, lx, lz, f, state, occ, AOL, lit, LUT) {
   // a mirrored/rotated face code uses the same corner ring, only the sprite uv moves. The *visit*
   // order is RING_ORDER, which is the one that winds the quad outward for a front-side renderer;
   // uv, corner offset and AO all follow the same ring index k so a sprite stays upright.
@@ -528,7 +534,7 @@ function tintOf(state) {
 }
 export { tintOf };
 
-function emitQuad(assets, streams, state, qi, bx, y, bz, chunk, at, lx, lz, stats, occ, AOL, lit, LUT, darkcut = -1, buried = null) {
+export function emitQuad(assets, streams, state, qi, bx, y, bz, chunk, at, lx, lz, stats, occ, AOL, lit, LUT, darkcut = -1, buried = null) {
   const gi = assets.ref[qi * 2];
   const pk = assets.ref[qi * 2 + 1];
   const texIdx = pk & 0xfff;

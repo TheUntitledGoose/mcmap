@@ -1,0 +1,240 @@
+// M12b Tier 3: a logged change drawn as the block it was, tinted by what happened.
+//
+// The failure this guards is the one the flat tiles have: a marker that says "something happened here" is
+// not a picture of the block. So these tests ask whether a place marker and a break marker of the same
+// block actually come out different, whether one cube marker is really a cube (36 indices, not 6), and
+// whether the cumulative per-marker counts that feed `setDrawRange` are the ones a cube needs - because
+// the tile layer's `n * 6` arithmetic would cut a cube into confetti.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+
+import { Assets } from '../web/js/assets.js';
+import { readPack, decodeTimeline } from '../shared/ledger-pack.mjs';
+import { buildPack } from '../server/ledger-pack.mjs';
+import { stateIdsByName } from '../web/js/ledger-terrain.mjs';
+import {
+  ACTION_WASH, buildTimeBlocks, markerAt, markerOfIndex, resetMarkerLift,
+} from '../web/js/ledger-blocks.mjs';
+import { filterRows } from '../web/js/ledger-time.mjs';
+import { fakeLog } from './fake-ledger.mjs';
+
+const T = (s) => 1717174690000 + s * 1000;
+
+function loadAssets() {
+  const json = JSON.parse(fs.readFileSync('build/assets/atlas.json', 'utf8'));
+  const g = fs.readFileSync('build/assets/geometry.bin');
+  return new Assets(json, g.buffer.slice(g.byteOffset, g.byteOffset + g.byteLength));
+}
+
+// rows: [x, y, z, actionId, name, oldName, sec] - the same shape the bake writes into a pack.
+function fakeTL(assets, rows) {
+  const L = fakeLog(rows.map(([x, y, z, aid, name, old, sec]) =>
+    [1, x, y, z, aid, 1, T(sec), name, old]));
+  const { buf } = buildPack(L, 1, 'region', { heightOf: () => 64 });
+  const P = readPack(buf);
+  const tl = decodeTimeline(buf.subarray(P.tlBytes[0], P.tlBytes[1]));
+  if (!tl.count) throw new Error('fake pack wrote no timeline rows');
+  return { tl, P };
+}
+
+function build(rows, opts = {}) {
+  const assets = loadAssets();
+  const { tl, P } = fakeTL(assets, rows);
+  resetMarkerLift();
+  return buildTimeBlocks(tl, P, Array.from({ length: tl.count }, (_, i) => i), assets,
+    stateIdsByName(assets.states), opts);
+}
+
+/** Mean of one colour channel over the whole marker set. The colour stream is normalized u8, 4 wide. */
+const meanCh = (b, ch) => {
+  let s = 0, n = 0;
+  for (let v = 0; v < b.col.length / 4; v++) { s += b.col[v * 4 + ch]; n++; }
+  return n ? s / n : 0;
+};
+
+test('a place marker and a break marker of the same block are not the same picture', () => {
+  const place = build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10]]);
+  const brk = build([[2, 64, 3, 3, 'minecraft:air', 'minecraft:stone', 10]]);
+  assert.equal(place.stats.markers, 1);
+  assert.equal(brk.stats.markers, 1);
+  assert.equal(place.stats.cubes, 1);
+  assert.equal(brk.stats.cubes, 1);
+
+  // Stone is grey in the atlas, so the wash is the only thing that can tell these apart - and a fill
+  // colour (the flat tile palette) would be a multiplier that darkens a sprite instead of tinting it.
+  const pR = meanCh(place, 0), pG = meanCh(place, 1);
+  const bR = meanCh(brk, 0), bG = meanCh(brk, 1);
+  assert.ok(pG > pR, `place wash should favour green: R=${pR.toFixed(1)} G=${pG.toFixed(1)}`);
+  assert.ok(bR > bG, `break wash should favour red: R=${bR.toFixed(1)} G=${bG.toFixed(1)}`);
+  assert.ok(pG > bG && bR > pR, 'the two washes must move in opposite directions');
+  assert.ok(pR > 60 && bR > 60, `a wash must not blacken the sprite: R place ${pR} break ${bR}`);
+});
+
+test('one cube marker is a cube, not a quad: the draw range is cumulative indices', () => {
+  const one = build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10]]);
+  assert.equal(one.markerEnd.length, 1);
+  assert.equal(one.markerSec.length, 1);
+  assert.equal(one.markerRow.length, 1);
+  const end = one.markerEnd[0];
+  assert.equal(one.idx.length, end, 'the index stream must end where the last marker ends');
+  assert.equal(end % 3, 0, 'a marker must whole triangles');
+  assert.ok(end >= 6 * 6, `a lone cube shows six quads = 36 indices, got ${end}`);
+  assert.notEqual(end, 1 * 6, 'n * 6 is the plate arithmetic and would cut the cube apart');
+
+  const two = build([
+    [2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],
+    [9, 64, 9, 2, 'minecraft:dirt', 'minecraft:air', 20],
+  ]);
+  assert.ok(two.markerEnd[0] < two.markerEnd[1], 'marker ends must climb in time order');
+  assert.ok(two.markerSec[0] < two.markerSec[1], 'markers are built in filter time order');
+  assert.ok(two.markerEnd[1] - two.markerEnd[0] >= 36, 'the second cube is a whole cube too');
+  assert.equal(two.markerRow[0], 0);
+  assert.equal(two.markerRow[1], 1);
+});
+
+test('a ray index answers which logged row it belongs to', () => {
+  const b = build([
+    [2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],
+    [9, 64, 9, 3, 'minecraft:air', 'minecraft:dirt', 20],
+  ]);
+  const mid = b.markerEnd[0];                 // first index of the second marker
+  assert.equal(markerOfIndex(b.markerEnd, 0), 0);
+  assert.equal(markerOfIndex(b.markerEnd, mid - 1), 0);
+  assert.equal(markerOfIndex(b.markerEnd, mid), 1);
+  assert.equal(markerOfIndex(b.markerEnd, b.idx.length - 1), 1);
+  assert.equal(markerOfIndex(b.markerEnd, b.idx.length), -1, 'past the end is past the end');
+  // A pack's time base is its own oldest row, so the two secs are 0 and 10 - not 10 and 20.
+  assert.deepEqual(Array.from(b.markerSec), [0, 10]);
+  assert.equal(markerAt(b.markerSec, -1), 0, 'before the first change, nothing is drawn');
+  assert.equal(markerAt(b.markerSec, 5), 1, 'one marker between the two changes');
+  assert.equal(markerAt(b.markerSec, 99), 2, 'and both after');
+});
+
+test('a change the atlas has no shape for is counted, and an air row is skipped', () => {
+  const b = build([
+    [2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],
+    [3, 64, 3, 6, 'minecraft:bat', '', 20],           // an entity: no block, no sprite
+    [4, 64, 4, 2, 'minecraft:air', '', 30],           // a place of air
+  ]);
+  assert.equal(b.stats.markers, 1);
+  assert.equal(b.stats.unknown, 1, 'a name the atlas cannot draw must be a number, not a silence');
+  assert.equal(b.stats.air, 1);
+  assert.ok(!b.markerSec.some((s) => s === 30), 'the air row must not reach the timeline');
+});
+
+test('plates cost a fraction of blocks, and a quad ceiling stops the build instead of lying', () => {
+  const rows = [];
+  for (let x = 0; x < 12; x++) for (let z = 0; z < 12; z++) {
+    rows.push([x, 64, z, 2, 'minecraft:stone', 'minecraft:air', 10 + x * 12 + z]);
+  }
+  const cubes = build(rows, {});
+  const plates = build(rows, { plates: true });
+  assert.equal(cubes.stats.cubes, 144);
+  assert.equal(plates.stats.plates, 144);
+  assert.ok(plates.stats.quads * 4 < cubes.stats.quads, 'a plate is one face, not six');
+  assert.ok(plates.stats.bytes * 4 < cubes.stats.bytes);
+
+  const capped = build(rows, { maxQuads: 300 });
+  assert.equal(capped.stats.stopped, true, 'the ceiling must say it stopped');
+  assert.ok(capped.stats.markers < 144, 'and stop rather than promise the whole filter');
+  assert.ok(capped.stats.markers > 0, 'the markers it does have are the OLDEST ones');
+  assert.ok(capped.markerSec[capped.markerSec.length - 1]
+    < cubes.markerSec[cubes.markerSec.length - 1], 'cutting the tail is what stopping means');
+});
+
+test('the wash table covers every action class the timeline can hold', () => {
+  assert.equal(ACTION_WASH.length, 7);
+  for (const w of ACTION_WASH) {
+    assert.equal(w.length, 3);
+    for (const c of w) assert.ok(c >= 0 && c <= 1.2, 'a wash is a multiplier on the sprite');
+  }
+});
+
+test('the panel sentence about what fits is a measured number, not a guess', () => {
+  // The real overworld pack, the real atlas. "The place filter is block-shaped near you" and
+  // "the ceiling is what stops the any-change filter" are both claims, so both are measured here.
+  const assets = loadAssets();
+  const fs2 = fs.readFileSync('build/ledger/region.ledpack');
+  const P = readPack(fs2.buffer.slice(fs2.byteOffset, fs2.byteOffset + fs2.byteLength));
+  const tl = decodeTimeline(fs2.subarray(P.tlBytes[0], P.tlBytes[1]));
+  const byName = stateIdsByName(assets.states);
+
+  const place = [];
+  for (let i = 0; i < tl.count; i++) if (tl.action[i] === 1) place.push(i);
+  resetMarkerLift();
+  const b = buildTimeBlocks(tl, P, place, assets, byName, {});
+  assert.equal(b.stats.rows, place.length);
+  assert.equal(b.stats.stopped, false, 'the place filter fits, which is why it is the default filter');
+  assert.ok(b.stats.markers > 80000, `tens of thousands of block markers, got ${b.stats.markers}`);
+  // 66 MB of geometry for a whole dimension of places: the reason a ceiling exists at all.
+  assert.ok(b.stats.bytes > 40 * 1024 * 1024, 'block markers are a real allocation, not free');
+  assert.ok(b.stats.bytes < 128 * 1024 * 1024);
+  assert.ok(b.stats.unknown > 0 && b.stats.unknown < b.stats.markers / 50,
+    `a few names the atlas cannot draw: ${b.stats.unknown} of ${b.stats.markers}`);
+
+  const anyChange = Array.from({ length: tl.count }, (_, i) => i);
+  resetMarkerLift();
+  const all = buildTimeBlocks(tl, P, anyChange, assets, byName, { maxQuads: 100000 });
+  assert.equal(all.stats.stopped, true, 'a whole dimension of changes does not fit a near-you budget');
+  assert.ok(all.stats.markers < anyChange.length);
+});
+
+test('the wash covers every action class the timeline can carry', () => {
+  assert.equal(ACTION_WASH.length, 7);                  // six classes plus the outside-the-six bucket
+  for (const w of ACTION_WASH) {
+    assert.equal(w.length, 3);
+    assert.ok(w.every((c) => c > 0 && c <= 1), 'a wash is a multiplier, never a fill');
+  }
+  assert.ok(ACTION_WASH[1][1] > ACTION_WASH[1][0], 'a place wash lifts green over red');
+  assert.ok(ACTION_WASH[2][0] > ACTION_WASH[2][1], 'a break wash lifts red over green');
+});
+
+test('marker draw ends climb, and the hit maps back to the marker that drew it', () => {
+  const b = build([
+    [2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],
+    [4, 64, 3, 2, 'minecraft:seagrass', 'minecraft:air', 20],
+    [6, 64, 3, 3, 'minecraft:air', 'minecraft:stone', 30],
+  ]);
+  for (let i = 1; i < b.markerEnd.length; i++) assert.ok(b.markerEnd[i] > b.markerEnd[i - 1]);
+  assert.equal(b.markerEnd[b.markerEnd.length - 1], b.idx.length);
+  // A click raycasts triangles: one triangle per face, three indices each, two triangles per quad. Asking
+  // with the raw triangle number times six looks at twice the offset; the page hit this by answering a
+  // marker further along the buffer than the pixel it was aimed at.
+  for (const item of [0, 1, 2]) {
+    const start = item ? b.markerEnd[item - 1] : 0;
+    for (const off of [0, 3, 6, b.markerEnd[item] - start - 3]) {
+      assert.ok(Number.isInteger((start + off) / 3), 'a marker starts and ends on a triangle');
+      const q = (start + off) / 3;                       // what three's faceIndex reports
+      assert.equal(markerOfIndex(b.markerEnd, Math.floor(q / 2) * 6), item, `item ${item} offset ${off}`);
+    }
+    assert.ok(markerOfIndex(b.markerEnd, b.markerEnd[item]) !== item, 'the next marker starts at its end');
+  }
+});
+
+test('a plant marker is the plant, not a cube - and its index count is what the draw range uses', () => {
+  const b = build([[9, 64, 9, 2, 'minecraft:grass', 'minecraft:air', 10]]);
+  assert.equal(b.stats.models, 1, 'grass is a model state in this atlas');
+  assert.equal(b.stats.cubes, 0);
+  // grass bakes to 4 quads, so the marker spans 24 indices, not a cube's 36. A draw range computed as
+  // "items x 6" or "items x 36" would either cut the plant in half or eat the next marker.
+  assert.equal(b.markerEnd[0], 24);
+  assert.equal(b.idx.length, 24);
+  const cube = build([[9, 64, 9, 2, 'minecraft:stone', 'minecraft:air', 10]]);
+  assert.equal(cube.markerEnd[0], 36);
+});
+
+test('the real overworld place filter fits under the default ceiling, as blocks', () => {
+  const realBuf = fs.readFileSync('build/ledger/region.ledpack');
+  const real = readPack(realBuf.buffer.slice(realBuf.byteOffset, realBuf.byteOffset + realBuf.byteLength));
+  const tl = decodeTimeline(realBuf.subarray(real.tlBytes[0], real.tlBytes[1]));
+  assert.ok(tl.count > 300000, 'the shipped overworld timeline');
+  const got = filterRows(tl, { who: 0, cls: 2 });        // cls 2 = block place
+  assert.ok(got.n > 80000, `the place filter, got ${got.n}`);
+  const b = buildTimeBlocks(tl, real, got.order, loadAssets(), stateIdsByName(loadAssets().states),
+    { maxBytes: Infinity });
+  assert.ok(b.stats.bytes > 20 * 1024 * 1024, 'a block per change is a real cost, and the panel says so');
+  assert.ok(b.stats.bytes < 128 * 1024 * 1024, 'and the default ceiling has to hold it');
+  assert.ok(b.stats.verts < 4_000_000);
+  assert.ok(b.stats.markers > 80000);
+});
