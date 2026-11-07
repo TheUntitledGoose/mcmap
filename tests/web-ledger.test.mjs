@@ -265,3 +265,38 @@ test('the baked overworld pack answers the two questions the UI asks', (t) => {
   assert.ok(collectCells(P, { minN: 100 }).cells.length < all.cells.length,
     'the "hide the specks" floor actually hides something');
 });
+
+test('a heat tile can be pulled in from its chunk footprint, and never through its own centre', () => {
+  // One tile per touched chunk at full 16 x 16 is a continuous floor wherever the log has rows, which is
+  // the "I can't see the world" complaint about the overlay. Inset opens the seams; the clamp is what
+  // stops a silly inset from flipping the winding and drawing the overlay face-down.
+  const P = packOf([[0, 0, 2, 1], [1, 0, 2, 1]], () => 70);
+  const cells = collectCells(P).cells;
+  const span = (g, q) => {
+    const xs = [0, 1, 2, 3].map((k) => g.pos[(q * 4 + k) * 3]);
+    const zs = [0, 1, 2, 3].map((k) => g.pos[(q * 4 + k) * 3 + 2]);
+    return [Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs)];
+  };
+  const flat = buildHeatQuads(cells, { bias: 0.6 });
+  assert.equal(flat.inset, 0, 'the default is still the whole chunk');
+  assert.deepEqual(span(flat, 0), [0, 16, 0, 16]);
+
+  const gap = buildHeatQuads(cells, { bias: 0.6, inset: 2 });
+  assert.equal(gap.inset, 2);
+  assert.equal(gap.quads, flat.quads, 'inset costs nothing in quads, verts or indices');
+  assert.equal(gap.verts, flat.verts);
+  assert.deepEqual(span(gap, 0), [2, 14, 2, 14], 'one block of air on every side of the tile');
+  // Inset is symmetric, so the tile still stands over its own chunk.
+  const cx = [0, 1, 2, 3].reduce((s, k) => s + gap.pos[k * 3], 0) / 4;
+  assert.ok(Math.abs(cx - 8) < 1e-4, `chunk 0,0 keeps its centre, got ${cx}`);
+  const a = [0, 1, 2].map((k) => gap.pos[k * 3 + (k ? 1 : 0)]);
+  const u = [gap.pos[3] - gap.pos[0], gap.pos[4] - gap.pos[1], gap.pos[5] - gap.pos[2]];
+  const v = [gap.pos[6] - gap.pos[0], gap.pos[7] - gap.pos[1], gap.pos[8] - gap.pos[2]];
+  assert.ok(u[2] * v[0] - u[0] * v[2] > 0, 'and still faces up, or FrontSide would draw nothing');
+  void a;
+
+  const silly = buildHeatQuads(cells, { bias: 0.6, inset: 999 });
+  assert.equal(silly.inset, 7.5, 'the clamp keeps the tile from passing through itself');
+  const w0 = silly.pos[0], w2 = silly.pos[6];
+  assert.ok(w2 > w0, `x still increases across the quad (${w0} -> ${w2})`);
+});

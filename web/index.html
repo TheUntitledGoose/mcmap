@@ -114,6 +114,19 @@
     border: 0; border-left: 2px solid #2c3642; padding: 2px 0 2px 7px; margin: 1px 0; color: #cfd8e3;
     font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; }
   .lcard-row:hover { border-left-color: #ffb454; background: rgba(255, 255, 255, .05); }
+  /* Each evidence line makes a claim about one block at one moment, so it gets two answers: go there, or
+     rewind the replay to that moment. They are separate buttons because one click cannot be both, and a
+     modifier key nobody remembers is worse than a small arrow. Green, because it is the time machine's
+     colour, not the map's. */
+  .lcard-line { display: flex; align-items: stretch; gap: 3px; }
+  .lcard-line .lcard-row { flex: 1 1 auto; min-width: 0; }
+  .lcard-seek { flex: 0 0 auto; width: 24px; background: none; border: 0; border-left: 2px solid #2c3642;
+    color: #6f7a87; cursor: pointer; padding: 2px 0;
+    font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .lcard-seek:hover, .lcard-seek.busy { color: #8fe3a8; border-left-color: #8fe3a8;
+    background: rgba(255, 255, 255, .05); }
+  .lcard-note { color: #8fe3a8; margin: 6px 0 0; }
+  .lcard-note.bad { color: #ff8f7a; }
 </style>
 </head>
 <body>

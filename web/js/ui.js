@@ -17,8 +17,9 @@ const el = (tag, cls, text) => {
  *   title   header text
  *   items   [{ key, label, kind: 'range'|'check'|'select'|'section', get, set, min, max, maxFn, step,
    *             stops,
- *             fmt, hint, live, options, open }]
- *           `live` (default) applies on every input event; otherwise on release only.
+ *             fmt, hint, live, end, options, open }]
+ *           `live` (default) applies on every input event; otherwise on release only. `end` runs once on
+ *           release, after the normal apply, for the part of a control's work that is too heavy per event.
  *           A `section` item opens a collapsible group: every item after it lives inside, until the
  *           next section. Sections exist so the six settings people actually use are not buried
  *           under twenty that only matter for tuning the renderer.
@@ -88,6 +89,21 @@ export function mountPanel({ title = 'settings', items = [], actions = [], width
     // `stops` lets one row cover a small useful range and a long reach: 0..64 chunks in 19 named
     // steps, where a linear 0..64 bar would put every sensible value in its first tenth.
     const stops = Array.isArray(it.stops) ? it.stops : null;
+    // `typeable` turns the value column into a number field. A stops slider is chosen for a thumb, so it
+    // cannot say "3 changes per second"; a row that owns its own reach should still let you type what you
+    // mean. The typed value is what the page stores and the thumb merely lands on the nearest stop - the
+    // same rule a URL value already follows - and a focused field is never rewritten from under the typist.
+    let num = null;
+    if (it.typeable) {
+      num = el('input', 'panel-valnum');
+      num.type = 'number';
+      num.min = String(it.numMin ?? it.min ?? 0);
+      num.max = String(it.numMax ?? it.max ?? 1e6);
+      num.step = String(it.numStep ?? 1);
+      num.value = it.get();
+      if (it.hint) num.title = it.hint;
+      num.addEventListener('change', () => it.set(+num.value));
+    }
     let input;
     if (it.kind === 'check') {
       input = el('input');
@@ -110,12 +126,16 @@ export function mountPanel({ title = 'settings', items = [], actions = [], width
       const commit = () => it.set(stops ? atStop(stops, +input.value) : +input.value);
       if (it.live !== false) input.addEventListener('input', commit);
       input.addEventListener('change', commit);      // release, for the controls that re-mesh
+      // A row can cost more the moment the thumb is let go than it costs while dragging. `end` is that
+      // second half: the playhead row moves decals on every input event and only re-cuts terrain once the
+      // gesture ends, which is what lets a live scrub stay cheap.
+      if (it.end) input.addEventListener('change', () => it.end(stops ? atStop(stops, +input.value) : +input.value));
     }
     if (it.kind === 'select') row.append(lab, input);
-    else row.append(lab, input, out);
+    else row.append(lab, input, num ?? out);
     slot.append(row);
     rows.set(it.key, {
-      it, input, out, stops,
+      it, input, out, num, stops,
       fmt: it.fmt ?? ((v) => fmtDefault(v, it.step ?? 1)),
       // A range with no explicit `kind` is still a range - checking `it.kind === 'range'` here was
       // how the zoom slider kept its stale ceiling.
@@ -135,33 +155,49 @@ export function mountPanel({ title = 'settings', items = [], actions = [], width
     body.append(bar);
   }
 
+  const refreshRow = ({ it, input, out, fmt, max, stops, num }) => {
+    const v = it.get();
+    if (it.kind === 'check') {
+      input.checked = !!v;
+      // A tick can still be worth a sentence: a check row that declares `fmt` says what it is on
+      // about ("on - to 739 m"), which is the part a tick cannot show. Rows without one stay bare.
+      if (it.fmt) out.textContent = fmt(v);
+    } else if (it.kind === 'select') { if (input.value !== String(v)) input.value = v; }
+    else {
+      // A slider whose reach depends on other settings (the zoom slider tops out where the far
+      // view runs out) gets its ceiling here, so it cannot be dragged into empty sky.
+      if (max) input.max = max();
+      if (document.activeElement !== input) input.value = stops ? stopIndex(stops, v) : v;
+      if (num) { if (document.activeElement !== num) num.value = v; }
+      else out.textContent = fmt(v, it.step ?? 1);
+    }
+  };
+  const refreshNote = (n) => { const t = noteText(n.it); if (n.node.textContent !== t) n.node.textContent = t; };
   const refresh = () => {
     if (width && !drag) applyW(+width.get());
-    for (const n of notes) { const t = noteText(n.it); if (n.node.textContent !== t) n.node.textContent = t; }
-    for (const { it, input, out, fmt, max, stops } of rows.values()) {      const v = it.get();
-      if (it.kind === 'check') {
-        input.checked = !!v;
-        // A tick can still be worth a sentence: a check row that declares `fmt` says what it is on
-        // about ("on - to 739 m"), which is the part a tick cannot show. Rows without one stay bare.
-        if (it.fmt) out.textContent = fmt(v);
-      }
-      else if (it.kind === 'select') { if (input.value !== String(v)) input.value = v; }
-      else {
-        // A slider whose reach depends on other settings (the zoom slider tops out where the far
-        // view runs out) gets its ceiling here, so it cannot be dragged into empty sky.
-        if (max) input.max = max();
-        if (document.activeElement !== input) input.value = stops ? stopIndex(stops, v) : v;
-        out.textContent = fmt(v, it.step ?? 1);
-      }
+    for (const n of notes) refreshNote(n);
+    for (const r of rows.values()) refreshRow(r);
+  };
+  // A subset refresh, because the time machine moves its playhead every frame and the full sweep repaints
+  // every sentence in the panel (several of which do arithmetic). Rows and notes are named by key; an
+  // unnamed note is only reached by the full sweep, which the frame loop still runs once a second.
+  const refreshRows = (keys) => {
+    for (const k of keys) {
+      const r = rows.get(k);
+      if (r) refreshRow(r);
+      for (const n of notes) if (n.it.key === k) refreshNote(n);
     }
   };
   // A slider being dragged must not be rewritten from the page's state mid-gesture, and a slider
   // the camera moves under the user's thumb (zoom follows the mouse wheel) must be kept honest.
   let busy = false;
-  for (const { input } of rows.values()) {
-    input.addEventListener('pointerdown', () => { busy = true; });
-    input.addEventListener('keydown', () => { busy = true; });
-    input.addEventListener('keyup', () => { busy = false; });
+  for (const r of rows.values()) {
+    for (const node of [r.input, r.num]) {
+      if (!node) continue;
+      node.addEventListener('pointerdown', () => { busy = true; });
+      node.addEventListener('keydown', () => { busy = true; });
+      node.addEventListener('keyup', () => { busy = false; });
+    }
   }
   window.addEventListener('pointerup', () => { busy = false; });
   window.addEventListener('pointercancel', () => { busy = false; });
@@ -216,6 +252,7 @@ export function mountPanel({ title = 'settings', items = [], actions = [], width
   document.body.append(root);
   return {
     refresh,
+    refreshRows,
     keys: () => [...rows.keys()],
     widthPx: () => Math.round(root.getBoundingClientRect().width),
     busy: () => busy,

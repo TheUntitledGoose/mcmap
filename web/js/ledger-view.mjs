@@ -104,7 +104,12 @@ export function rankCells(cells, limit = 12) {
  * Winding is chosen to face +Y; the material is double-sided anyway, because this overlay is read
  * from above and from the side, and in walk mode you are sometimes under it.
  */
-export function buildHeatQuads(cells, { bias = 0.6, size = 16 } = {}) {
+export function buildHeatQuads(cells, { bias = 0.6, size = 16, inset = 0 } = {}) {
+  // Past half the cell the tile would pass through its own centre and the winding would flip, which turns
+  // an upward-facing overlay into a downward one - invisible under FrontSide, and mysterious. It cannot
+  // happen from the viewer (the shrink setting floors at 0.02) but a caller passing a silly inset gets a
+  // degenerate tile rather than an upside-down world.
+  const ins = Math.max(0, Math.min(inset || 0, (size - 1) / 2));
   const keep = cells.filter((c) => c.y !== null && c.y !== undefined);
   const skipped = cells.length - keep.length;
   const nv = keep.length * 4;
@@ -115,7 +120,11 @@ export function buildHeatQuads(cells, { bias = 0.6, size = 16 } = {}) {
   const max = keep.reduce((m, c) => (c.n > m ? c.n : m), 0);
   let p = 0, t = 0;
   for (const c of keep) {
-    const x0 = c.cx * size, z0 = c.cz * size, x1 = x0 + size, z1 = z0 + size;
+    // `inset` is why the overlay stops being a floor of paint. A tile the full 16 x 16 covers the chunk
+    // it describes, so a lit overlay reads as flat tiles welded together and the world under it
+    // disappears; pulling each tile in by a block or two leaves the seams open and keeps the terrain
+    // readable. It is geometry, not blending, so it costs no extra fill and no shader.
+    const x0 = c.cx * size + ins, z0 = c.cz * size + ins, x1 = x0 + size - ins * 2, z1 = z0 + size - ins * 2;
     const y = c.y + bias;
     const [r, g, b] = heatLinear(c.n, max);
     // `p` is the running corner count, so it is also this quad's first corner number. Getting that
@@ -132,7 +141,7 @@ export function buildHeatQuads(cells, { bias = 0.6, size = 16 } = {}) {
     idx[t++] = v0; idx[t++] = v0 + 2; idx[t++] = v0 + 3;
     p += 4;
   }
-  return { pos, col, idx, quads: keep.length, verts: nv, indices: idx.length, skipped };
+  return { pos, col, idx, quads: keep.length, verts: nv, indices: idx.length, skipped, inset: ins };
 }
 
 /**

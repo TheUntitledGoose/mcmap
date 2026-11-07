@@ -8,7 +8,13 @@ import { withAccessors } from '../web/js/payload.js';
 import {
   applyEdits, editsForCell, firstAfter, histStamp, rowsAfterCount, rowsByCell, stateIdsByName,
 } from '../web/js/ledger-terrain.mjs';
-import { decodeTimeline, tlPackCoord } from '../shared/ledger-pack.mjs';
+import { decodeTimeline, tlPackCoord, tlX, tlY, tlZ } from '../shared/ledger-pack.mjs';
+import { sectionIndex, voxelId } from '../web/js/lookup.js';
+import { openChunk } from '../web/js/payload.js';
+import { buildStateIds, decodeChunk, packChunk } from '../server/chunk-payload.mjs';
+import { RegionFile } from '../tools/region.mjs';
+import { readNbt } from '../tools/nbt.mjs';
+import zlib from 'node:zlib';
 import { readPack } from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import { fakeLog } from './fake-ledger.mjs';
@@ -71,7 +77,9 @@ test('the playhead boundary is strict: a row AT the playhead is present, not und
   assert.equal(rowsAfterCount(tl, rows, ph(100)), 0);
   assert.equal(rowsAfterCount(tl, rows, ph(50)), 1);
   assert.equal(histStamp(tl, rows, ph(100)), '', 'no newer rows means no history, so the mesh key is unchanged');
-  assert.equal(histStamp(tl, rows, ph(50)), `h${ph(50)}x1`);
+  // The stamp is a COUNT, not the playhead. `h<sec>x1` would re-key every touched chunk on every playhead
+  // move even when the same row is the one being undone, which is the whole cost of a scrub.
+  assert.equal(histStamp(tl, rows, ph(50)), 'x1');
 });
 
 test('a block broken after the playhead comes back, with the name the log recorded', () => {
@@ -207,5 +215,130 @@ if (existsSync(packPath)) {
     assert.ok(got.edits.length / 2 > 100, 'and the undo puts hundreds of voxels back');
     assert.ok(got.unknown / (got.breakRows + got.placeRows) < 0.05,
       'a few rows name entities or unmodelled mods; most name blocks the renderer can draw');
+  });
+}
+
+// The renderer's side of the contract (M12b.4 part 2). The page does not send patched chunks to its mesh
+// workers - it sends the edits, and the worker applies them to chunks it decoded itself. That only works
+// if the plain postMessage shape patches identically to the decoded one, and if the key the page stamps
+// a mesh with changes exactly when the undo set changes.
+test('the mesh key counts the suffix, so a scrub re-keys only the chunks a crossed row belongs to', () => {
+  const { tl, ph } = timeline([
+    [1, 0, 64, 0, 2, 1, T(10), 'minecraft:stone', ''],
+    [1, 1, 64, 0, 3, 1, T(20), '', 'minecraft:stone'],
+    [1, 32, 64, 0, 2, 1, T(30), 'minecraft:dirt', ''],      // a different chunk cell
+  ]);
+  const by = rowsByCell(tl, Int32Array.from([0, 1, 2]));
+  const cells = [...by.keys()];
+  const a = by.get(cells[0]), b = by.get(cells[1]);
+  // Both playheads sit between the first two rows of cell A: the same two rows are newer, so the same
+  // two rows get undone, so the mesh parked under either key is still correct.
+  assert.equal(histStamp(tl, a, ph(11)), histStamp(tl, a, ph(19)), 'a move that crosses no row keeps the key');
+  assert.notEqual(histStamp(tl, a, ph(11)), histStamp(tl, a, ph(25)), 'crossing one row changes it');
+  assert.equal(histStamp(tl, b, ph(11)), histStamp(tl, b, ph(19)));
+  assert.notEqual(histStamp(tl, b, ph(11)), histStamp(tl, b, ph(35)));
+  // The other half of the economy: a chunk the log never touched stamps '', so its key - and its parked
+  // triangles - survive the whole scrub.
+  assert.equal(histStamp(tl, null, ph(0)), '', 'an untouched chunk has no history at all');
+  assert.equal(histStamp(tl, Int32Array.from([]), ph(0)), '');
+});
+
+test('the plain chunk a worker holds patches to exactly the voxels the page patched', () => {
+  const { tl, ph } = timeline([
+    [1, 2, 64, 3, 3, 1, T(500), 'minecraft:air', 'minecraft:stone'],   // break: stone comes back
+    [1, 2, 70, 3, 2, 1, T(600), 'minecraft:dirt', ''],                 // place: dirt goes away
+    [1, 5, 80, 9, 2, 1, T(700), 'minecraft:stone', ''],                // place in an omitted section
+  ]);
+  const got = editsForCell(tl, Int32Array.from([0, 1, 2]), ph(400), idFor);
+  assert.equal(got.edits.length / 2, 3);
+
+  const decoded = chunkOf([[4, 'minecraft:air'], [5, 'minecraft:dirt']]);
+  const here = applyEdits(decoded, got.edits, { withAccessors, airId: AIR });
+  // What postMessage can actually send: no closures, the payload fields only - web/js/main.js plainChunk.
+  const plain = {
+    cx: 0, cz: 0, yMin: 0, yCount: 5, palette: decoded.palette, height: decoded.height,
+    sections: decoded.sections.map((s) => ({
+      y: s.y, single: s.single, vox: s.vox, sky: s.sky, blk: s.blk, skyArr: s.skyArr, blkArr: s.blkArr,
+    })),
+  };
+  const before = plain.sections.map((s) => s.vox && Uint16Array.from(s.vox));
+  const there = applyEdits(plain, got.edits, { withAccessors, airId: AIR });
+  assert.deepEqual(plain.sections.map((s) => s.vox && Uint16Array.from(s.vox)), before,
+    'the worker path must not write into the chunk it was handed either');
+
+  // And it reads voxels through sectionIndex/voxelId, not the accessors, so both halves get checked.
+  const secOf = sectionIndex(there);
+  for (let i = 0; i < got.edits.length; i += 2) {
+    const c = got.edits[i], want = got.edits[i + 1] === 0 ? AIR : got.edits[i + 1];
+    const x = tlX(c), y = tlY(c), z = tlZ(c);
+    assert.equal(there.stateAt(x, y, z), want, `page path wrote the wrong block at ${x},${y},${z}`);
+    assert.equal(voxelId(there, secOf, x, y, z), want, 'worker path disagrees with the page path');
+    assert.equal(here.stateAt(x, y, z), there.stateAt(x, y, z), 'decoded input and plain input disagree');
+  }
+  assert.equal(here.palette.length, there.palette.length, 'both grew their palette the same way');
+  for (let y = 64; y < 96; y += 8) {
+    for (let z = 0; z < 16; z += 5) for (let x = 0; x < 16; x += 7) {
+      assert.equal(here.stateAt(x, y, z), there.stateAt(x, y, z), `untouched voxel ${x},${y},${z} diverged`);
+    }
+  }
+});
+
+// The fixtures above hand applyEdits a plain Array palette. The renderer hands it a Uint16Array VIEW into
+// the payload buffer, which has no `push` - and the first browser run of the terrain time machine died in
+// the mesh worker for exactly that reason. So the real bytes get patched here.
+const realSave = 'DarkRPG/world/region/r.-1.-1.mca';
+if (existsSync(realSave) && existsSync(packPath)) {
+  test('a real payload chunk - typed palette, sections as views into the frame - patches in place', () => {
+    // The loudest chunk in the log: cx -3, cz -8, which lives in region r.-1.-1 at local 29,24.
+    const rgn = new RegionFile(realSave);
+    const raw = rgn.readChunkNbtBytes(29, 24);
+    rgn.close();
+    assert.ok(raw, 'the loudest logged chunk has to be in that region file');
+    const atlas = JSON.parse(readFileSync('build/assets/atlas.json', 'utf8')).states;
+    const stateIds = buildStateIds(atlas.map((s) => s.k));
+    const payload = packChunk(decodeChunk(readNbt(zlib.inflateSync(raw)).value, stateIds));
+    const ch = openChunk(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength));
+    assert.ok(ch.palette instanceof Uint16Array, 'the real palette is a typed array view, not an Array');
+    const bufs = new Set(ch.sections.filter((s) => s.vox).map((s) => s.vox.buffer));
+    assert.ok(ch.sections.some((s) => s.vox) && bufs.size <= 1,
+      'the voxel arrays are views into one frame buffer, which is why a patch has to copy them');
+
+    const raw2 = readFileSync(packPath);
+    const P = readPack(raw2);
+    const tl = decodeTimeline(raw2.subarray(P.tlBytes[0], P.tlBytes[1]));
+    let cell = -1;
+    for (let i = 0; i < P.cellCount; i++) {
+      const c = P.cell(i);
+      if (c.cx === -3 && c.cz === -8) { cell = i; break; }
+    }
+    assert.ok(cell >= 0, 'the chunk is in the cell table');
+    const rows = [];
+    for (let i = 0; i < tl.count; i++) if (tl.cell[i] === cell) rows.push(i);
+    const ids = stateIdsByName(atlas);
+    const airId = (atlas.findIndex((s) => s.k === 'minecraft:air') ?? -1) + 1;
+    assert.ok(airId > 0, 'the atlas holds air, so an undo can write real air');
+    const got = editsForCell(tl, Int32Array.from(rows), 0, (n) => ids.get(n) ?? 0, 1200);
+    assert.ok(got.edits.length / 2 > 100, 'undoing this chunk\'s whole history moves a lot of voxels');
+
+    const sample = [];
+    for (let y = 60; y < 90; y += 3) for (let z = 0; z < 16; z += 4) for (let x = 0; x < 16; x += 4) {
+      sample.push([x, y, z, ch.stateAt(x, y, z)]);
+    }
+    const patched = applyEdits(ch, got.edits, { withAccessors, airId });
+    const secOf = sectionIndex(patched);
+    let moved = 0, agree = 0;
+    for (let i = 0; i < got.edits.length; i += 2) {
+      const c = got.edits[i], want = got.edits[i + 1] === 0 ? airId : got.edits[i + 1];
+      const v = patched.stateAt(tlX(c), tlY(c), tlZ(c));
+      if (v !== 0 && v !== undefined) agree++;
+      if (ch.stateAt(tlX(c), tlY(c), tlZ(c)) !== v) moved++;
+      assert.equal(voxelId(patched, secOf, tlX(c), tlY(c), tlZ(c)), v, 'worker read disagrees with page read');
+    }
+    assert.ok(moved > 100, 'the patch really changed the voxels the mesh will read');
+    assert.equal(agree, got.edits.length / 2, 'every edit landed on a block id');
+    for (const [x, y, z, was] of sample) {
+      assert.equal(ch.stateAt(x, y, z), was, 'the payload the store holds was written into');
+    }
+    assert.notEqual(patched.digest, ch.digest, 'a different world has a different fingerprint');
   });
 }

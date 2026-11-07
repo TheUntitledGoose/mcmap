@@ -5,10 +5,11 @@ import assert from 'node:assert/strict';
 import { fakeLog } from './fake-ledger.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
-import { TL_NO_PLAYER, decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
+import { TL_NO_PLAYER, decodeTimeline, readPack, tlPackCoord } from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import {
   ACTION_COLOUR, actionLinear, actionName, buildTimeQuads, filterRows, playhead, quadAt,
+  rowForBlock, voxelKey, voxelRows,
 } from '../web/js/ledger-time.mjs';
 
 const T = (s) => 1717174690000 + s * 1000;
@@ -250,4 +251,104 @@ test('the baked overworld timeline filters and builds at a measured cost', (t) =
   assert.ok(probeMs < 50, `1,000 playhead moves ${probeMs.toFixed(2)} ms`);
   console.log(`playhead: 1000 draw-range moves in ${probeMs.toFixed(2)} ms, `
     + `rows at the oldest instant ${counts[0]}`);
+});
+
+test('an inset tile still names the same block, and the map stops being one sheet of paint', () => {
+  // The complaint this answers: a full-block tile per logged change hides the world it describes, so at
+  // any zoom the time machine looks like flat green armour over the terrain. Sizing the tile down about
+  // its own block centre leaves the block's edge and the seams open. It is geometry, so it costs no fill
+  // and no shader, and the playhead arithmetic must not move at all.
+  const { pack, tl } = fixture();
+  const all = filterRows(tl);
+  const full = buildTimeQuads(tl, pack, all.order);
+  const in1 = buildTimeQuads(tl, pack, all.order, { shrink: 0.5 });
+  assert.equal(in1.quads, full.quads, 'inset changes shape, never how many rows are drawn');
+  assert.equal(in1.verts, full.verts);
+  assert.equal(in1.indices, full.indices);
+  assert.deepEqual([...in1.quadSec], [...full.quadSec], 'the playhead maps to the same quads');
+  assert.equal(in1.shrink, 0.5, 'the geometry says what it was asked for');
+
+  const q = (g, c) => [g.pos[c * 3], g.pos[c * 3 + 1], g.pos[c * 3 + 2]];
+  // shrink 1 is the old geometry, corner for corner: nothing about the default path moved.
+  const one = buildTimeQuads(tl, pack, all.order, { shrink: 1 });
+  for (let k = 0; k < 12; k++) assert.ok(Math.abs(one.pos[k] - full.pos[k]) < 1e-6, `corner byte ${k}`);
+
+  // Quad 0 is block (0,64,0): half a block in on each side, and still centred on the block.
+  for (const [x, z] of [0, 1, 2, 3].map((c) => [q(in1, c)[0], q(in1, c)[2]])) {
+    assert.ok(x >= 0.25 - 1e-6 && x <= 0.75 + 1e-6, `x ${x} stays inside the block`);
+    assert.ok(z >= 0.25 - 1e-6 && z <= 0.75 + 1e-6, `z ${z} stays inside the block`);
+  }
+  const cx = [0, 1, 2, 3].reduce((s, c) => s + q(in1, c)[0], 0) / 4;
+  const cz = [0, 1, 2, 3].reduce((s, c) => s + q(in1, c)[2], 0) / 4;
+  assert.ok(Math.abs(cx - 0.5) < 1e-6 && Math.abs(cz - 0.5) < 1e-6, 'and centred on it');
+
+  // Winding is what decides whether FrontSide draws it at all, so inset must not flip it.
+  const a = q(in1, 0), b = q(in1, 1), c2 = q(in1, 2);
+  const u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+  const v = [c2[0] - a[0], c2[1] - a[1], c2[2] - a[2]];
+  assert.ok(u[2] * v[0] - u[0] * v[2] > 0, 'still faces the sky');
+  // Height is untouched: inset is a horizontal argument.
+  assert.ok(Math.abs(q(in1, 0)[1] - q(full, 0)[1]) < 1e-6, 'same height as the full tile');
+});
+
+test('a card line can rewind the replay to the exact block and moment it names', () => {
+  const { pack, tl } = fixture();
+  const all = filterRows(tl);
+  const g = buildTimeQuads(tl, pack, all.order);
+  assert.equal(g.quadRow.length, g.quads, 'one quad, one timeline row');
+  for (let q = 0; q < g.quads; q++) {
+    assert.equal(tl.sec[g.quadRow[q]], g.quadSec[q], `quad ${q} names its own row`);
+  }
+  const cellOf = (cx, cz) => {
+    for (let i = 0; i < pack.cellCount; i++) {
+      const c = pack.cell(i);
+      if (c.cx === cx && c.cz === cz) return i;
+    }
+    throw new Error(`no cell ${cx},${cz}`);
+  };
+  const c00 = cellOf(0, 0);
+  const groups = voxelRows(tl, g.quadRow);
+  const block = (x, y, z) => rowForBlock(groups, g.quadSec, c00, tlPackCoord(x, y, z), null);
+  assert.equal(block(1, 64, 0).n, 3, 'placed, broken, placed again: three changes to one block');
+  assert.equal(block(0, 64, 0).n, 1, 'and a block that was only ever placed');
+  assert.equal(rowForBlock(groups, g.quadSec, c00, tlPackCoord(9, 9, 9), 0), null,
+    'a block with no logged row answers nothing, rather than the nearest one');
+
+  const seq = groups.get(voxelKey(c00, tlPackCoord(1, 64, 0))).map((q) => g.quadSec[q]);
+  assert.deepEqual(seq, [10, 20, 30], 'a block group is in time order');
+  // "the last change at or before the moment" is the state a playhead sitting there shows.
+  assert.equal(rowForBlock(groups, g.quadSec, c00, tlPackCoord(1, 64, 0), 15).sec, 10);
+  assert.equal(rowForBlock(groups, g.quadSec, c00, tlPackCoord(1, 64, 0), 10).sec, 10, 'exact counts');
+  const early = rowForBlock(groups, g.quadSec, c00, tlPackCoord(1, 64, 0), 5);
+  assert.deepEqual([early.sec, early.before, early.later], [10, 0, 2],
+    'older than the block\'s history says so, and says how much later it starts');
+  const late = rowForBlock(groups, g.quadSec, c00, tlPackCoord(1, 64, 0), 999);
+  assert.deepEqual([late.sec, late.later], [30, 0], 'newer than it lands on the newest');
+  // What the card asked for is a quad a draw range can stop at.
+  const hit = rowForBlock(groups, g.quadSec, c00, tlPackCoord(1, 64, 0), 15);
+  assert.ok(quadAt(g.quadSec, hit.sec) >= hit.quad + 1, 'a draw range at that second draws this quad');
+  assert.ok(hit.quad < g.quads);
+});
+
+test('a skipped row cannot shift which quad a block points at', () => {
+  // The trap this guards: rows and quads are NOT the same numbering once a row is dropped, and a card
+  // that answered with a row index would jump the playhead to a different block's moment.
+  const { pack, tl } = fixture();
+  const all = filterRows(tl);
+  const cells = [];
+  for (let i = 0; i < pack.cellCount; i++) cells.push(pack.cell(i));
+  const c00 = cells.findIndex((c) => c.cx === 0 && c.cz === 0);
+  const c11 = cells.findIndex((c) => c.cx === 1 && c.cz === 1);
+  cells[c00] = {};                       // unplaceable, and it sits in the MIDDLE of the time order
+  const g = buildTimeQuads(tl, cells, all.order);
+  assert.equal(g.skipped, 7, 'seven of the eight rows live in the missing chunk');
+  assert.equal(g.quads, all.n - 7);
+  assert.equal(g.quadRow[0], all.order[7],
+    'the one surviving quad is the LAST row: a row index would have named a different moment');
+  const groups = voxelRows(tl, g.quadRow);
+  const one = rowForBlock(groups, g.quadSec, c11, tlPackCoord(20 & 15, 64, 20 & 15), 0);
+  assert.deepEqual([one.n, one.sec, one.quad], [1, 70, g.quads - 1],
+    'the surviving row is the last QUAD, not the last row');
+  const kill = rowForBlock(groups, g.quadSec, c00, tlPackCoord(4, 64, 4), 0);
+  assert.equal(kill, null, 'the dropped chunk\'s blocks are not in the replay, so a click says nothing');
 });

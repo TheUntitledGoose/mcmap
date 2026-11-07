@@ -8,7 +8,9 @@ import { ChunkStore } from './store.js';
 import { ShellStore } from './shell-store.js';
 import { LodStore } from './lod-store.js';
 import { pickLodRung, LOD_CELL } from '../../shared/lod-format.mjs';
-import { openOverview } from './payload.js';
+import { openOverview, withAccessors } from './payload.js';
+import { applyEdits, editsForCell, histStamp, rowsByCell, stateIdsByName } from './ledger-terrain.mjs';
+import { sectionIndex, idToState, voxelId } from './lookup.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
 import { PATCH_REACH, packPatchFrames, packPatchPolicy, patchFrameGetter, patchPolicy } from './shell-batch.js';
 import { cutReserve, patchThreadCap } from '../../shared/pool.mjs';
@@ -39,11 +41,11 @@ import {
   buildHeatQuads, buildPins, collectCells, formatTime as fmtLedger, LEDGER_CLASSES, nearRows, rankCells,
   rowLine, summarizeRows, timeAgo,
 } from './ledger-view.mjs';
-import { decodeTimeline, readPack } from '../../shared/ledger-pack.mjs';
+import { decodeTimeline, readPack, tlPackCoord } from '../../shared/ledger-pack.mjs';
 // M12b: the time machine's data half - filters, decal geometry and the playhead index, all of it
 // testable without a browser (tests/web-timemachine.test.mjs). This page owns the mesh and the
 // scrubber; the numbers in the readouts come from the tested functions.
-import { actionName, buildTimeQuads, filterRows, playhead, quadAt } from './ledger-time.mjs';
+import { actionName, buildTimeQuads, filterRows, playhead, quadAt, rowForBlock, voxelRows } from './ledger-time.mjs';
 
 
 const $ = (id) => document.getElementById(id);
@@ -203,12 +205,24 @@ const S = {
   time: num('time', 0) ? 1 : 0,
   timeAt: Math.max(0, num('timeat', 0)),
   timePlay: num('timeplay', 0) ? 1 : 0,
-  timeSpeed: Math.max(1, Math.min(5e6, num('timespeed', 20000))),  // LOGGED CHANGES per wall-clock second
+  timeSpeed: Math.max(0.05, Math.min(5e6, num('timespeed', 20000))),  // LOGGED CHANGES per wall-clock second
   // Not days per second. This dimension logged changes on 9 of the 822 days its log spans, with 99 % of
   // its rows inside the first week and 83,101 of them on one day. A calendar-driven playhead would sit
   // motionless for a month and then blur; an event-driven one builds at a rate the eye can read.
   timeCls: Math.max(0, Math.min(7, num('timecls', 2))),             // 0 = any change, 2 = block place
   timeLimit: Math.max(0, num('timelimit', 0)),                      // 0 = draw every row of the filter
+  // Undoing the log in the voxels defaults ON whenever the time machine does, because the two answer one
+  // question and a viewer who turns on "watch it get built" and sees only dots move has been let believe
+  // the blocks do not change. `?timeterrain=0` says otherwise, and that choice is respected for the session
+  // (S.timeTouched) so pressing M never quietly re-arms a cost the player just turned off.
+  timeTerrain: num('timeterrain', num('time', 0) ? 1 : 0) ? 1 : 0,  // undo the log in the VOXELS too
+  timeTouched: params.has('timeterrain') ? 1 : 0,
+  timeTerrainStep: Math.max(1, num('timeterrainstep', 64)),         // rows the playhead may jump before the terrain re-syncs
+  timeTerrainLimit: Math.max(0, num('timeterrainlimit', 1200)),     // newest-first rows undone per chunk; 0 = all
+  timeTerrainMax: Math.max(1, num('timeterrainmax', 192)),          // chunks re-cut per playhead sync
+  timeTiles: num('timetiles', 1) ? 1 : 0,                           // the per-change tiles; the playhead works without them
+  decalOp: Math.max(0, Math.min(1, num('decalop', 0.45))),           // how solid BOTH ledger overlays are
+  decalShrink: Math.max(0.2, Math.min(1, num('decalshrink', 0.82))), // a tile as a fraction of what it covers
   // The settings panel's own width in CSS pixels, because a panel that hides its own numbers behind
   // an ellipsis is a bug you can now resize: drag the panel's left edge, or set this. The value
   // column is what needs the room - the time machine prints a date stamp there. URL: ?panelw=440
@@ -218,6 +232,11 @@ const S = {
   meshKey: num('meshkey', 1) ? 1 : 0,
   bytesKeep: num('byteskeep', 1) ? 1 : 0,          // keep parked triangles across a payload eviction
   meshIndex: params.has('soup') ? 0 : 1,           // 9.5a: indexed detail meshes; ?soup=1 = the old soup
+  // Leave the old triangles on screen while a re-cut is in flight. A single time-machine move marks up to
+  // 192 chunks, and dropping each one when its job is POSTED showed the world flicker to the far layer for
+  // a whole worker round trip. ?keepmesh=0 restores that flicker for an A/B of the flicker, not of the
+  // geometry: the triangles that land are the same either way.
+  keepMesh: num('keepmesh', 1) ? 1 : 0,
   // A face pointing at a chunk whose voxels are not held, but whose ground the heightmap skin paints,
   // is behind that skin. Drawing it is the wall of dirt a hole grows when a neighbour never arrived.
   // ?cullcovered=0 puts the walls back to compare.
@@ -1003,8 +1022,19 @@ function coveredNeighbours(cx, cz) {
   return out;
 }
 
-function buildChunkGeometries(chunk) {
+/**
+ * @param over 3x3 map of "cx,cz" -> {ch, secOf} PATCHED chunks (M12b Tier 2). The mesher reads its
+ * neighbours for border faces, so a corrected chunk and an uncorrected neighbour draw a seam at the
+ * shared wall; the overrides are what keep the two sides agreeing. Absent = the store's payload.
+ */
+function buildChunkGeometries(chunk, over = null) {
   const at = (cx, cz, lx, ly, lz) => {
+    if (over) {
+      // lx/lz are LOCAL to the meshed chunk, so a neighbour read at local -1 or 16 belongs to the
+      // next chunk over - the same rounding the lookup helpers do.
+      const e = over.get(`${cx + (lx >> 4)},${cz + (lz >> 4)}`);
+      if (e) return idToState(voxelId(e.ch, e.secOf, lx, ly, lz), assets.states.length);
+    }
     const v = store.stateIndexAt(cx, cz, lx, ly, lz, stateOf);
     if (v === -1 && S.shellOn && S.cullCovered && shellStore) {
       const nx = cx + (lx >> 4), nz = cz + (lz >> 4);
@@ -1097,7 +1127,10 @@ const coveredKey = (cx, cz) => {
   return c ? c.map(([x, z]) => x + ':' + z).join(',') : '';
 };
 
-const meshKeyFor = (cx, cz) => meshKeys.key(cx, cz, detailSig(), coveredKey(cx, cz));
+// The history stamp of the 3x3 joins the key, so a playhead move invalidates exactly the touched
+// chunks and their borders, and nothing else. It is NOT in detailSig, which would invalidate every
+// mesh in the world - including 350 parked triangle sets - on every sync.
+const meshKeyFor = (cx, cz) => meshKeys.key(cx, cz, detailSig() + histSuffix(cx, cz), coveredKey(cx, cz));
 const settledNeighbours = (cx, cz) => meshKeys.settled(cx, cz);
 
 /** Why a key is dirty and how long it has waited, so "skip the work" never means "never do it". */
@@ -1201,7 +1234,9 @@ function installCached(cx, cz, mk) {
   // the old settings-only rule is back, so an A/B of 9.6 compares behaviour, not the byte cache.
   if (S.meshKey ? e.mk !== mk : e.sig !== detailSig()) { dropBytes(key); return false; }
   dropBytes(key);
-  const wasCovered = dropChunkMesh(cx, cz);
+  // Park the variant being replaced, but only while the time machine runs: a playhead that goes out and
+  // back wants the other geometry, and outside that mode this is the path the 9.x measurements priced.
+  const wasCovered = dropChunkMesh(cx, cz, HIST.on);
   const geos = e.passes.map(({ pass, position, uv, color, index }) => {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(position, 3));
@@ -1243,6 +1278,14 @@ function attachChunkMesh(cx, cz, geos, stats, wasCovered, mk = null) {
     for (const { geometry } of geos) geometry.dispose();
     return;
   }
+  // How many detail chunks THIS playhead rebuilt, counted where a mesh is actually installed rather than
+  // derived afterwards from a global build counter (which also counts streaming, far re-cuts and every
+  // other reason a chunk gets meshed). A chunk the undo empties still counts: it was rebuilt.
+  if (HIST.on && histSuffix(cx, cz)) { HIST.builds++; HIST.buildTotal++; }
+  // Replace whatever is here, in this call. The worker path leaves the previous mesh drawing while it
+  // computes, so this is the one moment the two can be swapped without a frame in between; parking the
+  // old bytes (only while the time machine runs) is what makes the move back cheap instead of another cut.
+  if (HIST.on && S.keepMesh) dropChunkMesh(`${cx},${cz}`, true);
   // An empty answer is still an answer, so it is recorded: `meshes.has` is what `detailHere` asks, and
   // the mk short-circuit in the mesh drain is what stops the next dirty mark from meshing it again.
   // Six chunks in a void column (surface sentinel -2048, air top to bottom) were the whole of the
@@ -1277,13 +1320,16 @@ function attachChunkMesh(cx, cz, geos, stats, wasCovered, mk = null) {
 }
 
 function rebuild(cx, cz, mk) {
-  const wasCovered = dropChunkMesh(cx, cz);
+  const wasCovered = dropChunkMesh(cx, cz, HIST.on);
   const chunk = store.get(cx, cz);
   if (!chunk) return;
   if (!mk) mk = meshKeyFor(cx, cz);
   countMesh(`${cx},${cz}`);
   const t0 = performance.now();
-  const { geos, stats } = buildChunkGeometries(chunk);
+  // Tier 2: mesh the world as of the playhead. `over` holds patched COPIES; the store keeps the real
+  // payload, and these patches are dropped when the mesh is built.
+  const over = histOverlayChunks(cx, cz);
+  const { geos, stats } = buildChunkGeometries(over.get(`${cx},${cz}`)?.ch ?? chunk, over);
   meshStat(performance.now() - t0);
   attachChunkMesh(cx, cz, geos, stats, wasCovered, mk);
 }
@@ -1347,7 +1393,9 @@ function startWorkers() {
       jobForKey.delete(m.key);
       // The chunk may have been evicted, replaced, or switched dimension while its mesh was being
       // built; a stale skin over new voxels is worse than one more frame of shell.
-      if (!job || job.gen !== dimGen || !store.get(m.cx, m.cz)) {
+      // A result built at an older playhead is stale even when its key still matches: the key carries the
+  // history stamp, so this is belt-and-braces against a job posted before a sync and answered after.
+  if (!job || job.gen !== dimGen || job.histGen !== HIST.gen || !store.get(m.cx, m.cz)) {
         meshResultsDropped.count++;
         // Discarding the triangles is right; discarding the *work order* along with them is what left a
         // hole. Put the order back if the chunk is still something the sharp layer owns.
@@ -1365,6 +1413,9 @@ function startWorkers() {
         return { pass, geometry: g };
       });
       meshStat(m.ms ?? 0);
+      // The patch bill is kept apart from this thread's, because the panel sentence says where the
+      // correcting happened: a scrub meshed mostly by workers should read that way.
+      if (m.patched) { HIST.workerPatches += m.patched; HIST.workerPatchMs += m.patchMs ?? 0; HIST.workerPatchTotalMs += m.patchMs ?? 0; }
       meshWait = Math.max(meshWait, performance.now() - job.t0);
       attachChunkMesh(m.cx, m.cz, geos, m.stats, job.wasCovered, job.mk);
       // This thread is free now. Ask for the next chunk instead of waiting for the next frame: at 6 fps
@@ -1426,7 +1477,11 @@ function meshAsync(cx, cz, mk) {
   const w = pool.find((x) => !x.busy);
   const chunk = store.get(cx, cz);
   if (!w || !chunk) return false;
-  const wasCovered = dropChunkMesh(cx, cz);
+  // NOT dropChunkMesh: the old triangles stay on screen while this job runs. Dropping at post time is what
+  // made a time-machine scrub blink - one playhead move marks up to 192 chunks, and every one of them went
+  // blank (far layer showing through) for the length of a worker round trip. The swap now happens in
+  // attachChunkMesh, at the moment the replacement actually exists.
+  const wasCovered = S.keepMesh ? meshes.has(key) : dropChunkMesh(cx, cz);
   const chunks = [];
   for (let dz = -1; dz <= 1; dz++) {
     for (let dx = -1; dx <= 1; dx++) {
@@ -1436,10 +1491,15 @@ function meshAsync(cx, cz, mk) {
   }
   const seq = ++meshSeq;
   countMesh(key);
-  jobs.set(seq, { cx, cz, key, wasCovered, t0: performance.now(), gen: dimGen, mk });
+  jobs.set(seq, { cx, cz, key, wasCovered, t0: performance.now(), gen: dimGen, mk, histGen: HIST.gen });
   jobForKey.set(key, seq);
   w.busy = true;
-  w.postMessage({ key, cx, cz, seq, chunks, opts: meshOpts(), covered: coveredNeighbours(cx, cz) });
+  w.postMessage({
+    key, cx, cz, seq, chunks, opts: meshOpts(), covered: coveredNeighbours(cx, cz),
+    // Only the EDITS cross the boundary, not patched payloads: the worker applies them to the copies
+    // it already decoded, which is a few hundred writes instead of a second chunk upload.
+    hist: histOverlays(cx, cz), airId: HIST.airId || 1, histGen: HIST.gen,
+  });
   return true;
 }
 
@@ -3556,10 +3616,13 @@ function ledgerMat() {
     ledgerHeatMat = new THREE.MeshBasicMaterial({
       // FrontSide, not DoubleSide: the decals face up, and 20,322 of them painted twice over a
       // whole-world frame is a fill bill the overlay does not need.
-      vertexColors: true, transparent: true, opacity: 0.55, side: THREE.FrontSide,
+      vertexColors: true, transparent: true, opacity: S.decalOp, side: THREE.FrontSide,
       depthWrite: false, fog: false,
     });
   }
+  // Strength is a setting, not a constant: a 20,322-tile sheet at 0.55 is a floor of paint over the
+  // world it describes, and the complaint from anyone who turned it on was that they could not see.
+  ledgerHeatMat.opacity = S.decalOp;
   ledgerHeatMat.depthTest = !S.ledgerXray;
   return ledgerHeatMat;
 }
@@ -3636,7 +3699,7 @@ function ledgerRebuild() {
     const got = collectCells(LEDGER.pack, { cls: S.ledgerCls, player: S.ledgerWho, minN: S.ledgerMin });
     LEDGER.cells = got.cells; LEDGER.max = got.max;
     LEDGER.noHeight = got.noHeight; LEDGER.dropped = got.dropped;
-    const g = buildHeatQuads(got.cells);
+    const g = buildHeatQuads(got.cells, { inset: heatInset() });
     if (g.quads) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
@@ -3844,7 +3907,11 @@ function showLedgerCard({ block, rows, out }) {
     + `  |  kinds: ${Object.entries(s.byKind).map(([k, v]) => `${k} ${v}`).join(', ')}`
     + `  |  ${fmtLedger(s.t0)} .. ${fmtLedger(s.t1)} (${timeAgo(s.t1)})`;
   el.append(sub);
+  const note = document.createElement('div');
+  note.className = 'lcard-note';
   for (const rw of rows.slice(0, 14)) {
+    const line = document.createElement('div');
+    line.className = 'lcard-line';
     const b = document.createElement('button');
     b.className = 'lcard-row';
     // Distance from the block that was asked about, not its absolute coordinates: every row here is
@@ -3852,8 +3919,18 @@ function showLedgerCard({ block, rows, out }) {
     b.textContent = rowLine(rw, Date.now(), block);
     b.title = 'go to that block';
     b.addEventListener('click', () => gotoLedger(rw.x + 0.5, rw.y + 1, rw.z + 0.5, 20));
-    el.append(b);
+    // The other half of the question. "Who broke this" is a fact about the world as it is; "when did it
+    // happen" only means anything to the replay, so it goes to the playhead and the voxel undo, not to the
+    // camera, and it stays a separate button because a viewer wants to pick one or the other.
+    const s = document.createElement('button');
+    s.className = 'lcard-seek';
+    s.textContent = '\u23ea';                         // ⏪
+    s.title = 'rewind the replay to this change, at this block';
+    s.addEventListener('click', () => rewindTo(rw, s, note));
+    line.append(b, s);
+    el.append(line);
   }
+  el.append(note);
   if (rows.length > 14) {
     const m = document.createElement('div');
     m.className = 'lcard-sub';
@@ -3942,6 +4019,10 @@ const TLAYER = {
   quadSec: null,         // the playhead index: one ascending second per drawn quad
   quads: 0, verts: 0, drawn: 0, sec: 0,
   cur: 0,                        // the playhead as a ROW INDEX into the current filter
+  quadRow: null,         // which timeline row each drawn quad came from (buildTimeQuads)
+  voxel: null,           // Map block -> its quads, built on the first click on a block card
+  voxelFrom: null, voxelMs: 0, jumpMs: 0,
+  cellsAt: null, cellsPack: null,   // "cx,cz" -> cell index, for a card that names a chunk
   activeDays: 0, busyDay: 0, busyN: 0,   // how much of the calendar the log actually covers
   rows: 0, other: 0, truncated: false,
   bytes: 0, fetchMs: 0, filterMs: 0, buildMs: 0,
@@ -3954,12 +4035,14 @@ function timeMat() {
     timeDecalMat = new THREE.MeshBasicMaterial({
       // FrontSide, like the heat layer: these decals face up, and over a whole-dimension history the back
       // faces are pure overdraw - the place set alone is 90,045 quads, the whole log 351,531.
-      // Less transparent than the heat layer: one decal is a fact about one block, and a viewer has to
-      // be able to pick one out of a whole canopy of them.
-      vertexColors: true, transparent: true, opacity: 0.92, side: THREE.FrontSide,
+      // Both overlays answer to one strength (`S.decalOp`), because both are flat tiles over the ground
+      // and a viewer tunes them together. Inset geometry (S.decalShrink) does the rest: an inset tile
+      // leaves the block's own edge visible instead of welding the map into one quilt.
+      vertexColors: true, transparent: true, opacity: S.decalOp, side: THREE.FrontSide,
       depthWrite: false, fog: false,
     });
   }
+  timeDecalMat.opacity = S.decalOp;
   // Same X-ray switch as the heat layer. A marker standing on a block top is invisible from 3 km away
   // behind a hill, and the time machine is almost always watched from a long way up.
   timeDecalMat.depthTest = !S.ledgerXray;
@@ -3973,6 +4056,7 @@ function clearTimeMesh() {
     TLAYER.mesh = null;
   }
   TLAYER.quads = 0; TLAYER.verts = 0; TLAYER.drawn = 0; TLAYER.quadSec = null;
+  TLAYER.quadRow = null; TLAYER.voxel = null; TLAYER.voxelFrom = null;
 }
 
 /**
@@ -4005,6 +4089,7 @@ async function timeLoad() {
   }
   TLAYER.bytes = buf.byteLength;
   TLAYER.fetchMs = performance.now() - t0;
+  HIST.packFrom = null; HIST.byCell = null;   // new dimension, new cell table: the undo must not keep the old one
   // How much of the CALENDAR this log has anything to say about. `sec` is ascending (the decoder checks
   // it), so this is one pass over runs rather than 351 531 Map inserts. Without the number on screen, a
   // scrub that races through empty months looks like a bug in the scrubber instead of a fact about the server.
@@ -4033,6 +4118,12 @@ function timeRebuild() {
   if (!S.time || !TLAYER.tl || !LEDGER.pack) { if (panel) panel.refresh(); return; }
   const t0 = performance.now();
   const got = filterRows(TLAYER.tl, { who: S.ledgerWho, cls: S.timeCls, limit: S.timeLimit });
+  // The undo reads the SAME rows the decals do, grouped by chunk. Keeping the group order (the
+  // decoder guarantees ascending time) is what lets editsForCell walk a chunk's rows newest-first.
+  HIST.byCell = rowsByCell(TLAYER.tl, got.order);
+  // A filter change is a different set of rows, so no held mark means anything any more - not even one
+  // whose suffix count happens to match. The marks go with it.
+  HIST.marks.clear();
   TLAYER.filterMs = performance.now() - t0;
   TLAYER.rows = got.n; TLAYER.other = got.other; TLAYER.truncated = got.truncated;
   if (!got.n) {
@@ -4044,9 +4135,10 @@ function timeRebuild() {
   }
   TLAYER.err = '';
   const t1 = performance.now();
-  const g = buildTimeQuads(TLAYER.tl, LEDGER.pack, got.order);
+  const g = buildTimeQuads(TLAYER.tl, LEDGER.pack, got.order, { shrink: S.decalShrink });
   TLAYER.buildMs = performance.now() - t1;
   TLAYER.quadSec = g.quadSec;
+  TLAYER.quadRow = g.quadRow;
   TLAYER.quads = g.quads; TLAYER.verts = g.verts;
   if (g.skipped) TLAYER.err = `${g.skipped.toLocaleString()} rows had no baked ground under them`;
   const geo = new THREE.BufferGeometry();
@@ -4070,8 +4162,12 @@ function timeRebuild() {
   // The cursor follows the MOMENT, not the row number: switching from every change to one player mid-play
   // should keep showing the same point in the log and keep running forward from there.
   TLAYER.cur = Math.max(0, quadAt(TLAYER.quadSec, TLAYER.sec) - 1);
+  histSync(true);
   if (panel) panel.refresh();
 }
+
+/** The rows and sentences a playhead move can change - the short list `timeApply` refreshes. */
+const TIME_ROWS = ['timeAt', 'time', 'timeTiles', 'timePlay', 'timeTerrain', 'note_time', 'note_hist'];
 
 /**
  * Move the playhead: one binary search and one draw range. `drawn` is what the readout and every probe
@@ -4082,9 +4178,294 @@ function timeApply() {
   const ph = playhead(TLAYER.tl, S.timeAt);
   const n = quadAt(TLAYER.quadSec, ph.sec);
   TLAYER.mesh.geometry.setDrawRange(0, n * 6);
+  // Tiles off is a real mode, not a cosmetic one: with the terrain undo on, the blocks themselves show
+  // the playhead, and a tile per logged change over a canopy only hides that. The playhead, the date and
+  // the voxel undo all keep working; only the decal mesh stops being drawn.
+  TLAYER.mesh.visible = !!S.timeTiles && n > 0;
   TLAYER.drawn = n;
   TLAYER.sec = ph.sec;
+  histSync();
+  // A playhead move is the one thing in this viewer that happens every frame, and the panel's full sweep
+  // runs once a second (and not at all while a thumb is held). So name the rows and sentences this move can
+  // change: the date under the thumb has to move with the thumb.
+  if (panel) panel.refreshRows(TIME_ROWS);
   return n;
+}
+
+/**
+ * How far each heat tile is pulled in from its chunk's footprint, in blocks. `buildHeatQuads` draws one
+ * tile per touched CHUNK, so at 16 x 16 with no inset the overlay is a continuous floor wherever the log
+ * has rows; half a block of inset on each side is enough to open the seams and let the terrain read.
+ */
+const heatInset = () => Math.max(0, (16 * (1 - Math.max(0.02, Math.min(1, S.decalShrink)))) / 2);
+
+/** Tiles on/off. The playhead, the date and the voxel undo are unaffected: this is the decal mesh only. */
+function setTiles(on) {
+  S.timeTiles = on ? 1 : 0;
+  timeApply();
+  if (panel) panel.refresh();
+}
+
+/** One number for both ledger overlays, so "I can't see anything" is one slider rather than two. */
+function setDecalOp(v) {
+  S.decalOp = Math.max(0, Math.min(1, +v || 0));
+  if (ledgerHeatMat) ledgerHeatMat.opacity = S.decalOp;
+  if (timeDecalMat) timeDecalMat.opacity = S.decalOp;
+  if (panel) panel.refresh();
+}
+
+/** Resizing the tiles is geometry, so both overlay meshes have to be re-cut. */
+function setDecalShrink(v) {
+  S.decalShrink = Math.max(0.02, Math.min(1, +v || 1));
+  if (S.ledger) ledgerRebuild();
+  if (S.time) timeRebuild();
+  if (panel) panel.refresh();
+}
+
+// ---- the world AS OF the playhead, in voxels (M12b Tier 2) ----------------------------------------
+// Tier 1 paints a dot wherever the log says something happened. This answers the harder question out of
+// the page's own voxels: stand at the playhead and the terrain is corrected BACKWARDS, so a block broken
+// after T stands again and a block placed after T is gone. Only the sharp (detail) layer is corrected,
+// because that is where one chunk mesh costs tens of milliseconds and there are only a few hundred of
+// them; the baked LOD tiles and the heightmap skin keep showing the world as it is now, and the panel
+// says so rather than letting the two layers disagree silently.
+//
+// Four rules keep it honest:
+//   The store's payload is NEVER written. A patched copy is meshed and thrown away, so the pick probes,
+//   the walker's collision, the mesher's neighbour reads and the far layers all still see the world as
+//   it is. `__world.hist()` reports what was patched; nothing about the real data changes.
+//   The log fills block_state for 2,828 of its 424,599 rows, so a restored block is chosen by NAME -
+//   the plainest state the atlas holds for it. A torch comes back as a torch; a stair comes back facing
+//   some default direction, because the log never recorded which way it faced.
+//   Light is not re-simulated. A restored block borrows the light its cell carries today, which is
+//   usually right at the surface and too dark inside a tunnel that has since been filled in.
+//   The undo follows the row FILTER, because it is built from the same rows the decals are drawn from.
+//   "Only playerA's places" then means "the world as playerA left it" - a different claim from the whole
+//   log, and a smaller one, which is why the two layers share the who/what filters instead of each having
+//   their own.
+const HIST = {
+  on: 0, gen: 0, sec: -1, cur: -1,
+  packFrom: null, cellsAt: null,   // "cx,cz" -> cell index, rebuilt when the cell table changes
+  byCell: null,                    // cell index -> this filter's rows, ascending in time
+  marks: new Map(),                // "cx,cz" -> {gen, edits, unknown, truncated}, one per (chunk, playhead)
+  stamps: new Map(),               // "cx,cz" -> history stamp, valid for HIST.gen
+  ids: null, airId: 0,
+  marked: 0, capped: 0, skipped: 0, workerPatches: 0, workerPatchMs: 0, builds: 0,
+  syncMs: 0, patchMs: 0, patches: 0, err: '',
+  // Lifetime counters. The ones above reset at every sync, which is right for the panel sentence
+  // ("what did the last move cost") and wrong for a probe that scrubs faster than the mesh budget
+  // drains: a scrub that syncs every frame never leaves a window long enough to install a mesh, and
+  // reads zero. These only ever grow.
+  buildTotal: 0, workerPatchTotalMs: 0,
+};
+const EMPTY_EDITS = new Int32Array(0);
+
+/** Is the terrain time machine running at all? It needs the timeline, the cell table and the switch. */
+const histWanted = () => !!(S.time && S.timeTerrain && TLAYER.tl && TLAYER.quadSec && LEDGER.pack);
+
+/**
+ * The history stamp of a chunk: how many of its logged rows are newer than the playhead, or '' when none
+ * are. It goes into the mesh key, which is what makes a playhead move re-mesh exactly the touched chunks
+ * and nothing else - a chunk the log never touched keeps the same key, and therefore its parked
+ * triangles, for the whole of the scrub. Rows are time-ordered, so the rows newer than the playhead are
+ * a SUFFIX of the chunk's list, and a suffix of the same length is the same suffix: the count is exact,
+ * so a move that crosses no row of a chunk leaves that chunk's key, mesh and parked triangles alone.
+ */
+function histStampOf(cx, cz) {
+  const k = `${cx},${cz}`;
+  const hit = HIST.stamps.get(k);
+  if (hit !== undefined) return hit;
+  let s = '';
+  if (HIST.on && TLAYER.tl) {
+    const ci = HIST.cellsAt?.get(k);
+    const rows = ci === undefined ? null : HIST.byCell?.get(ci) ?? null;
+    s = histStamp(TLAYER.tl, rows, HIST.sec);
+  }
+  HIST.stamps.set(k, s);
+  return s;
+}
+
+/** A border face has two owners, so a chunk's key changes when a NEIGHBOUR's history changes too. */
+function histSuffix(cx, cz) {
+  if (!HIST.on) return '';
+  let s = '';
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) s += histStampOf(cx + dx, cz + dz);
+  }
+  return s;
+}
+
+/** The voxel edits of one chunk at this playhead, computed once per (chunk, playhead generation). */
+function histEditsOf(cx, cz) {
+  const k = `${cx},${cz}`;
+  const stamp = histStampOf(cx, cz);
+  const hit = HIST.marks.get(k);
+  // A held mark is the SAME work when the set of rows newer than the playhead has not changed. The stamp
+  // is exactly the count of those rows and they are time-ordered, so an equal count is an equal suffix -
+  // re-running it would build identical edits, and worse, it would leave every chunk that the move did NOT
+  // re-mesh stamped with an older gen, which is how a scrub came to report "0 chunks undone" while the
+  // blocks on screen were still the undone ones.
+  if (hit && (hit.gen === HIST.gen || hit.stamp === stamp)) {
+    hit.gen = HIST.gen;
+    return hit;
+  }
+  let e = { gen: HIST.gen, stamp, edits: EMPTY_EDITS, unknown: 0, truncated: 0 };
+  if (HIST.on && HIST.ids && stamp) {
+    const ci = HIST.cellsAt.get(k);
+    const rows = ci === undefined ? null : HIST.byCell.get(ci) ?? null;
+    const got = editsForCell(TLAYER.tl, rows, HIST.sec, (nm) => HIST.ids.get(nm) ?? 0, S.timeTerrainLimit);
+    e = { gen: HIST.gen, stamp, edits: got.edits, unknown: got.unknown, truncated: got.truncated };
+    if (got.truncated) HIST.err = `the loudest chunk has more logged rows than ${S.timeTerrainLimit}: its undo is incomplete`;
+  }
+  HIST.marks.set(k, e);
+  if (HIST.marks.size > 8192) {
+    for (const [kk, v] of HIST.marks) if (v.gen !== HIST.gen) HIST.marks.delete(kk);
+  }
+  return e;
+}
+
+/**
+ * The edits to hand a mesh job: this chunk AND its eight neighbours. A wall on a chunk border is cut by
+ * both sides, and a mesh that corrects its own chunk while its neighbour still shows the block as it is
+ * today draws a seam - the same reason the mesh key already covers the 3x3.
+ */
+function histOverlays(cx, cz) {
+  const out = [];
+  if (!HIST.on) return out;
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const nx = cx + dx, nz = cz + dz;
+      const e = histEditsOf(nx, nz);
+      if (!e.edits.length) { if (histStampOf(nx, nz)) HIST.skipped++; continue; }
+      out.push({ cx: nx, cz: nz, edits: e.edits });
+    }
+  }
+  return out;
+}
+
+/** Same overlays for the in-thread path, which has no message to carry them. */
+function histOverlayChunks(cx, cz) {
+  const over = new Map();
+  if (!HIST.on) return over;
+  for (const o of histOverlays(cx, cz)) {
+    const ch = store.get(o.cx, o.cz);
+    if (!ch) continue;
+    const t = performance.now();
+    const pch = applyEdits(ch, o.edits, { withAccessors, airId: HIST.airId });
+    HIST.patchMs += performance.now() - t;
+    HIST.patches++;
+    over.set(`${o.cx},${o.cz}`, { ch: pch, secOf: sectionIndex(pch) });
+  }
+  return over;
+}
+
+/**
+ * Move the terrain playhead. The cursor advances by hundreds of rows a frame while playing and a chunk
+ * mesh costs tens of milliseconds, so the terrain does NOT follow every row: it re-syncs once the cursor
+ * has moved `S.timeTerrainStep` rows, and marks only chunks whose history changed or which carried
+ * history at the previous playhead (that second half is how a block comes back).
+ */
+function histSync(force = false) {
+  const on = histWanted() ? 1 : 0;
+  const wantCur = on ? Math.floor(TLAYER.cur) : -1;
+  if (!force && on === HIST.on && Math.abs(wantCur - HIST.cur) < Math.max(1, S.timeTerrainStep)) return;
+  const t0 = performance.now();
+  const before = [...HIST.marks.keys()];
+  HIST.on = on;
+  HIST.sec = on ? Math.round(S.timeAt) : -1;
+  HIST.cur = wantCur;
+  HIST.gen++;
+  HIST.stamps.clear();
+  if (on) {
+    if (HIST.packFrom !== LEDGER.pack) {
+      HIST.packFrom = LEDGER.pack;
+      HIST.cellsAt = new Map();
+      for (let i = 0; i < LEDGER.pack.cellCount; i++) {
+        const c = LEDGER.pack.cell(i);
+        HIST.cellsAt.set(`${c.cx},${c.cz}`, i);
+      }
+    }
+    if (!HIST.ids && assets) {
+      HIST.ids = stateIdsByName(assets.states);
+      HIST.airId = (assets.stateIndex.get('minecraft:air') ?? 0) + 1;
+    }
+  }
+  let marked = 0, capped = 0;
+  const room = () => marked < S.timeTerrainMax;
+  // Chunks carrying history at the OLD playhead have to be re-marked even if they carry none at the new
+  // one: undoing nothing is exactly the operation that makes a block stand again.
+  for (const k of before) {
+    if (!room()) { capped = 1; break; }
+    const comma = k.indexOf(',');
+    const cx = +k.slice(0, comma), cz = +k.slice(comma + 1);
+    if (inDetailRing(cx, cz, 1) && store?.has(cx, cz)) { markChunk(k, 'history'); marked++; }
+  }
+  if (on) {
+    const [ccx, ccz] = centerChunk();
+    const r = Math.min(detailR, Math.ceil(Math.sqrt(S.timeTerrainMax)));
+    // The cap is checked per chunk, not per row of the scan: checking it only between rows let one row of
+    // 29 chunks walk past it (measured 197 against a cap of 192), and a cap that leaks is not a budget.
+    scan:
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (!room()) { capped = 1; break scan; }
+        const cx = ccx + dx, cz = ccz + dz, k = `${cx},${cz}`;
+        if (!histStampOf(cx, cz)) continue;              // the log never touched it: the bulk of the map
+        if (!inDetailRing(cx, cz, 1) || !store?.has(cx, cz)) continue;
+        markChunk(k, 'history'); marked++;
+      }
+    }
+  }
+  HIST.marked = marked;
+  HIST.capped = capped;
+  HIST.syncMs = performance.now() - t0;
+  HIST.patches = 0;
+  HIST.patchMs = 0;
+  HIST.workerPatches = 0;
+  HIST.workerPatchMs = 0;
+  HIST.builds = 0;
+  HIST.skipped = 0;
+}
+
+/**
+ * The undo totals, computed when asked rather than at sync time. A sync only MARKS chunks; the edits
+ * themselves are built as each marked chunk reaches the mesher, so a summary taken inside histSync
+ * would report zero blocks undone for a scrub that was about to undo thousands.
+ */
+function histTotals() {
+  let chunks = 0, edits = 0, unknown = 0, truncated = 0;
+  for (const e of HIST.marks.values()) {
+    if (e.gen !== HIST.gen || !e.edits.length) continue;
+    chunks++; edits += e.edits.length >> 1; unknown += e.unknown;
+    if (e.truncated) truncated++;
+  }
+  return { chunks, edits, unknown, truncated };
+}
+
+/** What the terrain time machine costs and claims, in one object a probe can diff. */
+const histStats = () => ({
+  on: !!HIST.on, wanted: histWanted(), sec: HIST.sec, cur: HIST.cur, gen: HIST.gen,
+  touched: HIST.cellsAt ? HIST.cellsAt.size : 0, marked: HIST.marked, capped: !!HIST.capped,
+  ...histTotals(), workerPatches: HIST.workerPatches, workerPatchMs: +HIST.workerPatchMs.toFixed(1),
+  workerPatchTotalMs: +HIST.workerPatchTotalMs.toFixed(1),
+  builds: HIST.builds, buildTotal: HIST.buildTotal, skipped: HIST.skipped,
+  patches: HIST.patches, syncMs: +HIST.syncMs.toFixed(1), patchMs: +HIST.patchMs.toFixed(1),
+  step: S.timeTerrainStep, cap: S.timeTerrainMax, limit: S.timeTerrainLimit, err: HIST.err,
+});
+
+function histNote() {
+  if (!S.time) return '';
+  if (!S.timeTerrain) return 'the blocks themselves still show today - tick "undo the log in the blocks too" to put them back';
+  if (!HIST.on) return 'the terrain undo needs the timeline and the cell table, and one of them did not load';
+  const t = histTotals();
+  return 'the blocks in view are as they were: '
+    + `${t.chunks.toLocaleString()} chunk${t.chunks === 1 ? '' : 's'} re-cut, `
+    + `${t.edits.toLocaleString()} block${t.edits === 1 ? '' : 's'} undone, `
+    + `${t.unknown.toLocaleString()} row${t.unknown === 1 ? '' : 's'} naming nothing the atlas can draw`
+    + (t.truncated ? ` (${t.truncated} chunk${t.truncated === 1 ? '' : 's'} past the per-chunk row limit)` : '')
+    + ` - ${HIST.marked.toLocaleString()} chunk${HIST.marked === 1 ? '' : 's'} marked, `
+    + `${HIST.syncMs.toFixed(1)} ms to mark, ${HIST.patchMs.toFixed(1)} ms patched on this thread`
+    + (HIST.workerPatches ? `, ${HIST.workerPatches} patched in workers` : '');
 }
 
 /**
@@ -4132,6 +4513,107 @@ function timeGoto(sec) {
   return TLAYER.drawn;
 }
 
+/**
+ * The block index behind "when did THIS block happen?" - built on the first click, not on every filter
+ * change. 351,531 rows is a few ms and one small array per block, and a viewer who never clicks a block
+ * should not pay that each time they switch player or kind. It is keyed on the `quadRow` array itself, so
+ * any re-cut (filter, dimension, inset) drops it without a counter to remember to bump.
+ */
+function timeVoxelIndex() {
+  if (!TLAYER.quadRow) return null;
+  if (TLAYER.voxel && TLAYER.voxelFrom === TLAYER.quadRow) return TLAYER.voxel;
+  const t0 = performance.now();
+  TLAYER.voxel = voxelRows(TLAYER.tl, TLAYER.quadRow);
+  TLAYER.voxelFrom = TLAYER.quadRow;
+  TLAYER.voxelMs = performance.now() - t0;
+  return TLAYER.voxel;
+}
+
+/**
+ * "cx,cz" -> the cell index a timeline row carries. The pack keeps its cells sorted, but a Map costs less
+ * per click than a binary search and it is 20,322 entries, not 284,239.
+ */
+function ledgerCellAt() {
+  if (TLAYER.cellsPack === LEDGER.pack && TLAYER.cellsAt) return TLAYER.cellsAt;
+  const m = new Map();
+  if (LEDGER.pack) {
+    for (let i = 0; i < LEDGER.pack.cellCount; i++) {
+      const c = LEDGER.pack.cell(i);
+      m.set(`${c.cx},${c.cz}`, i);
+    }
+  }
+  TLAYER.cellsAt = m; TLAYER.cellsPack = LEDGER.pack;
+  return m;
+}
+
+/**
+ * Rewind the replay to one exact change - the row a card line names.
+ *
+ * A card answers a question about the world as it is ("what happened to this block?"); the replay answers
+ * "when?". The offset between the two is one second and it is not arbitrary: a break is a block LEAVING,
+ * so the moment that still shows it standing is one second BEFORE the break, while a place is a block
+ * ARRIVING and its own second is the one that shows it. That is the same rule the voxel undo works by -
+ * rows strictly newer than the playhead are the ones taken back - so the block is standing in the picture,
+ * not just in the date.
+ *
+ * A row the current player/kind filter excludes is not hidden: the playhead still goes to that moment, and
+ * the answer says the block itself was not in the replay set.
+ */
+async function ledgerRewind(rw) {
+  if (!LEDGER.meta?.available) return { ok: 0, why: LEDGER.meta?.why ?? 'no ledger in this world' };
+  if (!rw || rw.t === undefined) return { ok: 0, why: 'that card line does not name a moment' };
+  if (!TLAYER.tl) {
+    if (!S.time) setTime(true);
+    await timeLoad();
+    if (!TLAYER.tl) return { ok: 0, why: TLAYER.err || 'the timeline for this dimension did not load' };
+  }
+  const cx = rw.x >> 4, cz = rw.z >> 4;
+  const cell = ledgerCellAt().get(`${cx},${cz}`);
+  if (cell === undefined) return { ok: 0, why: `chunk ${cx},${cz} is not in this dimension's replay index` };
+  const packed = tlPackCoord(rw.x & 15, rw.y, rw.z & 15);
+  const want = Math.floor(rw.t / 1000) - TLAYER.tl.timeBaseSec - (rw.cls === 3 ? 1 : 0);
+  const t0 = performance.now();
+  const hit = rowForBlock(timeVoxelIndex() ?? new Map(), TLAYER.quadSec ?? new Uint32Array(0),
+    cell, packed, want);
+  TLAYER.jumpMs = performance.now() - t0;
+  if (!hit) {
+    timeGoto(want);
+    return { ok: 0, why: `the replay holds no ${actionName(rw.cls)} row for that block under the current filter`,
+      at: want, sec: TLAYER.sec };
+  }
+  S.timePlay = 0;
+  timeSeekRow(hit.quad);
+  return { ok: 1, at: hit.sec, sec: TLAYER.sec, n: hit.n, later: hit.later, before: hit.before,
+    ms: (TLAYER.tl.timeBaseSec + hit.sec) * 1000, quad: hit.quad, drawMs: +TLAYER.jumpMs.toFixed(2) };
+}
+
+/** What the card says after a rewind: the moment, and how much more that block has. */
+function rewindNote(rw, out, baseSec = 0) {
+  if (!out.ok) {
+    return `not in the replay set: ${out.why}`
+      + ` - the playhead went to ${fmtLedger((baseSec + (out.at ?? 0)) * 1000)} UTC anyway`;
+  }
+  const more = out.n > 1 ? `, ${out.later} more change${out.later === 1 ? '' : 's'} after this one` : '';
+  const early = out.before ? '' : ' - the replay holds nothing older for that block';
+  const blocks = S.timeTerrain ? '' : ' - the blocks themselves still show today until "undo the log in the blocks too" is on';
+  return `the replay now sits at ${fmtLedger((baseSec + out.at) * 1000)} UTC: that block's ${actionName(rw.cls)} row,`
+    + ` ${out.n} change${out.n === 1 ? '' : 's'} to it in the replay${more}${early}${blocks}`;
+}
+
+/** A card line's rewind button: jump the playhead, then say in the card what actually moved. */
+function rewindTo(rw, btn, noteEl) {
+  btn.classList.add('busy');
+  noteEl.textContent = 'rewinding\u2026';
+  ledgerRewind(rw).then((out) => {
+    btn.classList.remove('busy');
+    noteEl.textContent = rewindNote(rw, out, TLAYER.tl?.timeBaseSec ?? 0);
+    noteEl.classList.remove('bad');
+    if (!out.ok) noteEl.classList.add('bad');
+    if (panel) panel.refresh();
+    return out;
+  });
+}
+
 function setTimePlay(on) {
   if (!TLAYER.tl) { showLedger('the timeline is still loading, or this dimension has none'); return false; }
   S.timePlay = on ? 1 : 0;
@@ -4170,12 +4652,18 @@ const timeClsName = () => (S.timeCls > LEDGER_CLASSES.length ? 'other action' : 
 /** The one sentence that answers "am I watching a bug, or an empty decade?". */
 function timeNote() {
   if (!S.time) {
-    return 'M replays this dimension\'s ledger oldest first: 351,531 rows here, 820 days of it. One 4.7 MB\n'
-      + 'request and one mesh; the scrubber costs a draw range, so a filter change is the only rebuild.';
+    return 'M replays this dimension\'s ledger: 351,531 rows over 820 days here, but only 9 of those days\n'
+      + 'hold a change. It starts at the end and takes changes back as you pull left. One 5.4 MB request,\n'
+      + 'one mesh; the scrubber costs a draw range, so a filter change is the only rebuild.';
   }
   if (TLAYER.err) return `time machine: ${TLAYER.err}`;
   if (!TLAYER.tl) return 'time machine: loading the timeline...';
   const ph = playhead(TLAYER.tl, S.timeAt);
+  if (ph.permille >= 1000) {
+    return `the log as it stands today: all ${TLAYER.quads.toLocaleString()} ${timeClsName()} rows by `
+      + `${S.ledgerWho ? (LEDGER.meta?.players?.find((p) => p.id === S.ledgerWho)?.name ?? 'that player') : 'anybody'}`
+      + ` are in the picture, and nothing is taken back`;
+  }
   const who = S.ledgerWho
     ? (LEDGER.meta?.players?.find((p) => p.id === S.ledgerWho)?.name ?? `player ${S.ledgerWho}`) : 'anybody';
   const span = TLAYER.tl.spanSec;
@@ -4186,7 +4674,13 @@ function timeNote() {
     + `\nthe log spans ${fmtLedger(ph.firstMs)} to ${fmtLedger(ph.lastMs)}, but only ${TLAYER.activeDays}`
     + ` of those ${(span / 86400).toFixed(0)} days hold any change at all, and day ${TLAYER.busyDay + 1}`
     + ` alone holds ${TLAYER.busyN.toLocaleString()} of them: at ${S.timeSpeed.toLocaleString()} changes/s`
-    + ` this filter plays in ${playSecs.toFixed(1)} s${TLAYER.truncated ? ', and this view is capped short of the end' : ''}`;
+    + ` this filter plays in ${playSecs.toFixed(1)} s${TLAYER.truncated ? ', and this view is capped short of the end' : ''}`
+    // The date in the box is the filter's clock, not the log's. A place-only filter over a log that runs to
+    // 2026 stops at its last placement, and that is the kind of thing that looks like a broken clock.
+    + (TLAYER.quads && TLAYER.quadSec?.length
+      ? `\nthese rows themselves run ${fmtLedger((TLAYER.tl.timeBaseSec + TLAYER.quadSec[0]) * 1000)} to`
+        + ` ${fmtLedger((TLAYER.tl.timeBaseSec + TLAYER.quadSec[TLAYER.quadSec.length - 1]) * 1000)}`
+      : '\nthis filter keeps no rows, so there is nothing to scrub');
 }
 
 /** Short wall clock for the slider's value column, scaled to what the history actually spans. */
@@ -4606,13 +5100,14 @@ window.__world = {
   // M12b: the time machine's readout. `drawn` is the number that proves the playhead moved -
   // "the layer exists" is not evidence. `quads` is the size of the current filter, and the three ms
   // figures are the fetch, the filter and the mesh build, which are three different questions.
+  hist: histStats,
   time: () => ({
     on: !!S.time, playing: !!S.timePlay, tl: !!TLAYER.tl, err: TLAYER.err,
     rows: TLAYER.rows, other: TLAYER.other, quads: TLAYER.quads, verts: TLAYER.verts,
     cur: TLAYER.cur, activeDays: TLAYER.activeDays, busyDay: TLAYER.busyDay, busyN: TLAYER.busyN,
     drawn: TLAYER.drawn, sec: TLAYER.sec, at: S.timeAt, speed: S.timeSpeed,
     cls: S.timeCls, who: S.ledgerWho, limit: S.timeLimit, truncated: TLAYER.truncated,
-    span: TLAYER.tl?.spanSec ?? 0, base: TLAYER.tl?.baseSec ?? 0,
+    span: TLAYER.tl?.spanSec ?? 0, base: TLAYER.tl?.timeBaseSec ?? 0,
     kb: (TLAYER.bytes / 1024) | 0, fetchMs: +TLAYER.fetchMs.toFixed(1),
     filterMs: +TLAYER.filterMs.toFixed(1), buildMs: +TLAYER.buildMs.toFixed(1),
     drawRange: TLAYER.mesh ? [TLAYER.mesh.geometry.drawRange.start, TLAYER.mesh.geometry.drawRange.count] : null,
@@ -4620,8 +5115,13 @@ window.__world = {
     bytes: TLAYER.mesh ? TLAYER.mesh.geometry.attributes.position.array.byteLength + TLAYER.mesh.geometry.index.array.byteLength : 0,
   }),
   timeLoad, timeRebuild, timeApply, timeGoto, timePermille, timeSeekRow, timeRowAt, setTime, setTimePlay, timeNote,
+  // The card and the playhead: a probe has to be able to ask about a block and rewind to one of its rows
+  // without owning the scene graph.
+  ledgerAsk, ledgerAskCentre, ledgerRewind, rewindNote,
+  histSync, histStats, histEditsOf, histNote, histTotals, histStampOf, histWanted, HIST,
   TLAYER,
   ledgerLoad, ledgerFind, ledgerJump, ledgerAsk, ledgerAskCentre, setLedger, clearLedgerPins,
+  ledgerRewind, timeVoxelIndex, ledgerCellAt,
   ledgerNote, rankCells, collectCells, summarizeRows, readPack,
   // Ray for a screen point, so a probe can walk the world along the line of sight instead of only
   // asking what the rasteriser happened to draw there.
@@ -4761,6 +5261,16 @@ window.__world = {
   // find-and-replace over the settings list.
   panelKeys: () => (panel ? panel.keys() : []),
   panelWidth: () => (panel ? panel.widthPx() : 0),
+  // The overlay's own facts, so a probe can check what a viewer would see rather than what the code
+  // intends: material opacity read back off the material, tile visibility read back off the mesh.
+  overlay: () => ({
+    tiles: !!S.timeTiles, op: S.decalOp, shrink: S.decalShrink,
+    heatOp: ledgerHeatMat ? +ledgerHeatMat.opacity.toFixed(3) : null,
+    heatInset: +heatInset().toFixed(2),
+    timeOp: timeDecalMat ? +timeDecalMat.opacity.toFixed(3) : null,
+    timeVisible: TLAYER.mesh ? TLAYER.mesh.visible : false,
+    setTiles, setDecalOp, setDecalShrink,
+  }),
   // M11/M14 walk mode, in the shape a probe needs it: on/off, how far ahead the world is kept, where
   // the eye actually is, and a way to put the body somewhere without a keyboard.
   walk: (...a) => (a.length ? setWalk(!!a[0]) : walk.on),
@@ -5226,22 +5736,42 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         fmt: () => (S.time ? `on - ${(TLAYER.drawn ?? 0).toLocaleString()} / ${(TLAYER.quads || 0).toLocaleString()}` : 'off'),
         get: () => !!S.time, set: (v) => setTime(v),
         hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one decal per\nlogged change that has happened by the playhead. Costs one 4.7 MB request per dimension\n(/ledger/timeline) and one mesh; moving the playhead is a draw range, not a rebuild, so two years of\nhistory play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole dimension,\n35 ms for one player. M. URL: ?time=1' },
-      { key: 'timeAt', label: 'playhead', min: 0, max: 1000, step: 1, live: false, valw: 132,
+      { key: 'timeTiles', label: 'draw the change tiles', kind: 'check',
+        fmt: () => (S.timeTiles ? `${(TLAYER.drawn ?? 0).toLocaleString()} tiles` : 'off - the blocks speak'),
+        get: () => !!S.timeTiles, set: (v) => setTiles(v),
+        hint: 'The time machine has two halves: flat tiles over every block the log touched, and the blocks\nthemselves corrected back to the playhead ("undo the log in the blocks too", below). Tiles are the cheap\nhalf - one mesh, a draw range per frame, 90,045 quads for this dimension\'s places - but a tile per\nlogged change over a canopy hides the very world it is describing. Off leaves the playhead, the date\nand the terrain undo working, which is the "watch the house get built" view with nothing in the way.\nM still brings the layer back. URL: ?timetiles=0' },
+      { key: 'decalop', label: 'overlay strength', stops: [0.15, 0.3, 0.45, 0.6, 0.8, 1],
+        fmt: (v) => `${Math.round(100 * v)}% solid`, get: () => S.decalOp, set: (v) => setDecalOp(v),
+        hint: 'How solid both ledger overlays are - the per-chunk heat tiles and the per-change time tiles. They\nsit a fraction of a block above the ground, so at full strength they are a floor of paint over whatever\nthey describe; 45% is where 90,045 place tiles over a canopy still read as canopy. URL: ?decalop=' },
+      { key: 'decalshrink', label: 'tile inset', stops: [0.4, 0.6, 0.7, 0.82, 0.92, 1],
+        fmt: (v) => `${Math.round(100 * v)}% of the block`, get: () => S.decalShrink, set: (v) => setDecalShrink(v),
+        hint: 'The cheaper fix, and the one that does not cost fill: each tile is drawn smaller than what it\ncovers, so the block\'s own edge and the seam between chunks stay open and the overlay stops welding\nitself into one sheet. A heat tile is 16 x 16 blocks, a time tile is one, so one number sizes both.\nRe-cuts the overlay meshes (about 100 ms for a dimension). URL: ?decalshrink=' },
+      { key: 'timeAt', label: 'playhead', min: 0, max: 1000, step: 1, live: true, valw: 132,
         get: () => timePermille(), set: (v) => timeSeekRow(timeRowAt(+v)),
+        // Dragging moves up to a thousand rows of the cursor; the voxel undo self-throttles to one sync per
+        // 64 rows (0.1 ms to mark), so the tiles follow the thumb and the blocks land when the thumb stops.
+        end: () => histSync(true),
         fmt: () => (TLAYER.tl ? timeStamp(playhead(TLAYER.tl, TLAYER.sec).ms) : '-'),
-        hint: 'Permille of THIS FILTER\'s rows drawn, oldest first - deliberately not a date slider, because a\ndate slider shows nothing at all across the 60% of days with no logged change. The value column is the\nwall clock at the playhead. Drag to scrub, K to play. URL: ?timeat=<seconds since the first row>' },
+        hint: 'Permille of THIS FILTER\'s rows drawn, oldest first - deliberately not a date slider, because a\ndate slider shows nothing at all across the 813 of 822 days with no logged change. The value column is\nthe wall clock at the playhead. The tiles follow the thumb; the blocks re-cut when you let go\n(or every 64 rows while dragging). Drag to scrub, K to play. URL: ?timeat=<seconds since the first row>' },
       { key: 'timePlay', label: 'play (K)', kind: 'check',
         fmt: () => (S.timePlay ? `${S.timeSpeed.toLocaleString()}/s` : 'paused'),
         get: () => !!S.timePlay, set: (v) => setTimePlay(v),
         hint: 'The playhead, not the frame: a slow machine shows less history per frame rather than wrong\nhistory. Reaching the end of the log stops; K from the end restarts at the first logged change, not at\nthe oldest calendar second.' },
-      { key: 'timeSpeed', label: 'changes per second', stops: [200, 1000, 5000, 20000, 80000, 250000],
-        fmt: (v) => `${(+v).toLocaleString()}/s`, get: () => S.timeSpeed, set: (v) => { S.timeSpeed = Math.max(1, +v || 1); },
-        hint: 'Logged changes per wall-clock second, because that is the only rate that works here: this\nserver logged activity on 9 of the 822 days its log spans, and one of those days holds 83,101 rows. A\nplayhead driven by the calendar would sit still for a month and then blur. At 20,000/s the whole\noverworld log plays in 18 s and one player\'s places in 0.2 s; the sentence below does that arithmetic.\nURL: ?timespeed=' },
+      { key: 'timeSpeed', label: 'changes per second', stops: [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2500, 5000, 20000, 80000, 250000],
+        typeable: true, numMin: 0.05, numMax: 500000, numStep: 1, valw: 96,
+        fmt: (v) => `${(+v).toLocaleString()}/s`, get: () => S.timeSpeed,
+        set: (v) => { S.timeSpeed = Math.max(0.05, Math.min(5e5, +v || 1)); },
+        hint: 'Logged changes per wall-clock second, because that is the only rate that works here: this\nserver logged activity on 9 of the 822 days its log spans, and one of those days holds 83,101 rows. A\nplayhead driven by the calendar would sit still for a month and then blur. The thumb names 15 rates\nfrom 1/s to 250,000/s, and the box beside it takes any number you type: at 1/s you watch one block\nappear per second, at 5/s one player\'s 9,651 places take half an hour, at 20,000/s the whole overworld\nlog plays in 18 s. The sentence below does that arithmetic. URL: ?timespeed=' },
       { key: 'timeCls', label: 'replay which action', kind: 'select', options: timeClassOptions(),
         get: () => S.timeCls, set: (v) => { S.timeCls = +v || 0; timeRebuild(); },
         hint: 'Which rows get a decal, and what colour it is. Blocks only is the one that reads as building:\n90,045 place rows against 202,826 break rows. The playhead counts THIS filter, so switching mid-play\nkeeps the fraction of the filtered history, not the date. Any colour is 7.4 M triangles - the place set\nis 1.1 M.' },
-      { kind: 'note', text: () => timeNote(),
+      { key: 'timeTerrain', label: 'undo the log in the blocks too', kind: 'check',
+        fmt: () => (S.timeTerrain ? `${histTotals().chunks.toLocaleString()} chunks, ${histTotals().edits.toLocaleString()} blocks` : 'off'),
+        get: () => !!S.timeTerrain, set: (v) => { S.timeTerrain = v ? 1 : 0; S.timeTouched = 1; histSync(true); },
+        hint: 'Not a decal: the voxels. Walking the playhead back re-cuts the detail chunks in view with every\nlogged change after it reversed - a block broken after the playhead stands again, a block placed after it\nis gone - which is the difference between watching dots appear and watching the house get built. Undo runs\nnewest first, and the work is bounded by the LOG per chunk rather than by the size of the world: this\ndimension has 20,322 touched chunks and its loudest holds 4,254 rows. Only the sharp layer is corrected:\nthe baked far tiles and the heightmap skin keep showing today, so zoom out and you see today. Two limits\ncome from the log itself, not from this viewer - block_state is filled for 2,828 of its 424,599 rows, so a\nrestored block is chosen by NAME and gets the plainest state the atlas holds (a stair comes back facing a\ndefault way, not the way it was placed); and light is not re-simulated, so a block coming back inside a\ntunnel is lit by the light that cell has today. It follows the row filter above, so "one player\'s places"\nthen means "the world as that player left it". URL: ?timeterrain=1, and the costs behind it stay URL-only:\n?timeterrainstep= (rows the playhead may jump per re-sync), ?timeterrainlimit= (rows undone per chunk),\n?timeterrainmax= (chunks re-cut per re-sync).' },
+      { kind: 'note', key: 'note_time', text: () => timeNote(),
         hint: 'The one sentence that answers "am I watching a bug, or an empty decade?". Unattributed rows -\n269,358 of this dimension\'s 351,531, most of them water, fire, growth and mobs - belong to anybody:\nfiltering to one player is a much smaller claim, and it costs 35 ms to re-cut instead of 100.' },      { kind: 'note', text: () => ledgerNote() },
+      { kind: 'note', key: 'note_hist', text: () => histNote() },
       { kind: 'note', text: 'M the time machine - K play or pause - drag playhead to scrub - Esc clears the card and the markers' },
       { kind: 'note', text: 'click a block for its history - L the overlay - T middle of view - F tour - Esc clears the card and the markers' },
       { kind: 'section', key: 'sec_far', label: 'the far world', open: false,

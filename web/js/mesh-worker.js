@@ -10,6 +10,8 @@ import { meshChunk, NEIGH_COVERED } from './mesher.js';
 import { sectionIndex, stateIndexAt, lightLevelAt, skyLevelAt } from './lookup.js';
 import { meshShellPatch } from './shell-mesh.js';
 import { patchFrameGetter, patchPolicy } from './shell-batch.js';
+import { applyEdits } from './ledger-terrain.mjs';
+import { withAccessors } from './payload.js';
 
 let assets = null;
 
@@ -20,6 +22,28 @@ const entries = (chunks) => {
   for (const ch of chunks) map.set(`${ch.cx},${ch.cz}`, { ch, secOf: sectionIndex(ch) });
   return map;
 };
+
+/**
+ * M12b Tier 2: the world as of the playhead, in this worker's copies.
+ *
+ * The page sends the VOXEL EDITS (packed coordinate + state id pairs), not patched payloads: the worker
+ * already decoded the chunk bytes, and a few hundred palette writes costs far less than uploading a
+ * second copy of a chunk. The edits cover the 3x3, because a wall on a chunk border is cut by both sides
+ * and a corrected chunk next to an uncorrected neighbour draws a seam. `applyEdits` copies the palette
+ * and only the sections it touches, and these patched chunks never travel back to the page - the store
+ * keeps the world as it is, and only the triangles remember the playhead.
+ */
+function applyHist(map, hist, airId) {
+  let n = 0;
+  for (const h of hist) {
+    const e = map.get(`${h.cx},${h.cz}`);
+    if (!e) continue;                      // the 3x3 may name a chunk this job was not given
+    const pch = applyEdits(e.ch, h.edits, { withAccessors, airId: airId || 1 });
+    map.set(`${h.cx},${h.cz}`, { ch: pch, secOf: sectionIndex(pch) });
+    n++;
+  }
+  return n;
+}
 
 self.onmessage = ({ data: m }) => {
   if (m.init) {
@@ -47,6 +71,14 @@ self.onmessage = ({ data: m }) => {
   }
 
   const map = entries(m.chunks);
+  // The patch cost is reported back, because "the worker did it" is not the same as "it was free": the
+  // page adds it to its own patched-chunk count so the panel can say how many chunks were corrected.
+  let patched = 0, patchMs = 0;
+  if (m.hist?.length) {
+    const t = performance.now();
+    patched = applyHist(map, m.hist, m.airId);
+    patchMs = performance.now() - t;
+  }
   const chunk = map.get(`${m.cx},${m.cz}`)?.ch;
   if (!chunk) { self.postMessage({ key: m.key, passes: [], stats: null }); return; }
 
@@ -84,5 +116,5 @@ self.onmessage = ({ data: m }) => {
     transfer.push(s.position.buffer, s.uv.buffer, s.color.buffer);
     if (s.index) transfer.push(s.index.buffer);
   }
-  self.postMessage({ key: m.key, cx: m.cx, cz: m.cz, seq: m.seq, passes, stats, ms }, transfer);
+  self.postMessage({ key: m.key, cx: m.cx, cz: m.cz, seq: m.seq, passes, stats, ms, patched, patchMs }, transfer);
 };

@@ -118,7 +118,10 @@ export function editsForCell(tl, rows, sec, stateIdFor, limit = 0) {
  * @param opts.airId          global state id of air, for sections the payload never had
  */
 export function applyEdits(ch, edits, { withAccessors = null, airId = 0 } = {}) {
-  const palette = ch.palette.slice();
+  // Array.from, not slice(): a decoded payload's palette is a TYPED array, and a typed array has no
+  // push. The first browser run of this layer found that by dying in the mesh worker. The palette is a
+  // few hundred numbers at most, so the copy is not the cost; growing an immutable-length buffer is.
+  const palette = Array.from(ch.palette);
   const slotOf = new Map();
   for (let i = 0; i < palette.length; i++) if (!slotOf.has(palette[i])) slotOf.set(palette[i], i);
   const slotFor = (stateId) => {
@@ -214,11 +217,17 @@ export function stateIdsByName(states) {
 }
 
 /**
- * A chunk is worth undoing when it has rows after the playhead. That is a binary search, so the render
- * loop can ask it of every chunk in the ring without touching a row.
+ * The mesh-key stamp of a chunk: how many of its logged rows are newer than the playhead, or '' when
+ * none are. Rows are time-ordered, so "newer than T" is a SUFFIX of the chunk's row list, and a suffix
+ * of the same length is the same suffix - which makes a count exact rather than approximate. Two
+ * playheads with the same count undo the same rows, produce the same voxels, and must produce the same
+ * key, because the mesh parked under the old key is still correct.
+ *
+ * That is what makes a scrub affordable: moving the playhead re-keys only the chunks that have a row
+ * between the old and the new playhead. Most of the map keeps its key, and with it its parked triangles.
  */
 export const histStamp = (tl, rows, sec) => {
   if (!rows || !rows.length) return '';
   const n = rowsAfterCount(tl, rows, sec);
-  return n ? `h${sec}x${n}` : '';
+  return n ? `x${n}` : '';
 };

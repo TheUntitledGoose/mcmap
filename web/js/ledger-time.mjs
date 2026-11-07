@@ -86,7 +86,7 @@ export function filterRows(tl, { who = 0, cls = 0, limit = 0 } = {}) {
  * hole it left at the same height. `quadSec` is the playhead index: `quadAt(quadSec, t)` is how many
  * quads the draw range should cover at time t.
  */
-export function buildTimeQuads(tl, cells, order, { bias = 0.02, lift = 0.004, maxLift = 0.08 } = {}) {
+export function buildTimeQuads(tl, cells, order, { bias = 0.02, lift = 0.004, maxLift = 0.08, shrink = 1 } = {}) {
   const cellAt = typeof cells?.cell === 'function' ? (i) => cells.cell(i) : (i) => cells?.[i];
   const n = order.length;
   const pos = new Float32Array(n * 4 * 3);
@@ -97,6 +97,10 @@ export function buildTimeQuads(tl, cells, order, { bias = 0.02, lift = 0.004, ma
   // skipped row would make the draw range cover more indices than exist - geometry drawn out of order, or
   // past the end of the buffer.
   const quadSec = new Uint32Array(n);
+  // Which timeline row each quad came from. It is NOT the same numbering as `order` whenever a row was
+  // skipped, and "click this block, show me when it happened" has to answer with a quad, so the mapping
+  // leaves this function instead of being guessed by the caller.
+  const quadRow = new Int32Array(n);
   // Repeats of one voxel are lifted rather than dropped, and the count per voxel is all that has to be
   // remembered. A packed number key keeps this a Map of numbers: |x| and |z| stay inside 2^21 in this
   // save and y inside 13 bits, so the key fits a double exactly (max ~2^47).
@@ -113,21 +117,29 @@ export function buildTimeQuads(tl, cells, order, { bias = 0.02, lift = 0.004, ma
     const rep = seen.get(key) ?? 0;
     seen.set(key, rep + 1);
     const yy = y + 1 + bias + Math.min(maxLift, rep * lift);
+    // `shrink` insets the tile inside its own block, about the block's centre. A full-block tile is a
+    // sticker that hides the block it is about: at any zoom past close-in, the map becomes an opaque
+    // quilt of flat squares and the terrain under it cannot be read. Inset leaves each block's own edge
+    // and the seams between blocks open, which is the same legibility trick as the heat layer's `inset`.
+    const half = 0.5 * Math.max(0.02, Math.min(1, shrink));
+    const px0 = wx + 0.5 - half, px1 = wx + 0.5 + half;
+    const pz0 = wz + 0.5 - half, pz1 = wz + 0.5 + half;
     const [r, g, b] = colour[tl.action[i]] ?? colour[0];
     const v0 = v;
     // Winding as in buildHeatQuads: for the triangle (p0,p1,p2), (p1-p0) x (p2-p0) points at +Y. The
     // heat layer's comment writes that cross product the other way round - a comment bug there, not a
     // winding difference: these are its four corners in its order, and the test checks the sign itself.
-    pos[v * 3] = wx; pos[v * 3 + 1] = yy; pos[v * 3 + 2] = wz;
-    pos[(v + 1) * 3] = wx; pos[(v + 1) * 3 + 1] = yy; pos[(v + 1) * 3 + 2] = wz + 1;
-    pos[(v + 2) * 3] = wx + 1; pos[(v + 2) * 3 + 1] = yy; pos[(v + 2) * 3 + 2] = wz + 1;
-    pos[(v + 3) * 3] = wx + 1; pos[(v + 3) * 3 + 1] = yy; pos[(v + 3) * 3 + 2] = wz;
+    pos[v * 3] = px0; pos[v * 3 + 1] = yy; pos[v * 3 + 2] = pz0;
+    pos[(v + 1) * 3] = px0; pos[(v + 1) * 3 + 1] = yy; pos[(v + 1) * 3 + 2] = pz1;
+    pos[(v + 2) * 3] = px1; pos[(v + 2) * 3 + 1] = yy; pos[(v + 2) * 3 + 2] = pz1;
+    pos[(v + 3) * 3] = px1; pos[(v + 3) * 3 + 1] = yy; pos[(v + 3) * 3 + 2] = pz0;
     for (let q = 0; q < 4; q++) {
       col[(v + q) * 3] = r; col[(v + q) * 3 + 1] = g; col[(v + q) * 3 + 2] = b;
     }
     idx[t++] = v0; idx[t++] = v0 + 1; idx[t++] = v0 + 2;
     idx[t++] = v0; idx[t++] = v0 + 2; idx[t++] = v0 + 3;
     quadSec[v / 4] = tl.sec[i];          // one entry per emitted quad, never per row considered
+    quadRow[v / 4] = i;
     v += 4;
   }
   return {
@@ -135,9 +147,9 @@ export function buildTimeQuads(tl, cells, order, { bias = 0.02, lift = 0.004, ma
     // index buffer with zero-filled slack at the end is a trap: draw the whole thing once without a draw
     // range and it renders a fan of triangles at the world origin.
     pos: pos.subarray(0, v * 3), col: col.subarray(0, v * 3), idx: idx.subarray(0, t),
-    quadSec: quadSec.subarray(0, v / 4),
+    quadSec: quadSec.subarray(0, v / 4), quadRow: quadRow.subarray(0, v / 4),
     quads: v / 4, verts: v, indices: t, skipped,
-    lift: { bias, lift, maxLift },
+    lift: { bias, lift, maxLift }, shrink,
   };
 }
 
@@ -170,3 +182,58 @@ export function playhead(tl, sec) {
 
 /** The action names the legend and the card use, so the time layer cannot invent its own vocabulary. */
 export const actionName = (cls) => ACTION_NAME[cls] ?? `#${cls}`;
+
+/**
+ * One number for one block: the timeline's chunk index plus its packed local coordinate. A cell index is
+ * under 2^31 and a packed coord under 2^21, so the product fits a double exactly - the same trick
+ * `buildTimeQuads` uses for its repeat counter, and the reason this is a Map of numbers rather than a Map
+ * of strings.
+ */
+export const voxelKey = (cell, coord) => cell * 2097152 + coord;
+
+/**
+ * Group the drawn quads by the block they are about, so a card can ask "when did THIS block change?".
+ *
+ * `tl` is the decoded timeline and `quadRow` the mapping `buildTimeQuads` returns, so the answer is a quad
+ * index - the thing a draw range can be set from - and not a row index that only means something before
+ * filtering. Each group stays in time order because `quadSec` does.
+ *
+ * Built on demand and cached by the page: 351,531 rows is a few ms and an array per touched block, which
+ * is not a price worth paying on every filter change when almost nobody clicks a block.
+ */
+export function voxelRows(tl, quadRow) {
+  const m = new Map();
+  for (let q = 0; q < quadRow.length; q++) {
+    const i = quadRow[q];
+    const key = voxelKey(tl.cellOf(i), tl.coord[i]);
+    const a = m.get(key);
+    if (a) a.push(q); else m.set(key, [q]);
+  }
+  return m;
+}
+
+/**
+ * The change to one exact block closest to a moment - by default the last one at or before it, which is
+ * the state a playhead sitting at that moment shows. When nothing in the group is that old, the answer is
+ * the earliest change instead, with `before: 0`, so the caller can say "this block's history starts later"
+ * instead of pretending the rewind worked.
+ *
+ * `n` is how many changes that block has under the current filter and `later` how many come after the one
+ * picked, which is what makes "3 more after this one, keep scrubbing" possible on the card.
+ */
+export function rowForBlock(groups, quadSec, cell, coord, sec = null) {
+  const list = groups.get(voxelKey(cell, coord));
+  if (!list || !list.length) return null;
+  let at = list.length - 1;
+  let before = 1;
+  if (sec !== null) {
+    let lo = 0, hi = list.length - 1, best = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (quadSec[list[mid]] <= sec) { best = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    if (best < 0) { at = 0; before = 0; } else at = best;
+  }
+  const q = list[at];
+  return { quad: q, sec: quadSec[q], n: list.length, before, later: list.length - 1 - at };
+}
