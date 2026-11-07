@@ -34,9 +34,11 @@ const RE_REGION = /^r\.(-?\d+)\.(-?\d+)\.mca$/;
 /** Region file names present in a dimension -> chunk extent and file list (no file contents read). */
 export function dimExtent(dir) {
   const files = fs.readdirSync(dir).filter(f => RE_REGION.test(f));
+  const cells = [];
   let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
   for (const f of files) {
     const m = RE_REGION.exec(f);
+    cells.push({ rx: +m[1], rz: +m[2] });
     minX = Math.min(minX, +m[1]); maxX = Math.max(maxX, +m[1]);
     minZ = Math.min(minZ, +m[2]); maxZ = Math.max(maxZ, +m[2]);
   }
@@ -48,5 +50,6 @@ export function dimExtent(dir) {
       ? { minX: minX * 32, maxX: maxX * 32 + 31, minZ: minZ * 32, maxZ: maxZ * 32 + 31 }
       : null,
     chunksUpperBound: chunks,
+    cells,
   };
 }

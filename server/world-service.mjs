@@ -6,6 +6,7 @@ import zlib from 'node:zlib';
 import { readNbt } from '../tools/nbt.mjs';
 import { RegionFile } from '../tools/region.mjs';
 import { listDims, dimExtent } from './world-dims.mjs';
+import { packCells, makeReader, toWire } from '../shared/regionbits.mjs';
 import { decodeChunk, packChunk } from './chunk-payload.mjs';
 import { shellFromPayload, shellFrameCols } from './shell.mjs';
 import {
@@ -144,6 +145,12 @@ export class WorldService {
     // walking it takes 98 s (build/dbg-cachewalk.mjs). A server that does not run its event loop for
     // 98 s is, to whoever is looking at the map, a server that died: heartbeats stop, requests pile up
     // in CLOSE_WAIT, and the viewport freezes on the last chunks it fetched.
+    // Region coverage. A save's bounding box is not its coverage (this one: 1,394 cells, 437
+    // files), and every far request walks the box. Absence here only ever short-circuits a walk
+    // into the answer that walk would have given anyway, and the listing is refreshed on a TTL so
+    // a region written later is not permanently invisible.
+    this.coverage = new Map();
+    this.coverageTtlMs = +(opts.coverageTtlMs ?? 30000);
     this.written = [];
     this.writtenBytes = 0;
     this.baseBytes = 0;               // cache bytes this process did not write (from a reconcile sweep)
@@ -154,6 +161,8 @@ export class WorldService {
       // missing: distinct region files remembered as absent; missHits: lookups answered from that
       // memory. A far pan's whole cost profile sits in these two numbers.
       missing: 0, missHits: 0,
+      // coverageSkips: batch requests answered from the region listing instead of a slot walk.
+      coverageSkips: 0, coverageSlots: 0,
     };
     // 0 disables; the running total of what this process has written is the trip wire, so the cap
     // costs nothing until it is actually exceeded.
@@ -182,6 +191,52 @@ export class WorldService {
     const d = this.dims.get(dim) ?? this.dims.get(shortName(dim));
     if (!d) throw new Error(`unknown dimension '${dim}' (have: ${[...this.dims.keys()].join(', ')})`);
     return d;
+  }
+
+  /**
+   * Which r.x.z files this dimension has, re-read from disk when the cached listing goes stale.
+   * The startup listing is not enough: a server started while the world is still generating must
+   * still notice a region file that appears later.
+   */
+  #coverageEntry(dimId) {
+    const d = this.dims.get(dimId) ?? this.dims.get(shortName(dimId));
+    if (!d) return null;
+    const now = performance.now();
+    const cur = this.coverage.get(d.key);
+    if (cur && now - cur.at < this.coverageTtlMs) return cur;
+    const cells = dimExtent(d.dir).cells ?? [];
+    const grid = packCells(cells);
+    const entry = { reader: makeReader(grid), wire: toWire(grid), cells: cells.length, at: now };
+    this.coverage.set(d.key, entry);
+    return entry;
+  }
+
+  /** Bit reader over the listing; empty for a dimension this server does not know. */
+  coverageFor(dimId) {
+    return this.#coverageEntry(dimId)?.reader ?? makeReader(null);
+  }
+
+  /**
+   * Does any region file overlap this chunk rectangle? An unknown dimension or an empty listing says
+   * yes: the point is to skip walks over ground that was never written, never to hide ground.
+   */
+  hasGround(dimId, cx0, cz0, w, h) {
+    const e = this.#coverageEntry(dimId);
+    if (!e || !e.cells) return true;
+    return e.reader.hasAny(cx0, cz0, w, h);
+  }
+
+  /** JSON form for /regions, so the browser can stop asking for ground this save never had. */
+  coverageWire(dimId) {
+    const e = this.#coverageEntry(dimId);
+    return e?.cells ? { ...e.wire, cells: e.cells } : null;
+  }
+
+  /** All-empty batch when coverage says the whole rectangle was never written; null otherwise. */
+  #emptyBatchFor(dimId, cx0, cz0, w, h) {
+    if (this.hasGround(dimId, cx0, cz0, w, h)) return null;
+    this.stats.coverageSkips++; this.stats.coverageSlots += w * h;
+    return packBatch(new Array(w * h).fill(Buffer.alloc(0)));
   }
 
   #regionFile(dim, rx, rz) {
@@ -345,6 +400,8 @@ export class WorldService {
    * bake and the tests, where nothing else needs the thread.
    */
   async batchBytesAsync(dimId, cx0, cz0, w, h, every = YIELD_EVERY) {
+    const skip = this.#emptyBatchFor(dimId, cx0, cz0, w, h);
+    if (skip) return skip;
     const frames = [];
     let due = performance.now() + YIELD_MS;
     for (let j = 0; j < h; j++) {
@@ -362,6 +419,8 @@ export class WorldService {
   }
 
   async shellBatchBytesAsync(dimId, cx0, cz0, w, h, every = YIELD_EVERY) {
+    const skip = this.#emptyBatchFor(dimId, cx0, cz0, w, h);
+    if (skip) return skip;
     const frames = [];
     let due = performance.now() + YIELD_MS;
     for (let j = 0; j < h; j++) {

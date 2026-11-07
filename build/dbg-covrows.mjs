@@ -1,0 +1,15 @@
+import fs from 'node:fs';
+import { WorldService } from '../server/world-service.mjs';
+import { buildStateIds } from '../server/chunk-payload.mjs';
+const atlas = JSON.parse(fs.readFileSync('build/assets/atlas.json', 'utf8'));
+const s = new WorldService('DarkRPG/world', buildStateIds(atlas.states.map((x) => x.k)), null, {});
+const d = s.resolve('minecraft:overworld');
+const r = s.coverageFor('minecraft:overworld');
+const e = d.chunkExtent;
+console.log('extent', JSON.stringify(e), 'grid', r.x0, r.z0, r.w, r.h);
+console.log('minZ row', r.hasAny(e.minX, e.minZ, e.maxX - e.minX + 1, 1));
+console.log('maxZ row', r.hasAny(e.minX, e.maxZ, e.maxX - e.minX + 1, 1));
+console.log('minX col', r.hasAny(e.minX, e.minZ, 1, e.maxZ - e.minZ + 1));
+console.log('maxX col', r.hasAny(e.maxX, e.minZ, 1, e.maxZ - e.minZ + 1));
+console.log('outside', r.hasAny(e.minX - 32, e.minZ - 32, 1, 1));
+console.log('unknown dim hasGround', s.hasGround('nope', 0, 0, 64, 64));

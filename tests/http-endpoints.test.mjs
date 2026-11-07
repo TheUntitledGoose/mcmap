@@ -1,0 +1,87 @@
+// The wire contract: coordinates that are not numbers are a 400, and /regions tells the browser
+// which region cells exist.
+//
+// Why the 400 exists: `+q.get('cx0')` is 0 when the parameter is missing and NaN when it is spelled
+// wrong, and `NaN >> 5` is 0 - so `/voxels?...&cx=-366&cz=892` answered chunk (0,0) with a 200 and
+// 4.5 MB of plausible payload. A whole measurement ("168 MB per pan") was built on that typo before
+// the tiny responses were noticed. A wrong parameter name must fail, not be answered with data.
+import test, { after } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fromWire, makeReader } from '../shared/regionbits.mjs';
+
+const PORT = 8790 + (process.pid % 90);
+const BASE = `http://127.0.0.1:${PORT}`;
+const child = spawn(process.execPath, ['server/worldd.mjs', '--port', String(PORT), '--cache', 'none',
+  '--heartbeat', '0', '--host', '127.0.0.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+let log = '';
+child.stdout.on('data', (b) => { log += b; });
+child.stderr.on('data', (b) => { log += b; });
+
+const get = async (p) => {
+  const r = await fetch(BASE + p);
+  const buf = Buffer.from(await r.arrayBuffer());
+  return { code: r.status, buf, text: buf.toString('utf8') };
+};
+
+async function waitReady() {
+  for (let i = 0; i < 120; i++) {
+    try {
+      const r = await fetch(`${BASE}/meta`);
+      if (r.ok) return JSON.parse(await r.text());
+    } catch { /* not listening yet */ }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error(`worldd did not come up:\n${log}`);
+}
+
+test('the server boots on a test port and answers /meta', async () => {
+  const meta = await waitReady();
+  assert.ok(meta.dims.some((d) => d.id === 'minecraft:overworld'));
+});
+
+test('a missing or misspelled coordinate is a 400, not somebody else\'s chunk', async () => {
+  // The exact typo that made a far-pan probe lie: cx/cz instead of cx0/cz0.
+  const typo = await get('/voxels?dim=minecraft:overworld&cx=-366&cz=892&w=6&h=6');
+  assert.equal(typo.code, 400, `expected 400, got ${typo.code} and ${typo.buf.length} bytes`);
+  assert.match(typo.text, /cx0/);
+  const junk = await get('/voxels?dim=minecraft:overworld&cx0=-366&cz0=north&w=6&h=6');
+  assert.equal(junk.code, 400);
+  assert.match(junk.text, /cz0/);
+  const shells = await get('/shells?dim=minecraft:overworld&w=64&h=64');
+  assert.equal(shells.code, 400, 'a block with no origin cannot default to (0,0) either');
+  const one = await get('/voxel?dim=minecraft:overworld');
+  assert.equal(one.code, 400);
+});
+
+test('a correct block still answers, and /regions describes the save', async () => {
+  const ok = await get('/voxels?dim=minecraft:overworld&cx0=-20&cz0=-30&w=3&h=3');
+  assert.equal(ok.code, 200);
+  assert.equal(ok.buf.subarray(0, 8).toString('latin1'), 'DVDXB1  ', 'batch magic, i.e. real payload');
+  const meta = JSON.parse((await get('/meta')).text);
+  const dim = meta.dims.find((d) => d.id === 'minecraft:overworld');
+  const wire = JSON.parse((await get('/regions?dim=minecraft:overworld')).text);
+  assert.equal(wire.cells, dim.regions, 'the wire coverage matches the listing /meta reports');
+  const r = makeReader(fromWire(wire));
+  assert.equal(r.count, dim.regions);
+  const e = dim.chunkExtent;
+  assert.ok(r.hasAny(e.minX, e.minZ, e.maxX - e.minX + 1, e.maxZ - e.minZ + 1));
+  assert.ok(!r.hasAny(e.minX - 32 * 4, e.minZ, 32, 32), 'outside the save reads as empty');
+  assert.ok(meta.coverage?.ttlMs > 0, 'and the server says how fresh the answer is');
+});
+
+test('an unknown dimension is a 404 on /regions, not an empty grid', async () => {
+  const r = await get('/regions?dim=not:a:dimension');
+  assert.equal(r.code, 404);
+});
+
+test('the log stays quiet enough to read', () => {
+  // The heartbeat and slow-request log are the point of the instrumentation; a boot this short
+  // should not have produced any of it.
+  assert.doesNotMatch(log, /stuck|EADDRINUSE/);
+});
+
+test.done?.();
+after(() => { try { child.kill(); } catch { } });

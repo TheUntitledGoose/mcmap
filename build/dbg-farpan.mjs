@@ -75,7 +75,7 @@ for (const [cx, cz] of line(STEPS)) {
   // payload: every 6x6 tile whose centre box the skin covers, deduped across the whole pan
   for (const [tx, ty] of tilesFor(cx, cz, PR, TILE)) {
     const k = `v${tx},${ty}`;
-    if (!seen.has(k)) { seen.add(k); urls.push(`/voxels?dim=${DIM}&cx=${tx}&cz=${ty}&w=${TILE}&h=${TILE}`); }
+    if (!seen.has(k)) { seen.add(k); urls.push(`/voxels?dim=${DIM}&cx0=${tx}&cz0=${ty}&w=${TILE}&h=${TILE}`); }
   }
   // shell coverage: 64x64 blocks around the same centre
   for (const [tx, ty] of tilesFor(cx, cz, SR, 64)) {
@@ -106,8 +106,13 @@ console.log(JSON.stringify({
   ms: { median: pct(0.5), p90: pct(0.9), p99: pct(0.99), max: +Math.max(...times.map((t) => t.ms)).toFixed(0) },
   worst: slow.map((t) => ({ ms: +t.ms.toFixed(0), bytes: t.bytes, url: t.url.slice(0, 64) })),
   emptyResponses: times.filter((t) => t.bytes === 0 || t.status !== 'ok').length,
+  // The probe once used `cx=` where the server reads `cx0=`; NaN coordinates came back as chunk
+  // (0,0) and every tile looked like data. Tiny responses are the honest way to see the difference.
+  tinyResponses: times.filter((t) => t.bytes < 1024).length,
+  wireMB: +(times.reduce((a, t) => a + t.bytes, 0) / 1e6).toFixed(1),
+  byPathBytes: Object.fromEntries(Object.entries(after.byPath ?? {}).map(([p, e]) => [p, { n: e.n, kb: e.kb, max: e.max }])),
   aliveProbe: { probes, medianMs: probeMs.sort((a, b) => a - b)[probeMs.length >> 1] ?? null, maxMs: Math.max(...probeMs) },
-  server: Object.fromEntries(['cacheHits', 'decodes', 'empty', 'holes', 'regionOpens', 'cacheWrites', 'cachePruned', 'sweeps']
-    .map((k) => [k, delta(k)])),
+  server: Object.fromEntries(['cacheHits', 'decodes', 'empty', 'holes', 'regionOpens', 'cacheWrites', 'cachePruned', 'sweeps',
+    'missing', 'missHits', 'coverageSkips', 'coverageSlots'].map((k) => [k, delta(k)])),
   inflightNow: after.inflight,
 }, null, 1));

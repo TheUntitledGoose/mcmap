@@ -129,6 +129,20 @@ function levelSummary() {
   } catch (e) { return { error: String(e.message ?? e) }; }
 }
 
+/**
+ * Chunk coordinates must be present numbers. The old code passed them straight through: a missing
+ * parameter reads as `+null === 0`, and a mistyped one as NaN - which is also 0 once it goes through
+ * `>> 5`. So `/voxels?...&cx=-366` was served chunk (0,0) with a 200, indistinguishable from real
+ * data both on the wire and in a probe that made the same typo.
+ */
+function coord400(q, ...names) {
+  for (const n of names) {
+    const v = q.get(n);
+    if (v === null || v === '' || !Number.isFinite(+v)) return `${n}: expected a chunk coordinate, got '${v ?? ''}'`;
+  }
+  return null;
+}
+
 const CT_MAGIC = 'DVDXB1  ';
 
 const MIME = {
@@ -231,15 +245,26 @@ const server = http.createServer(async (req, res) => {
         assets: { states: atlas.states.length, textures: atlas.textures.length, atlasSize: atlas.atlasSize, geometry: atlas.geometry },
         stats: svc.stats,
         packed: { shells: fs.existsSync(PACKS), lod: lodSummary, ledger: ledger.ready },
+        coverage: { ttlMs: svc.coverageTtlMs },
       }), 'application/json; charset=utf-8');
     }
+    if (u.pathname === '/regions') {
+      // Region coverage for one dimension. The browser uses it to stop asking for ground this save
+      // never had, which over the whole bounding box is most of the map.
+      const wire = svc.coverageWire(q.get('dim') ?? 'minecraft:overworld');
+      return send(req, res, wire ? 200 : 404, wire ? JSON.stringify(wire) : '{"error":"no regions"}', 'application/json');
+    }
     if (u.pathname === '/voxel') {
+      const bad = coord400(q, 'cx', 'cz');
+      if (bad) return send(req, res, 400, bad, 'text/plain');
       const b = svc.chunkBytes(q.get('dim') ?? 'minecraft:overworld', +q.get('cx'), +q.get('cz'),
         { fresh: q.get('fresh') === '1' });
       if (!b) return send(req, res, 404, Buffer.alloc(0), 'application/octet-stream');
       return send(req, res, 200, b, 'application/octet-stream');
     }
     if (u.pathname === '/voxels') {
+      const bad = coord400(q, 'cx0', 'cz0');
+      if (bad) return send(req, res, 400, bad, 'text/plain');
       // Awaited: a ring of payloads can be a few hundred chunk decodes, and the loop must stay free
       // for the requests that came in behind it.
       const b = await svc.batchBytesAsync(q.get('dim') ?? 'minecraft:overworld', +q.get('cx0'),
@@ -247,11 +272,15 @@ const server = http.createServer(async (req, res) => {
       return send(req, res, 200, b, 'application/octet-stream');
     }
     if (u.pathname === '/shell') {
+      const bad = coord400(q, 'cx', 'cz');
+      if (bad) return send(req, res, 400, bad, 'text/plain');
       const b = svc.shellBytes(q.get('dim') ?? 'minecraft:overworld', +q.get('cx'), +q.get('cz'));
       if (!b) return send(req, res, 404, Buffer.alloc(0), 'application/octet-stream');
       return send(req, res, 200, b, 'application/octet-stream');
     }
     if (u.pathname === '/shells') {
+      const bad = coord400(q, 'cx0', 'cz0');
+      if (bad) return send(req, res, 400, bad, 'text/plain');
       // A 16x16 tile of shells is ~256 KB, which is why the far view can cover a wide radius.
       const b = await svc.shellBatchBytesAsync(q.get('dim') ?? 'minecraft:overworld', +q.get('cx0'), +q.get('cz0'),
         Math.min(64, +q.get('w') ?? 1), Math.min(64, +q.get('h') ?? 1));
