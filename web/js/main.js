@@ -12,6 +12,7 @@ import { openOverview } from './payload.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
 import { PATCH_REACH, packPatchFrames, packPatchPolicy, patchFrameGetter, patchPolicy } from './shell-batch.js';
 import { cutReserve, patchThreadCap } from '../../shared/pool.mjs';
+import { recordCut, cutPrice, decideCut } from '../../shared/cutpolicy.mjs';
 import { meshKeyTool } from './mesh-key.js';
 import { parkPasses, indexedMatch } from './mesh-bytes.js';
 import { mountPanel } from './ui.js';
@@ -82,6 +83,13 @@ const S = {
   groundFar: Math.max(0, Math.min(1, num('groundfar', 1))),
   budget: num('budget', 8),
   shellBudget: num('sbudget', 10),
+  // A far patch whose cut does not fit the frame is left marked, and this is how long it may wait
+  // before the render thread cuts it anyway (`shared/cutpolicy.mjs`). It has to be finite: a patch
+  // with no mesh is a hole in the ground, and a patch that stays dirty means the pan never settles.
+  patchStarve: num('starvems', 400),
+  // Price a far cut by its own cell, or by the average of all cuts (the pre-9.9 rule). `?cutavg=1`
+  // is the A/B; the average rule is what let a 47 ms cell-1 patch start 1 ms into a 10 ms frame.
+  cutCellPrice: !params.has('cutavg'),
   // Demotion is a *time* budget as well as a headcount. Demoting one chunk means slicing three
   // attribute arrays into the park and deleting up to three GPU buffers; 64 of them measured 45 ms
   // in a single frame in the middle of a pan, which is a stutter you can see and hear.
@@ -1613,7 +1621,8 @@ function postPatchJob(pk, plan) {
   const w = pool.find((x) => !x.busy);
   if (!w) return false;
   const seq = ++patchSeq;
-  patchJobs.set(seq, { pk, gen: dimGen, tier: plan.tier, mode: plan.mode, sig: plan.sig, t0: performance.now() });
+  patchJobs.set(seq, { pk, gen: dimGen, tier: plan.tier, mode: plan.mode, sig: plan.sig,
+    cell: plan.cell, t0: performance.now() });
   patchJobForKey.set(pk, seq);
   const opts = { ...plan.opts };
   delete opts.cellFor; delete opts.skip;          // closures cannot travel; their answers are the arrays
@@ -1674,6 +1683,7 @@ function patchResult(w, m) {
   const job = patchJobs.get(m.seq);
   patchJobs.delete(m.seq);
   patchJobForKey.delete(m.patch.key);
+  const hadMesh = shellMeshes.has(m.patch.key);
   if (!job || job.gen !== dimGen || job.pk !== m.patch.key) { patchDropped++; return; }
   patchOutside += m.outside || 0;
   // The patch left the skin square while its cut was running. Installing it would be the old carpet
@@ -1688,6 +1698,11 @@ function patchResult(w, m) {
   // test would then believe it is finished.
   if (patchSig(job.pk) !== job.sig) { dirtyAdd(job.pk, 'stale'); patchDropped++; return; }
   installPatch(job.pk, job, m.stream, m.stats, m.ms ?? 0);
+  // A worker's cut is the same meshing work, so it prices the same cell table - the render thread
+  // just does not pay for it. Without these samples the table would only ever see the cheap patches
+  // that stayed inline, which is the mistake that produced the 47 ms frame in the first place.
+  recordCut(cutByCell, job.cell, m.ms ?? 0);
+  cutLog(job.pk, job.cell, m.ms ?? 0, 'worker', !hadMesh);
 }
 
 function rebuildPatch(pk) {
@@ -1732,11 +1747,15 @@ function rebuildPatch(pk) {
     installPatch(pk, plan, again.stream, again.stats, performance.now() - t1);
     const ms2 = performance.now() - tJob;
     shellCutAvg += (ms2 - shellCutAvg) / ++shellCuts;
+    recordCut(cutByCell, plan.cell, ms2);
+    cutLog(pk, plan.cell, ms2, 'inline', !live);
     return 'inline';
   }
   installPatch(pk, plan, stream, stats, performance.now() - t0);
   const ms = performance.now() - tJob;
   shellCutAvg += (ms - shellCutAvg) / ++shellCuts;
+  recordCut(cutByCell, plan.cell, ms);
+  cutLog(pk, plan.cell, ms, 'inline', !live);
   return 'inline';
 }
 
@@ -1748,6 +1767,18 @@ function recountShellVerts() {
 }
 
 let shellCutAvg = 0, shellCuts = 0, PATCH_CUT_MAX = 64;
+// Cut cost per cell size, blended over *both* paths (see shared/cutpolicy.mjs). A cell-1 patch is
+// 4 096 block columns; a cell-8 patch is 64. Pricing them with one blended average is what left a
+// 47 ms cut starting 9 ms into a 10 ms frame.
+const cutByCell = new Map();
+let patchDeferredBig = 0, patchForced = 0, patchCutMax = 0, patchCutMaxCell = 0, patchCutMaxPk = '';
+// The last cuts, named: cell, ms, path, first-mesh. A "shell 47 ms" frame has to be answerable.
+const cutLog = (pk, cell, ms, path, first) => {
+  patchCutLog.push({ pk, cell, ms: +ms.toFixed(1), path, first });
+  if (patchCutLog.length > 24) patchCutLog.shift();
+  if (ms > patchCutMax) { patchCutMax = ms; patchCutMaxCell = cell; patchCutMaxPk = pk; }
+};
+const patchCutLog = [];
 // Three different pieces of work live in this pass and they cost three different things: a signature
 // test (walks a patch's tier, its eight neighbours' tiers and 64 chunk keys), an inline cut (meshing
 // up to 65 536 columns), and a worker job build (collecting the patch's shell frames to send away).
@@ -1820,13 +1851,33 @@ function drainShellPatches(now) {
       sigAvg += (sms - sigAvg) / ++sigN;
       if (same) { dirtyPatches.delete(pk); dirtySince.delete(pk); continue; }
     }
-    // A cut has to fit in the budget it is started in. When no thread is free the cut runs here at the
-    // measured inline average, and starting one 9 ms into a 10 ms frame meant the frame paid 38 ms.
-    // The first cut of a frame is always allowed, or a budget smaller than one cut would never cut.
-    if (n && patchInflight >= patchCap() &&
-        performance.now() + Math.max(2, shellCutAvg) > deadline) {
-      dirtyAdd(pk, 'budget'); patchDeferredN++;
-      return;
+    // A cut has to fit the budget it is started in, priced by *this* patch's cell. The old gate asked
+    // whether the average measured cut fit, and since most cuts go to a thread (0.15 ms of main-thread
+    // work) that average was set by the cheap patches: a cell-1 patch started 1 ms into a 10 ms frame
+    // and the frame paid 47 ms. It also allowed the first cut of a frame unconditionally.
+    const pcell = cellOfTier(patchTier.get(pk) ?? patchTierFor(pk, 0));
+    const price = cutPrice(cutByCell, pcell, shellCutAvg);
+    if (!S.cutCellPrice) {
+      // The old rule, kept for A/B: one blended average for every patch, and the first cut of a frame
+      // free. It stopped the pass instead of skipping just the unaffordable patch, which starved the
+      // cheap ones behind it.
+      if (n && patchInflight >= patchCap() &&
+          performance.now() + Math.max(2, shellCutAvg) > deadline) {
+        dirtyAdd(pk, 'budget'); patchDeferredN++;
+        return;
+      }
+    } else {
+      const act = decideCut({ cell: pcell, priceMs: price, remainingMs: deadline - performance.now(),
+        inflight: patchInflight, cap: patchCap(), waitedMs: now - (dirtySince.get(pk) ?? now),
+        starveMs: S.patchStarve, hasMesh: !!live });
+      if (act === 'defer') {
+        dirtyAdd(pk, 'budget'); patchDeferredN++;
+        if (price > Math.max(2, shellCutAvg)) patchDeferredBig++;
+        // Leave it marked and keep going: this patch is the expensive one, and a cheaper patch later in
+        // the same frame is still worth serving. Returning here starved them for a whole frame.
+        continue;
+      }
+      if (act === 'force') patchForced++;
     }
     dirtyPatches.delete(pk); dirtySince.delete(pk);
     // Pay for the patch, then decide with the cost of *that* patch in hand. A 16x16 patch is 65 536
@@ -1837,7 +1888,8 @@ function drainShellPatches(now) {
     const path = rebuildPatch(pk);
     if (path === 'skip' || path === 'dup') continue;
     if (live) patchCutsChanged++; else patchCutsNew++;
-    const est = path === 'worker' ? Math.max(0.5, patchJobAvg) : Math.max(2, shellCutAvg);
+    const est = path === 'worker' ? Math.max(0.5, patchJobAvg)
+      : Math.max(2, S.cutCellPrice ? cutPrice(cutByCell, pcell, shellCutAvg) : shellCutAvg);
     if (++n >= PATCH_CUT_MAX || performance.now() + est > deadline) return;
   }
 }
@@ -3207,6 +3259,11 @@ window.__world = {
       // Measured cost per piece of far-patch work, so a budget number means something.
       patchCutMsAvg: +shellCutAvg.toFixed(2), patchJobMsAvg: +patchJobAvg.toFixed(2),
       patchSigMsAvg: +sigAvg.toFixed(2),
+      // The far pass priced each cut by its own cell, and what that said:
+      patchCutMsByCell: Object.fromEntries([...cutByCell].map(([c, e]) => [c, +e.ms.toFixed(2)])),
+      patchDeferredBig, patchForced, patchStarveMs: S.patchStarve, patchCutLog,
+      patchCellPrice: S.cutCellPrice ? 1 : 0,
+      patchCutMax: +patchCutMax.toFixed(2), patchCutMaxCell, patchCutMaxPk,
       shellBudgetMs: S.shellBudget, demoteBudgetMs: S.demoteBudget,
       dirtyWhy: Object.fromEntries(dirtyWhy), meshByWhy: Object.fromEntries(meshWhy),
       farCostScale: +costScale.toFixed(2), farFloorBoost: floorBoost, cpuRenderMs: +cpuRenderMs.toFixed(2),
@@ -3520,6 +3577,8 @@ window.__world = {
   // units the GPU counts, so an estimate and a mesh can be compared directly.
   gridEst: () => ({ columns: gridColumns(), costScale, floorBoost, vpc: +vertsPerColumn().toFixed(1),
     cutMs: +shellCutAvg.toFixed(2), cuts: shellCuts, dirty: dirtyPatches.size,
+    cutByCell: Object.fromEntries([...cutByCell].map(([c, e]) => [c, +e.ms.toFixed(2)])),
+    deferredBig: patchDeferredBig, forced: patchForced,
     jobs: patchJobs.size, outside: patchOutside, posted: patchPosted, dropped: patchDropped,
     detailMarks: patchDetailMarks,
     caps: [...shellMeshes.values()].reduce((s, e) => s + (e.caps || 0), 0),
@@ -3737,7 +3796,7 @@ function switchDim(id) {
   applyDetailBudget();
 
   for (const e of [...shellMeshes.values()]) for (const m of [e.mesh, e.mesh2]) if (m) { shellGroup.remove(m); m.geometry.dispose(); }
-  shellMeshes.clear(); patchTier.clear(); dirtyPatches.clear(); recountShellVerts();
+  shellMeshes.clear(); patchTier.clear(); dirtyPatches.clear(); cutByCell.clear(); recountShellVerts();
   if (shellStore && S.shellOn) makeShellStore(id);
   clearLodMeshes();
   if (lodStore) lodStore.clear();

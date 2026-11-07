@@ -38,7 +38,14 @@ process.stdin.on('end', () => {
     firstMeshes: (c.settled.patchCutsNew ?? 0) - (c.before.patchCutsNew ?? 0),
     reCuts: (c.settled.patchCutsChanged ?? 0) - (c.before.patchCutsChanged ?? 0),
     workerCuts: (c.settled.workerCuts ?? 0) - (c.before.workerCuts ?? 0),
+    // The pan's worst single cut: the cumulative max at pan start vs at settle.
+    maxCut: { before: c.before.cutMax ?? 0, after: c.settled.cutMax ?? 0,
+      cell: c.settled.cutMaxCell, pk: c.settled.cutMaxPk },
     msAvg: { cut: c.settled.cutMs, job: c.settled.jobMs, sig: c.settled.sigMs },
+    // per-cell cut cost, and what the cell-aware gate refused / forced
+    cutByCell: c.settled.cutByCell ? JSON.parse(c.settled.cutByCell) : undefined,
+    deferredBig: (c.settled.deferredBig ?? 0) - (c.before.deferredBig ?? 0),
+    forced: (c.settled.forced ?? 0) - (c.before.forced ?? 0),
     queueLeft: c.settled.patchQueue, patches: c.settled.patches, retired: c.settled.retired,
     verts: c.settled.verts, drawn: c.settled.drawn });
 });

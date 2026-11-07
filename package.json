@@ -19,7 +19,7 @@
     "inspect-chunk": "node tools/inspect-chunk.mjs",
     "nbt-trace": "node tools/nbt-trace.mjs",
     "test": "node --test tests/",
-    "test:fast": "node --test tests/view-policy.test.mjs tests/web-shell.test.mjs tests/web-store.test.mjs tests/web-mesh.test.mjs tests/shell-pack.test.mjs tests/web-index.test.mjs tests/web-shellevict.test.mjs tests/web-meshbytes.test.mjs",
+    "test:fast": "node --test tests/view-policy.test.mjs tests/web-shell.test.mjs tests/web-store.test.mjs tests/web-mesh.test.mjs tests/shell-pack.test.mjs tests/web-index.test.mjs tests/web-shellevict.test.mjs tests/web-meshbytes.test.mjs tests/cutpolicy.test.mjs",
     "browser:probe": "node tools/browser-probe.mjs --gpu --url http://127.0.0.1:8765/?debug=1 --out build/probe.png",
     "cache:prune:dry": "node tools/cache-prune.mjs --dry"
   },

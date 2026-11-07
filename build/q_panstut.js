@@ -35,6 +35,10 @@ const cheap = () => {
     patchQueue: s.patchQueue, workerCuts: s.patchWorkerJobs,
     patchCutsNew: s.patchCutsNew, patchCutsChanged: s.patchCutsChanged,
     cutMs: s.patchCutMsAvg, jobMs: s.patchJobMsAvg, sigMs: s.patchSigMsAvg,
+    // cumulative worst cut so far: cheap() before the pan and after it tells you the pan's worst cut
+    cutMax: s.patchCutMax, cutMaxCell: s.patchCutMaxCell, cutMaxPk: s.patchCutMaxPk,
+    cutByCell: JSON.stringify(s.patchCutMsByCell ?? {}),
+    deferredBig: s.patchDeferredBig, forced: s.patchForced,
     meshBuilds: s.meshBuilds, chunks: s.chunks, meshTotalMs: s.mesh, meshAvgMs: s.meshMs };
 };
 
@@ -112,7 +116,8 @@ return {
     detailReach: w.state.detailReachBlocks, drawRes: w.res().setting, autoRes: w.res().autoOn,
     workers: w.state.workers, workerReady: w.state.workerReady, aa: w.state.aa,
     shellBudgetMs: w.state.shellBudgetMs, demoteBudgetMs: w.state.demoteBudgetMs,
-    patchQuiesce: w.state.patchQuiesce },
+    patchQuiesce: w.state.patchQuiesce, cellPrice: w.state.patchCellPrice,
+    starveMs: w.state.patchStarveMs },
   framesSampled: frames.length, panWallS: +((performance.now() - panStart) / 1000).toFixed(1),
   settleAfterPanS: waited / 1000, settleNot: why,
   // [second, dirty far patches, cuts since pan start, signature tests, patches left marked]. A queue
@@ -139,4 +144,10 @@ return {
   gpu: { ms: +r.gpuMs.toFixed(2), timer: r.gpuTimer, dead: r.timerDead, resScale: +r.scale.toFixed(3),
     resChanges: r.changes },
   counters: { before: a, settled: b },
+  // What the far pass paid per cell, and what it refused to run inline (shared/cutpolicy.mjs). The
+  // 47 ms frames have to be answerable, so the last cuts are named: cell, ms, path, first-mesh.
+  cutBill: { starveMs: w.state.patchStarveMs, byCell: w.state.patchCutMsByCell,
+    deferredBig: w.state.patchDeferredBig, forced: w.state.patchForced,
+    cuts: w.state.patchCuts, cutMsAvg: w.state.patchCutMsAvg, workerJobs: w.state.patchWorkerJobs,
+    biggest: (w.state.patchCutLog ?? []).slice().sort((x, y) => y.ms - x.ms).slice(0, 4) },
 };
