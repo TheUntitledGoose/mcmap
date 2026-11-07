@@ -68,42 +68,74 @@ export function firstAfter(tl, rows, sec) {
 export const rowsAfterCount = (tl, rows, sec) => rows.length - firstAfter(tl, rows, sec);
 
 /**
- * Build the voxel edits for one chunk: `[packedCoord, stateId]` pairs, stateId 0 meaning air.
+ * The edits to hand a chunk: `[packedCoord, stateId]` pairs, one per voxel the log touched, state 0 meaning
+ * "take it away".
+ *
+ * The question is not "which rows are newer than the playhead" - it is "what stood in that voxel AT the
+ * playhead", and that is whatever the LAST row not newer than it left behind:
+ *
+ *   last row <= playhead is a place -> the block that row put there
+ *   last row <= playhead is a break -> air, the block was gone by then
+ *   no row <= playhead at all       -> the log never saw it before the playhead, so fall back on the
+ *                                      OLDEST row: a place means "not yet placed" (that is what lets a base
+ *                                      un-build itself), a break means "it was standing, and got broken".
+ *
+ * Only voxels with at least one row NEWER than the playhead get an edit: if nothing in the log after that
+ * moment touched the voxel, what the payload says is already what stood there. One edit per voxel - a chunk
+ * whose 4,254 rows fall on 8,501 voxels costs 8,501 edits, not 4,254 writes in sequence.
  *
  * @param tl        decoded timeline
  * @param rows      that cell's row indices, ascending in time (see rowsByCell)
- * @param sec       playhead, in the timeline's own base-relative seconds; rows strictly after it are undone
+ * @param sec       playhead, in the timeline's own base-relative seconds
  * @param stateIdFor  name -> global state id (1-based, 0 when the name is not a block in the atlas)
- * @param limit     stop after this many rows of the chunk, so a 4,000-row chunk cannot stall a frame
+ * @param limit     cap on edits from this chunk, so a 4,000-row chunk cannot stall a frame
+ * @returns edits plus what they cost: `truncated` is the number of voxels the cap left showing today
  */
 export function editsForCell(tl, rows, sec, stateIdFor, limit = 0) {
   const start = firstAfter(tl, rows, sec);
-  const values = new Map();                 // packed coord -> state id to write
-  let breakRows = 0, placeRows = 0, otherRows = 0, unknown = 0, truncated = 0;
-  // Newest first: the oldest surviving write is the last one applied, which is the state at the
-  // playhead. Ascending order with "first write wins" would be equivalent but reads wrong.
-  let n = rows.length - start;
-  if (limit && n > limit) { truncated = n - limit; n = limit; }
-  for (let k = rows.length - 1, done = 0; done < n; k--, done++) {
-    const r = rows[k];
-    const a = tl.action[r];
-    const c = tl.coord[r];
-    if (isBreak(a)) {
-      breakRows++;
-      const nm = tl.nameOf(r);
-      const id = nm ? stateIdFor(nm) : 0;
-      if (!nm || !id) { unknown++; continue; }
-      values.set(c, id);
-    } else if (isPlace(a)) {
-      placeRows++;
-      values.set(c, 0);
-    } else otherRows++;
+  const none = { edits: new Int32Array(0), breakRows: 0, placeRows: 0, otherRows: 0, unknown: 0, truncated: 0 };
+  if (start === rows.length) return none;
+  // The rows ascend, so one pass over the cell's rows gives three facts per voxel: the newest row at or
+  // behind the playhead, the oldest row that ever touched it, and whether anything happens after the
+  // playhead at all (only those voxels need an edit - the payload is already right for the rest).
+  const behind = new Map();   // packed coord -> newest row at/behind the playhead
+  const first = new Map();    // packed coord -> oldest row that touched it, ever
+  const newer = new Set();    // packed coords with a row after the playhead
+  for (let k = 0; k < rows.length; k++) {
+    const r = rows[k], c = tl.coord[r];
+    if (!first.has(c)) first.set(c, r);
+    if (k < start) behind.set(c, r); else newer.add(c);
   }
-  const edits = new Int32Array(values.size * 2);
+  let breakRows = 0, placeRows = 0, otherRows = 0, unknown = 0, truncated = 0;
+  const edits = new Int32Array(newer.size * 2);
   let w = 0;
-  for (const [c, v] of values) { edits[w++] = c; edits[w++] = v; }
-  return { edits, breakRows, placeRows, otherRows, unknown, truncated };
+  for (const c of newer) {
+    const back = behind.get(c);
+    const use = back === undefined ? first.get(c) : back;
+    const act = tl.action[use];
+    if (isBreak(act)) breakRows++;
+    else if (isPlace(act)) placeRows++;
+    else { otherRows++; continue; }
+    // Which side of that row is the playhead on? A place's record names what it left standing, so a place
+    // at/behind the playhead is a block that WAS there and a place after it is a block that was NOT. A
+    // break's record names what it removed, so it is the mirror image.
+    const wantName = back === undefined ? isBreak(act) : isPlace(act);
+    if (!wantName) { edits[w++] = c; edits[w++] = 0; }
+    else {
+      // A block that stood at the playhead but whose name the log does not give: leave the payload alone
+      // rather than guess, and count it.
+      const id = stateIdFor(tl.nameOf(use));
+      if (!id) { unknown++; continue; }
+      edits[w++] = c; edits[w++] = id;
+    }
+    if (limit && w / 2 >= limit) { truncated = 1; break; }
+  }
+  // "Bounded" is a number a note can print, not a flag: say how many of the voxels it needed to touch were
+  // left showing today.
+  if (truncated) truncated = newer.size - w / 2;
+  return { edits: edits.subarray(0, w), breakRows, placeRows, otherRows, unknown, truncated };
 }
+
 
 /**
  * Apply edits to a decoded chunk, returning a patched copy.

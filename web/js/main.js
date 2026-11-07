@@ -4315,7 +4315,8 @@ function histEditsOf(cx, cz) {
     const rows = ci === undefined ? null : HIST.byCell.get(ci) ?? null;
     const got = editsForCell(TLAYER.tl, rows, HIST.sec, (nm) => HIST.ids.get(nm) ?? 0, S.timeTerrainLimit);
     e = { gen: HIST.gen, stamp, edits: got.edits, unknown: got.unknown, truncated: got.truncated };
-    if (got.truncated) HIST.err = `the loudest chunk has more logged rows than ${S.timeTerrainLimit}: its undo is incomplete`;
+    if (got.truncated) HIST.err = 'a chunk needed more than ' + S.timeTerrainLimit
+      + ' voxel writes to reach that moment; the rest of it still shows today';
   }
   HIST.marks.set(k, e);
   if (HIST.marks.size > 8192) {
@@ -4433,13 +4434,15 @@ function histSync(force = false) {
  * would report zero blocks undone for a scrub that was about to undo thousands.
  */
 function histTotals() {
-  let chunks = 0, edits = 0, unknown = 0, truncated = 0;
+  let chunks = 0, edits = 0, unknown = 0, truncated = 0, truncChunks = 0;
   for (const e of HIST.marks.values()) {
     if (e.gen !== HIST.gen || !e.edits.length) continue;
     chunks++; edits += e.edits.length >> 1; unknown += e.unknown;
-    if (e.truncated) truncated++;
+    // `truncated` counts VOXELS the per-chunk cap left showing today (an undo is one edit per voxel, so a
+    // row count would overstate it); truncChunks says how many chunks hit the cap.
+    if (e.truncated) { truncated += e.truncated; truncChunks++; }
   }
-  return { chunks, edits, unknown, truncated };
+  return { chunks, edits, unknown, truncated, truncChunks };
 }
 
 /** What the terrain time machine costs and claims, in one object a probe can diff. */
@@ -4462,7 +4465,8 @@ function histNote() {
     + `${t.chunks.toLocaleString()} chunk${t.chunks === 1 ? '' : 's'} re-cut, `
     + `${t.edits.toLocaleString()} block${t.edits === 1 ? '' : 's'} undone, `
     + `${t.unknown.toLocaleString()} row${t.unknown === 1 ? '' : 's'} naming nothing the atlas can draw`
-    + (t.truncated ? ` (${t.truncated} chunk${t.truncated === 1 ? '' : 's'} past the per-chunk row limit)` : '')
+    + (t.truncated ? ` (${t.truncated.toLocaleString()} voxel${t.truncated === 1 ? '' : 's'} in ${t.truncChunks}`
+      + ` chunk${t.truncChunks === 1 ? '' : 's'} still showing today, past the per-chunk cap)` : '')
     + ` - ${HIST.marked.toLocaleString()} chunk${HIST.marked === 1 ? '' : 's'} marked, `
     + `${HIST.syncMs.toFixed(1)} ms to mark, ${HIST.patchMs.toFixed(1)} ms patched on this thread`
     + (HIST.workerPatches ? `, ${HIST.workerPatches} patched in workers` : '');
@@ -5768,7 +5772,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
       { key: 'timeTerrain', label: 'undo the log in the blocks too', kind: 'check',
         fmt: () => (S.timeTerrain ? `${histTotals().chunks.toLocaleString()} chunks, ${histTotals().edits.toLocaleString()} blocks` : 'off'),
         get: () => !!S.timeTerrain, set: (v) => { S.timeTerrain = v ? 1 : 0; S.timeTouched = 1; histSync(true); },
-        hint: 'Not a decal: the voxels. Walking the playhead back re-cuts the detail chunks in view with every\nlogged change after it reversed - a block broken after the playhead stands again, a block placed after it\nis gone - which is the difference between watching dots appear and watching the house get built. Undo runs\nnewest first, and the work is bounded by the LOG per chunk rather than by the size of the world: this\ndimension has 20,322 touched chunks and its loudest holds 4,254 rows. Only the sharp layer is corrected:\nthe baked far tiles and the heightmap skin keep showing today, so zoom out and you see today. Two limits\ncome from the log itself, not from this viewer - block_state is filled for 2,828 of its 424,599 rows, so a\nrestored block is chosen by NAME and gets the plainest state the atlas holds (a stair comes back facing a\ndefault way, not the way it was placed); and light is not re-simulated, so a block coming back inside a\ntunnel is lit by the light that cell has today. It follows the row filter above, so "one player\'s places"\nthen means "the world as that player left it". URL: ?timeterrain=1, and the costs behind it stay URL-only:\n?timeterrainstep= (rows the playhead may jump per re-sync), ?timeterrainlimit= (rows undone per chunk),\n?timeterrainmax= (chunks re-cut per re-sync).' },
+        hint: 'Not a decal: the voxels. Walking the playhead back re-cuts the detail chunks in view with every\nlogged change after it reversed - a block broken after the playhead stands again, a block placed after it\nis gone - which is the difference between watching dots appear and watching the house get built. The answer is asked per voxel: what the last logged change at or\nbefore the playhead left standing there. Rows after it are undone\nnewest first, and the work is bounded by the LOG per chunk rather than by the size of the world: this\ndimension has 20,322 touched chunks and its loudest holds 4,254 rows. Only the sharp layer is corrected:\nthe baked far tiles and the heightmap skin keep showing today, so zoom out and you see today. Two limits\ncome from the log itself, not from this viewer - block_state is filled for 2,828 of its 424,599 rows, so a\nrestored block is chosen by NAME and gets the plainest state the atlas holds (a stair comes back facing a\ndefault way, not the way it was placed); and light is not re-simulated, so a block coming back inside a\ntunnel is lit by the light that cell has today. It follows the row filter above, so "one player\'s places"\nthen means "the world as that player left it". URL: ?timeterrain=1, and the costs behind it stay URL-only:\n?timeterrainstep= (rows the playhead may jump per re-sync), ?timeterrainlimit= (voxels one chunk may rewrite),\n?timeterrainmax= (chunks re-cut per re-sync).' },
       { kind: 'note', key: 'note_time', text: () => timeNote(),
         hint: 'The one sentence that answers "am I watching a bug, or an empty decade?". Unattributed rows -\n269,358 of this dimension\'s 351,531, most of them water, fire, growth and mobs - belong to anybody:\nfiltering to one player is a much smaller claim, and it costs 35 ms to re-cut instead of 100.' },      { kind: 'note', text: () => ledgerNote() },
       { kind: 'note', key: 'note_hist', text: () => histNote() },

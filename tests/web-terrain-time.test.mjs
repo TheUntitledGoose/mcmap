@@ -96,7 +96,7 @@ test('a block broken after the playhead comes back, with the name the log record
   assert.equal(out.digest !== ch.digest, true, 'a patched chunk is not the same payload');
 });
 
-test('undo is newest-first, so the surviving value is what stood at the playhead', () => {
+test('the playhead sees what the last row AT OR BEHIND it left, not what the newest row did', () => {
   // Present: air. Log: placed dirt at 20, broke it at 30. Playhead 10 -> the block was not there yet.
   const { tl, ph } = timeline([
     [1, 1, 64, 1, 2, 1, T(20), 'minecraft:dirt', ''],
@@ -165,8 +165,28 @@ test('a row limit keeps a loud chunk bounded, and says it was bounded', () => {
   const all = Int32Array.from(Array.from({ length: 40 }, (_, i) => i));
   const got = editsForCell(tl, all, ph(99), idFor, 10);
   assert.equal(got.edits.length / 2, 10);
-  assert.equal(got.truncated, 30);
+  // 40 rows over 16 distinct voxels: the cap is about voxels left showing today, not rows unread.
+  assert.equal(got.truncated, 6, 'six of the sixteen voxels it needed were left as they are now');
   assert.ok(got.breakRows <= 10);
+});
+
+test('a voxel placed twice keeps the FIRST placement, instead of blanking itself out', () => {
+  // The bug this pins: undoing the later place used to mean "take the block away", which also took away
+  // the block the earlier place had put there - so scrubbing back to a placement hid the placed block.
+  const { tl, ph } = timeline([
+    [1, 6, 66, 6, 2, 1, T(10), 'minecraft:dirt', ''],      // first placement, at/behind the playhead
+    [1, 6, 66, 6, 2, 1, T(20), 'minecraft:stone', ''],     // a later placement of something else
+  ]);
+  const rows = Int32Array.from([0, 1]);
+  const vox = new Uint16Array(4096).fill(2);              // today: stone
+  const ch = chunkOf([[4, vox]]);
+  const got = editsForCell(tl, rows, ph(15), idFor);
+  assert.deepEqual([...got.edits], [tlPackCoord(6, 66, 6), DIRT], 'as of second 15 the dirt was standing');
+  const out = applyEdits(ch, got.edits, { withAccessors, airId: AIR });
+  assert.equal(out.stateAt(6, 66, 6), DIRT);
+  // Two seconds later the second placement is in the picture again, and nothing is edited for it.
+  const later = editsForCell(tl, rows, ph(25), idFor);
+  assert.equal(later.edits.length, 0, 'nothing after second 25 touched it, so today is already right');
 });
 
 test('names pick the plainest form of a block, and read either key spelling', () => {
