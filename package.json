@@ -27,7 +27,8 @@
     "cache:prune:dry": "node tools/cache-prune.mjs --dry",
     "clean:scratch": "node tools/reap.mjs",
     "deploy:check": "node tools/deploy-pack.mjs --no-stage",
-    "deploy:stage": "node tools/deploy-pack.mjs"
+    "deploy:stage": "node tools/deploy-pack.mjs",
+    "cache:trim": "node tools/cache-prune.mjs --max-gb 2"
   },
   "dependencies": {
     "three": "^0.187.0",

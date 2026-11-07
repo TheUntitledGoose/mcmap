@@ -89,7 +89,10 @@ const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
   stamp,
   // The payload cache is saved CPU, not data: the whole world re-decodes in ~25 min. Left alone it
   // grew to 36 GB of unreachable generations, so it gets a byte budget and a startup sweep.
-  cacheMaxGb: num('cache-max-gb', 8),
+  // 8 GB was chosen for a dedicated box; this machine also holds a 3.44 GB save and the packs, and the
+  // cache reached 2.1 GB / 628k files without ever crossing that budget. 2 GB holds roughly the whole
+  // overworld at one light generation (284k chunks x ~3.7 KB), which is what a sweep has to refill.
+  cacheMaxGb: num('cache-max-gb', 2),
 });
 
 // M12: the block-history index. Optional by design - a world without a ledger (or before

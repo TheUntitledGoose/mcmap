@@ -46,6 +46,48 @@ export function measure(dir) {
 }
 
 /**
+ * Trim the cache to a byte budget, oldest first, across every generation.
+ *
+ * The server's own sweep (`WorldService.sweepCacheBudget`) only ever looks inside the generation it is
+ * writing, and it only fires above `--cache-max-gb`. This is the other direction: "I want my disk back",
+ * run by hand, and it walks every tag so a month of probe sweeps drains too. Zero-byte files go first
+ * (an inode that frees no bytes), then the oldest payload - which is also what drains a generation the
+ * running scheme no longer reads.
+ */
+export function trimCache(root, maxBytes, { dry = false, log = () => {} } = {}) {
+  if (!fs.existsSync(root)) return { files: 0, bytes: 0, freed: 0, gone: 0, byTag: [] };
+  const files = [];
+  let total = 0;
+  const walk = (d, tag) => {
+    let ent;
+    try { ent = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ent) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) { walk(p, tag ?? e.name); continue; }
+      try { const st = fs.statSync(p); files.push([p, st.mtimeMs, st.size, tag ?? '?']); total += st.size; } catch { }
+    }
+  };
+  walk(root, null);
+  const tags = new Map();
+  for (const [, , sz, tag] of files) {
+    const t = tags.get(tag) ?? { files: 0, bytes: 0 };
+    t.files++; t.bytes += sz; tags.set(tag, t);
+  }
+  const byTag = [...tags.entries()].map(([tag, v]) => ({ tag, ...v })).sort((a, b) => b.bytes - a.bytes);
+  if (total <= maxBytes) return { files: files.length, bytes: total, freed: 0, gone: 0, byTag };
+  const target = maxBytes * 0.9;
+  files.sort((a, b) => ((a[2] === 0 ? 0 : 1) - (b[2] === 0 ? 0 : 1)) || a[1] - b[1]);
+  let freed = 0, gone = 0;
+  for (const [p, , sz] of files) {
+    if (sz > 0 && total - freed <= target) break;
+    if (!dry) { try { fs.rmSync(p, { force: true }); } catch { continue; } }
+    freed += sz; gone++;
+    if (gone % 5000 === 0) log(`  ${dry ? 'would delete' : 'deleted'} ${gone} files, ${(freed / 1e6).toFixed(0)} MB`);
+  }
+  return { files: files.length, bytes: total, freed, gone, byTag };
+}
+
+/**
  * Remove cache subtrees the running scheme cannot read.
  *
  *   unreachable: a top-level dir with no `lit`/`nolight` inside (pre-light-tag layout), and any
