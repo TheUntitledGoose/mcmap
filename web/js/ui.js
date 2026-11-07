@@ -37,10 +37,12 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
   const body = el('div', 'panel-body');
   root.append(body);
   const rows = new Map();
+  const notes = [];
   // Rows go into `slot`, which a section item swaps for its own <details>. Nothing is inside a
   // section until one is opened, so the top of the panel stays short.
   let slot = body;
   const fmtDefault = (v, step) => (step >= 1 ? String(Math.round(v)) : v.toFixed(2));
+  const noteText = (it) => (typeof it.text === 'function' ? it.text() : it.text);
   // A `stops` row is an index over named values. Both directions of that mapping live here so
   // a preset or a probe can still speak in real values, and a value that is not on the list
   // (URL-seeded) lands on the nearest stop instead of being snapped away.
@@ -64,9 +66,11 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
     }
 
     if (it.kind === 'note') {
-      // One line of prose, for the things the page does with a gesture rather than a control.
-      const n = el('div', 'panel-note', it.text);
+      // One line of prose, for the things the page does with a gesture rather than a control. The text
+      // may be a function, because what the mouse wheel *means* changes with the view mode.
+      const n = el('div', 'panel-note', noteText(it));
       if (it.hint) n.title = it.hint;
+      notes.push({ node: n, it });
       slot.append(n);
       continue;
     }
@@ -126,6 +130,7 @@ export function mountPanel({ title = 'settings', items = [], actions = [] } = {}
   }
 
   const refresh = () => {
+    for (const n of notes) { const t = noteText(n.it); if (n.node.textContent !== t) n.node.textContent = t; }
     for (const { it, input, out, fmt, max, stops } of rows.values()) {      const v = it.get();
       if (it.kind === 'check') {
         input.checked = !!v;

@@ -21,6 +21,10 @@ import { layerAlpha, stackOver, over, dmax } from '../../shared/composite.mjs';
 import { CH, maxZoomFor, cornerTan, zoomCeiling, frustumFor, groundReach, skinRadius, fogFor,
   closestApproach, cellForPixels, budgetCell, detailRadius, detailReach, faceFactor, tierDistance,
   pickEvictions, aaDefault } from '../../shared/view.mjs';
+// M11 first-person rig. The arithmetic (keys, mouse-look, the wheel, standing on the ground) lives in
+// shared/walk.mjs next to the other view policies, so the tests cover it without a browser.
+import { EYE_DIST, PITCH_LIMIT, look as walkLook, step as walkStep, wheelReach, walkWant,
+  snapTo as walkSnapTo, floorUnder as walkFloor, riseToAir as walkRise } from '../../shared/walk.mjs';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -259,6 +263,16 @@ lodCellMaxPx: Math.max(1, num('lodcellmax', 8)),
   // this exists to remove. URL: ?nopatchdetail
   patchDetail: params.has('nopatchdetail') ? 0 : (num('patchdetail', 1) ? 1 : 0),
   invert: params.has('invert'),       // orbit drag direction: mouse-look (default) vs grab-the-world
+  // ---- M11: walking (first person) ---------------------------------------------------------
+  // Same rig, distance driven to about zero, so the orbit target becomes the eye. The wheel stops
+  // meaning zoom and starts meaning how far ahead of the eye the world stays drawn.
+  // URL: ?view=walk (or ?view=fly), ?reach=, ?wspeed=, ?wsprint=, ?nosnap, ?look=
+  walk: /walk|fly|first/i.test(params.get('view') ?? '') ? 1 : 0,
+  walkReach: clampInt(num('reach', 420), 96, 1600),   // blocks of world kept drawn ahead of the eye
+  walkSpeed: Math.max(1, num('wspeed', 14)),          // blocks/s on foot (in-game is ~4.3)
+  walkSprint: Math.max(1, num('wsprint', 2.6)),       // held Ctrl
+  walkSnap: params.has('nosnap') ? 0 : 1,             // stand the eye on the ground under it
+  walkSens: Math.max(0.0004, num('look', 0.0025)),    // pointer-lock mouse-look, rad per pixel
   worldSpan: 0,        // blocks across the loaded part of this dimension, filled in at boot
   maxZoom: 1200,       // wheel ceiling, recomputed from worldSpan + skinCap
 };
@@ -281,6 +295,16 @@ function setReadouts(on) {
 }
 // The line of keys is not part of the instruments: a first visit needs it whether or not the
 // numbers are up. It fades on its own once you have clearly started driving, and H brings it back.
+// Two key lines, because the keys change: an orbit is dragged and zoomed, a walk is driven.
+const HELP_ORBIT = '<b>drag</b> orbit &nbsp; <b>right-drag</b> pan &nbsp; <b>wheel</b> zoom &nbsp; <b>WASD</b> move'
+  + ' &nbsp; <b>V</b> walk &nbsp; <b>P</b> settings &nbsp; <b>F</b> whole world &nbsp; <b>H</b> readouts';
+const HELP_WALK = '<b>WASD</b> walk &nbsp; <b>Space</b>/<b>Shift</b> up/down &nbsp; <b>Ctrl</b> sprint'
+  + ' &nbsp; <b>click</b> look with the mouse &nbsp; <b>wheel</b> view depth &nbsp; <b>V</b> orbit again';
+function setHelp(on) {
+  const h = $('help');
+  if (h) h.innerHTML = on ? HELP_WALK : HELP_ORBIT;
+  showHelp();
+}
 function showHelp() {
   document.body.classList.remove('helpgone');
   clearTimeout(helpFade);
@@ -365,6 +389,77 @@ groups[0].add(shellGroup);
 
 // ---- camera rig ------------------------------------------------------------
 const rig = { target: new THREE.Vector3(0, 100, 0), yaw: 0.7, pitch: 0.42, dist: +(params.get('dist') ?? 40), keys: new Set() };
+
+// ---- M11: the walking rig ---------------------------------------------------
+// Not a second camera. `dist` goes to about zero, which makes the orbit target the eye, and every
+// distance policy in shared/view.mjs - tier distance, sharp-ring reach, skin radius, the frustum -
+// starts reading "from the eye" for free. What the mode has to supply instead is what to *ask for*:
+// an orbit sizes the world from the frame's corners at the target, and with the target in the eye
+// that square is a point, so a walker sizes it by view depth (`reach`) instead.
+const walk = { on: 0, reach: 0, distWas: 40 };
+// What is solid in the column under the eye, as a test on a world Y. Voxel truth when that chunk is
+// held; the shell's `ground` plane when only the shell is held. That plane is the right one for a
+// walker: the viewer's heightmap is WORLD_SURFACE, whose top is the canopy, and standing a walker on
+// it stands them in the tree tops. `groundAt` is the paint block under a plant, canopy or lake.
+// null means nothing is held there, and no answer must ever move the camera.
+function eyeSolidAt() {
+  const [cx, cz] = centerChunk();
+  const lx = Math.floor(rig.target.x) & 15, lz = Math.floor(rig.target.z) & 15;
+  const c = store ? store.get(cx, cz) : null;
+  if (c && assets) {
+    return (y) => {
+      const id = c.stateAt(lx, y, lz);           // 1-based global state id, 0 = unknown/absent
+      return id !== 0 && assets.stateAir[id - 1] !== 1 && assets.stateFilm[id - 1] !== 1;
+    };
+  }
+  const sh = shellAt(cx, cz);
+  if (sh) { const g = sh.groundAt(lx, lz); return (y) => y <= g; }
+  return null;
+}
+let walkFloorY = NaN;           // last floor found under the eye, for the readout and the probes
+let walkFloorTry = 0;           // when the floor was last asked for outside a movement step
+function walkStand() {
+  const solid = eyeSolidAt();
+  if (!solid) { walkFloorY = NaN; return; }
+  if (S.walkSnap) rig.target.y = walkRise(solid, rig.target.y);
+  walkFloorY = walkFloor(solid, rig.target.y);
+  if (S.walkSnap) rig.target.y = walkSnapTo(walkFloorY, rig.target.y, { on: true });
+}
+function setWalk(on) {
+  on = !!on;
+  if (on === !!walk.on) return walk.on;
+  walk.on = on ? 1 : 0; S.walk = walk.on;
+  if (on) {
+    walk.distWas = rig.dist;
+    walk.reach = S.walkReach;
+    rig.dist = EYE_DIST;
+    rig.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, rig.pitch));
+    walkStand();
+  } else {
+    if (document.pointerLockElement) document.exitPointerLock();
+    rig.dist = Math.max(2, Math.min(S.maxZoom, walk.distWas || 40));
+  }
+  // The request ring, the far grid's tiers and the store budgets are all anchored on the camera's
+  // distance, so all of them re-anchor on the eye now the mode changed. Without the lastCx/lastDb
+  // reset a requestAround() in the same chunk would decide nothing had moved.
+  lastCx = null; lastCz = null; lastDb = -1;
+  lastTierSig = ''; lastDetailR = -1;
+  applyDetailBudget(); requestAround(); retierPatches(); updateCamera(); updateView();
+  if (panel) panel.refresh();
+  setHelp(!!walk.on);
+  if (hud.msg && !hud.msg.classList.contains('err')) {
+    hud.msg.textContent = on ? 'walking - click the picture to look with the mouse, V for orbit again' : '';
+  }
+  return walk.on;
+}
+// The wheel in walking mode buys view depth. One number drives the skin radius, the far grid's reach
+// and (through the tier rule) how coarse the ground ahead of you may get.
+function setReach(m) {
+  S.walkReach = walk.reach = Math.max(96, Math.min(1600, +m || 0));
+  if (walk.on) { updateView(); requestAround(); }
+  if (panel) panel.refresh();
+  return S.walkReach;
+}
 // ?goto=x,y,z aims the camera at a place. Boot overwrites the target with world spawn, so this has to
 // be applied after that - a shared link that opens somewhere other than the place it names is a bug
 // people hit immediately, and `__world.goto()` uses the same rule as the URL.
@@ -404,6 +499,9 @@ function updateCamera() {
 // the fog both follow the skin, and the wheel ceiling is the distance at which the screen is exactly
 // filled by the widest skin the user allows. shared/view.mjs holds the arithmetic, and its tests.
 function updateView() {
+  // Walking owns the distance, so anything that sets it (a preset, F, R, `__world.set('dist')`) is
+  // undone here rather than leaving the mode half-applied with the target no longer the eye.
+  if (walk.on && rig.dist !== EYE_DIST) rig.dist = EYE_DIST;
   if (rig.dist > S.maxZoom) rig.dist = S.maxZoom;   // the ceiling applies to go()/orbit() too
   // The skin only has to be as wide as the frame can actually see: at least the half-width of the
   // frame at the orbit target, and out to whichever of "where the ground runs out" and "how far the
@@ -418,7 +516,9 @@ function updateView() {
   // took over a few hundred blocks in front of the camera, which is where their flat plates and
   // straight cliff walls are impossible to miss. No fog means "you may see to the horizon".
   const fogWant = S.fog > 0 ? Math.max(320, rig.dist * 1.35) * S.fog : Infinity;
-  const want = Math.max(frameWant, Math.min(groundWant, fogWant));
+  // A walker has no frame corners to size the skin by - the target is the eye, so the square this
+  // maths produces is a point. The view depth from the wheel is what the skin is asked to cover.
+  const want = walk.on ? walkWant(walk.reach, S.fog) : Math.max(frameWant, Math.min(groundWant, fogWant));
   const r = skinRadius(rig.dist, want, { min: S.skinFloor, cap: S.skinCap });
   // Grow straight away - a missing ring is a hole in the view. Shrink only once it is clearly
   // wider than needed, so nudging the pitch does not thrash the request ring and re-mesh patches.
@@ -473,7 +573,7 @@ function updateView() {
   // top of them, which is exactly "the big ones still render even if more detailed are also loaded"
   // and, zooming the other way, the reverse. Quantised so a smooth zoom does not re-tier every
   // frame; retierPatches only dirties the patches whose tier really moved.
-  const sig = `${Math.round(rig.dist / 8)}|${skinR}|${detailR}|${S.cellPx}|${S.cellBudget}|${S.cellMax}|${S.forceCell}`;
+  const sig = `${Math.round(rig.dist / 8)}|${skinR}|${detailR}|${S.cellPx}|${S.cellBudget}|${S.cellMax}|${S.forceCell}|${walk.on ? Math.round(walk.reach / 8) : 0}`;
   if (sig !== lastTierSig && performance.now() - lastTierSigAt > 250) {
     lastTierSig = sig; lastTierSigAt = performance.now();
     retierPatches();
@@ -489,8 +589,8 @@ function updateView() {
 }
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-let drag = null;
-canvas.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY, orbit: e.button === 0 }; });
+let drag = null, pressXY = null;
+canvas.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY, orbit: e.button === 0 }; pressXY = [e.clientX, e.clientY]; });
 addEventListener('pointerup', () => { drag = null; });
 addEventListener('pointermove', (e) => {
   if (!drag) return;
@@ -513,8 +613,24 @@ canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
   // The ceiling is what the skin can actually paint, so scrolling past it stops the view getting
   // bigger instead of showing the edge of the loaded world.
+  if (walk.on) { setReach(wheelReach(walk.reach, e.deltaY)); return; }
   rig.dist = Math.max(2, Math.min(S.maxZoom, rig.dist * Math.exp(e.deltaY * 0.0012)));
 }, { passive: false });
+// Click to look with the mouse. Pointer lock is the only way to keep turning past the edge of the
+// canvas, so it is asked for by a click rather than taken on entering the mode, and Escape gives the
+// cursor back the way the browser expects. Dragging still looks around with no lock at all.
+canvas.addEventListener('click', (e) => {
+  if (!walk.on || document.pointerLockElement) return;
+  // A click that was really a drag (you were looking around) must not steal the cursor.
+  if (pressXY && Math.hypot(e.clientX - pressXY[0], e.clientY - pressXY[1]) > 6) return;
+  canvas.requestPointerLock();
+});
+canvas.addEventListener('mousemove', (e) => {
+  if (!walk.on || document.pointerLockElement !== canvas) return;
+  const l = walkLook({ yaw: rig.yaw, pitch: rig.pitch, dx: e.movementX, dy: e.movementY,
+    sens: S.walkSens, invert: S.invert });
+  rig.yaw = l.yaw; rig.pitch = l.pitch;
+});
 
 let SPAWN = [0, 110, 0];
 let panel = null;
@@ -526,6 +642,9 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyP' && panel) panel.toggle();
   if (e.code === 'KeyF') fitWorld();
   if (e.code === 'KeyX') groups.forEach((g) => g.traverse((o) => { if (o.material) o.material.wireframe = !o.material.wireframe; }));
+  if (e.code === 'KeyV') { setWalk(!walk.on); return; }
+  // Space and the arrows are walk keys here; the page must not scroll out from under them.
+  if (walk.on && (e.code === 'Space' || e.code.startsWith('Arrow'))) e.preventDefault();
   if (e.code === 'KeyH') setReadouts(!readouts);   // instruments and the key line, together
   if (e.code === 'BracketLeft') rig.target.y -= 4;
   if (e.code === 'BracketRight') rig.target.y += 4;
@@ -533,6 +652,17 @@ addEventListener('keydown', (e) => {
 addEventListener('keyup', (e) => rig.keys.delete(e.code));
 
 function stepKeys(dt) {
+  if (walk.on) {
+    // shared/walk.mjs owns the arithmetic - yaw plane only, a diagonal is not faster, Space up and
+    // Shift down (Shift is *down* here, not the orbit speed boost), Ctrl sprints - which is where it
+    // is unit-tested. The eye is the target, so moving the target is moving the eye.
+    const s = walkStep({ keys: rig.keys, yaw: rig.yaw, dt, speed: S.walkSpeed, sprint: S.walkSprint });
+    if (s.dx || s.dy || s.dz) {
+      rig.target.x += s.dx; rig.target.z += s.dz; rig.target.y += s.dy;
+      walkStand();
+    }
+    return;
+  }
   const speed = (rig.keys.has('ShiftLeft') ? 120 : 30) * dt;
   if (rig.keys.has('KeyW') || rig.keys.has('ArrowUp')) rig.target.addScaledVector(fwdOf(), speed);
   if (rig.keys.has('KeyS') || rig.keys.has('ArrowDown')) rig.target.addScaledVector(fwdOf(), -speed);
@@ -1726,6 +1856,9 @@ function patchResult(w, m) {
 
 function rebuildPatch(pk) {
   if (patchJobForKey.has(pk)) return 'dup';    // a cut is already running for this patch
+  // Whether this cut replaces a patch that is already drawn, or fills a hole. Ask BEFORE installing:
+  // installPatch overwrites the store entry. The worker path asks the same question (`hadMesh`).
+  const had = shellMeshes.has(pk);
   const tJob = performance.now();             // the whole job: plan, pack, and mesh if it stays here
   const plan = planPatch(pk);
   if (plan.skip) {
@@ -1776,14 +1909,14 @@ function rebuildPatch(pk) {
     const ms2 = performance.now() - tJob;
     shellCutAvg += (ms2 - shellCutAvg) / ++shellCuts;
     recordCut(cutByCell, plan.cell, ms2);
-    cutLog(pk, plan.cell, ms2, 'inline', !live);
+    cutLog(pk, plan.cell, ms2, 'inline', !had);
     return 'inline';
   }
   installPatch(pk, plan, stream, stats, performance.now() - t0);
   const ms = performance.now() - tJob;
   shellCutAvg += (ms - shellCutAvg) / ++shellCuts;
   recordCut(cutByCell, plan.cell, ms);
-  cutLog(pk, plan.cell, ms, 'inline', !live);
+  cutLog(pk, plan.cell, ms, 'inline', !had);
   return 'inline';
 }
 
@@ -2750,12 +2883,24 @@ let last = performance.now(), frames = 0, loopFrames = 0, fpsAt = last, verts = 
 // itself, so a single exception left every later probe reading a stale scene that looked like a
 // rendering bug. Keep the loop alive and put the failure where a probe can see it.
 let frameError = null;
+// How many frames threw since boot. The catch in `frame()` keeps the viewer alive, but the rest of that
+// frame - the render included - is gone, and since M13 hid the HUD nothing on screen says so. A pan
+// measurement on a page throwing every inline patch cut looked healthy and was not: `frameError` was set
+// and nobody read it. Probes assert this is 0.
+let frameErrors = 0;
+const frameErrorKinds = new Set();   // console.error per frame floods the CDP console and buries the probe
 function frame(now) {
   try { frameBody(now); }
   catch (e) {
+    frameErrors++;
     frameError = String((e && e.stack) || e).replace(/\s+/g, ' ').slice(0, 400);
-    console.error(e);
+    if (frameErrorKinds.size < 8 && !frameErrorKinds.has(frameError.slice(0, 120))) {
+      frameErrorKinds.add(frameError.slice(0, 120));
+      console.error(e);
+    }
     if (hud) hud.msg.textContent = 'frame error: ' + e;
+    // The pill is the only readout that is always on screen, so a broken frame has to be visible there.
+    if (hud && hud.fps) hud.fps.textContent = `!${frameErrors}`;
   }
   requestAnimationFrame(frame);
 }
@@ -2789,6 +2934,12 @@ function frameBody(now) {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
   stepKeys(dt);
+  // A `?view=walk&goto=...` boot asks for the floor before the chunk under the eye has streamed in, so
+  // the first scan answers "no idea" and the eye stays at the literal goto height - in the ground or in
+  // the air - until a key is pressed. Ask again while the answer is unknown. A column that genuinely has
+  // no floor within reach (the walker is over a gorge) keeps answering NaN, and the cost of asking is
+  // ten palette reads a quarter-second.
+  if (walk.on && !Number.isFinite(walkFloorY) && now - walkFloorTry > 250) { walkFloorTry = now; walkStand(); }
   updateCamera();
   updateView();
   // If the setting asks for mesh workers and the pool is somehow empty (a failed start, a reset that
@@ -2880,12 +3031,12 @@ function frameBody(now) {
   frames++;
   if (now - fpsAt > 500) {
     lastFps = frames * 1000 / (now - fpsAt);
-    hud.fps.textContent = lastFps.toFixed(0);
+    hud.fps.textContent = lastFps.toFixed(0) + (frameErrors ? ` !${frameErrors}` : '');
     // A blurry picture is usually a resolution decision rather than a rendering decision, so the
     // pill says when the picture is not the screen's own pixels.
     if (hud.scale) {
       const k = resWanted() / DPR_CAP;
-      hud.scale.textContent = Math.abs(k - 1) < 0.02 ? '' : '×' + (+k.toFixed(2));
+      hud.scale.textContent = Math.abs(k - 1) < 0.02 ? '' : '\u00d7' + (+k.toFixed(2));
     }
     hud.verts.textContent = verts.toLocaleString();
     hud.tris.textContent = Math.round(tris).toLocaleString();
@@ -3231,10 +3382,15 @@ function atState(wx, wy, wz) {
 window.__world = {
   get state() {
     return {
-      fps: lastFps, frameError, loopFrames, verts, tris, drawn, bootError: bootError && bootError.message,
+      fps: lastFps, frameError, frameErrors, loopFrames, verts, tris, drawn, bootError: bootError && bootError.message,
       chunks: store ? store.loaded : 0, inflight: store ? store.inflight : -1,
       queued: store ? store.queue.length : -1, missing: store ? store.missing.size : -1,
       dirty: store ? store.dirty.size : -1, dist: rig.dist, dim: hud.dim.value,
+      // M11: the walking mode, in the readout, because "is the eye really the target?" is the first
+      // thing a walk measurement has to be able to prove.
+      walkOn: walk.on, walkReach: walk.reach, walkSpeed: S.walkSpeed, walkSprint: S.walkSprint,
+      walkSnap: S.walkSnap, eye: [rig.target.x, rig.target.y, rig.target.z],
+      yaw: +rig.yaw.toFixed(4), pitch: +rig.pitch.toFixed(4),
       // [held chunks inside the sharp ring with no mesh, how many of those are queued].
       // `ringStuck[0] > 0 && ringStuck[1] === 0` is the failure, not a slow queue: work that
       // nobody will ever ask for again.
@@ -3627,6 +3783,27 @@ window.__world = {
   // so no Node test can import it, and a silently missing control is the failure mode of every
   // find-and-replace over the settings list.
   panelKeys: () => (panel ? panel.keys() : []),
+  // M11 walk mode, in the shape a probe needs it: on/off, how far ahead the world is kept, where the
+  // eye actually is, and a way to put the eye somewhere without a keyboard.
+  walk: (...a) => (a.length ? setWalk(!!a[0]) : walk.on),
+  reach: (...a) => (a.length ? setReach(+a[0]) : walk.reach),
+  eye: () => ({ x: rig.target.x, y: rig.target.y, z: rig.target.z, yaw: rig.yaw, pitch: rig.pitch,
+    locked: document.pointerLockElement === canvas, reach: walk.reach,
+    // Scanned on demand. `walkFloorY` is refreshed only when the walker moves, so a step that crossed
+    // into a chunk still streaming left it NaN even though the same column answers a frame later - and
+    // a probe reading a stale NaN is how a working floor scan looks broken.
+    floor: (() => { const s = eyeSolidAt(); return s ? walkFloor(s, rig.target.y) : NaN; })() }),
+  walkTo: (x, y, z) => {
+    rig.target.set(+x, +y, +z);
+    if (walk.on) walkStand();
+    updateCamera(); updateView(); requestAround();
+    return [rig.target.x, rig.target.y, rig.target.z];
+  },
+  look: (y, p) => {
+    rig.yaw = +y; rig.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, +p));
+    updateCamera(); updateView();
+    return [rig.yaw, rig.pitch];
+  },
   presets: () => Object.keys(PRESETS),
   presetKeys: () => Object.fromEntries(Object.entries(PRESETS).map(([k, p]) => [k, Object.keys(p.s)])),
   set: (k, v) => {
@@ -3863,16 +4040,16 @@ function switchDim(id) {
 // quietly do nothing - it names a control, and the control knows what else has to be invalidated.
 // `dist: 0` means "fit the world", which is a runtime number rather than a stored one.
 const PRESETS = {
-  'whole world': { dist: 0, s: {
+  'whole world': { dist: 0, s: { walk: false,
     radius: 8, farsharp: 1.5, lodtiles: true, lodquality: 100, shellon: true, overview: false,
     detailPixels: true, lodcap: 8, maxradius: 96, vertbudget: 12000000, fog: 0, caves: false } },
-  'walk around': { dist: 110, s: {
+  'walk around': { s: { walk: true,
     radius: 10, farsharp: 1, lodtiles: true, lodquality: 50, lodcap: 8, caves: true,
     shadow: 0.58, cave: 0.32, daylight: 1, clarity: 0.5, fog: 0 } },
-  'caves': { dist: 150, s: {
+  'caves': { dist: 150, s: { walk: false,
     caves: true, darkcut: 0, buried: 0, surface: false, underfar: false, cave: 0.45,
     daylight: 0.6, radius: 12, farsharp: 1, lodtiles: true } },
-  'fast': { s: {
+  'fast': { s: { walk: false,
     radius: 6, farsharp: 2, lodquality: 100, lodtiles: true, res: 0.7, resAuto: 1,
     budget: 6, sbudget: 8, caves: false, fog: 0 } },
 };
@@ -3898,6 +4075,19 @@ function buildPanel() {
       { key: 'dim', label: 'world', kind: 'select', options: dims,
         hint: 'Which world to look at. Switching keeps every setting and drops nothing but the loaded chunks.',
         get: () => currentDim(), set: (v) => switchDim(v) },
+      { key: 'walk', label: 'walk around (V)', kind: 'check', live: false,
+        fmt: (v) => (v ? `on - ${Math.round(walk.reach)} m` : 'off - orbit'),
+        hint: `First person: the eye goes to head height at the place you were looking at, WASD walks,
+Space up and Shift down, held Ctrl sprints. The wheel stops meaning zoom and starts meaning how much
+world stays drawn ahead of you. Click the picture to look with the mouse (Escape gives the cursor
+back) - or drag, which has always worked. Nothing is faked for this mode: the block-by-block ring, the
+far grid's tier and the baked world all follow the eye instead of the orbit point, which is what
+looking out over a valley costs. URL: ?view=walk, ?reach=`,
+        get: () => !!walk.on, set: (v) => setWalk(v) },
+      { key: 'reach', label: 'walk view depth', min: 96, max: 1600, step: 32, live: false,
+        fmt: (v) => `${v | 0} m`,
+        hint: 'How far ahead of the eye the world is kept drawn: the heightmap skin, the far grid and\nthe baked tiles all stop reaching past it, and the ground beyond is simply not requested. The wheel\nsets the same number while walking. It cannot go below the skin floor (?minradius, 640 m by\ndefault) - that much heightmap is held around the eye at any setting. URL: ?reach=',
+        get: () => S.walkReach, set: (v) => setReach(v) },
       // The useful range is small (a handful of chunks) and the reach is long (the whole view), which a
       // linear 0..24 bar cannot do: it crowded 4, 8, 12, 16 and 24 into a quarter of the track and made
       // 64 unreachable. The stops are the values the measurements actually land on.
@@ -3957,7 +4147,27 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         fmt: (v) => `${Math.round(v * 100)}%`,
         hint: 'How much you can see through water and ice. URL: ?water',
         get: () => 1 - S.water, set: (v) => { S.water = 1 - v; applySettings('water'); } },
-      { kind: 'note', key: 'note_zoom', text: 'zoom with the mouse wheel - drag on empty sky to look around' },
+      { kind: 'note', key: 'note_zoom', text: () => (walk.on
+        ? 'the wheel is how much world stays drawn ahead - click the picture to look with the mouse'
+        : 'zoom with the mouse wheel - drag on empty sky to look around') },
+      { kind: 'section', key: 'sec_walk', label: 'walking', open: false,
+        hint: 'The first-person rig: how fast the eye moves, whether it stands on the ground, and how\nfar ahead the world is kept drawn.' },
+      { key: 'wspeed', label: 'walk speed', min: 2, max: 60, step: 1, live: false,
+        fmt: (v) => `${v | 0} blocks/s`,
+        hint: 'In-game a player walks about 4.3 blocks/s and sprints about 5.6. This eye has no\ncollision and no gravity, so the default is faster than the game on purpose: 14 crosses a chunk in a\nlittle over a second, which keeps the streaming and the meshing in the cheap close-pan case the viewer\nis already good at. Set it to 4 to walk at game speed. URL: ?wspeed=',
+        get: () => S.walkSpeed, set: (v) => { S.walkSpeed = Math.max(1, +v); } },
+      { key: 'wsprint', label: 'sprint multiplier (Ctrl)', min: 1, max: 6, step: 0.2, live: false,
+        fmt: (v) => `${(+v).toFixed(1)}x`,
+        hint: 'Held Ctrl multiplies walk speed. Shift is the down key, the way it is in the game.\nURL: ?wsprint=',
+        get: () => S.walkSprint, set: (v) => { S.walkSprint = Math.max(1, +v); } },
+      { key: 'wsnap', label: 'stand on the ground', kind: 'check', live: false,
+        fmt: (v) => (v ? 'eye on the floor' : 'free flight'),
+        hint: 'A nudge, not a physics engine: if the surface under the eye is within 2.4 blocks, the\neye is put on it. If it is further - flying, swimming, or already deep in a mine - the eye stays where\nyou left it, because a rule that teleports you out of the tunnel you walked into is worse than no\nrule. URL: ?nosnap',
+        get: () => !!S.walkSnap, set: (v) => { S.walkSnap = v ? 1 : 0; if (walk.on) walkStand(); } },
+      { key: 'wlook', label: 'mouse-look speed', min: 0.0005, max: 0.01, step: 0.0005, live: false,
+        fmt: (v) => `${(+v).toFixed(4)} rad/px`,
+        hint: 'Click-to-lock mouse-look only; a drag has always been 0.006 rad/px and still is.\nURL: ?look=',
+        get: () => S.walkSens, set: (v) => { S.walkSens = Math.max(0.0004, +v); } },
       { kind: 'section', key: 'sec_far', label: 'the far world', open: false,
         hint: 'The ground outside the close ring: how it is drawn, how coarse it is allowed to get, and\n'
           + 'what that costs in triangles.' },
@@ -4239,6 +4449,11 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     updateView();
     requestAround();
     buildPanel();
+    // Walking is turned on after the panel exists (its rows report the mode) and after the spawn
+    // point and the ?goto target are known, so ?view=walk&goto=x,y,z lands the eye on that place at
+    // head height rather than aiming at it from 40 blocks away.
+    if (params.has('pitch')) rig.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, num('pitch', rig.pitch)));
+    if (S.walk) setWalk(true);
     requestAnimationFrame(frame);
     // The pill is quiet unless something is wrong or something is arriving. What the save contains
     // is a fact for ?debug=1, not a caption over the world.

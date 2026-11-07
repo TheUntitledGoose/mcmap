@@ -51,4 +51,14 @@ process.stdin.on('end', () => {
     stolen: (c.settled.stolen ?? 0) - (c.before.stolen ?? 0),
     queueLeft: c.settled.patchQueue, patches: c.settled.patches, retired: c.settled.retired,
     verts: c.settled.verts, drawn: c.settled.drawn });
+
+  // Read the page errors FIRST. A throw inside frameBody takes the rest of that frame - the render
+  // with it - and the viewer keeps running, so every number in a run like that measures a broken
+  // page. This parser used to chop the errors block off the output entirely.
+  const en = raw.match(/^errors \((\d+)/m);
+  const bad = (raw.match(/^ {2,}(error|log): .*$/gm) ?? []).slice(0, 3);
+  line('pageErrors', en ? +en[1] : 0);
+  line('frameErrors', `${c.before.frameErrors ?? 0} -> ${c.settled.frameErrors ?? 0}`);
+  if (c.settled.frameError) console.log('  last frame error: ' + c.settled.frameError);
+  for (const e of bad) console.log('  ' + e.trim());
 });

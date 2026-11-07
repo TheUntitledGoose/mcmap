@@ -40,7 +40,10 @@ const cheap = () => {
     cutByCell: JSON.stringify(s.patchCutMsByCell ?? {}),
     deferredBig: s.patchDeferredBig, forced: s.patchForced,
     cappedIdle: s.patchCappedIdle, stolen: s.patchStolen,
-    meshBuilds: s.meshBuilds, chunks: s.chunks, meshTotalMs: s.mesh, meshAvgMs: s.meshMs };
+    meshBuilds: s.meshBuilds, chunks: s.chunks, meshTotalMs: s.mesh, meshAvgMs: s.meshMs,
+    // a throw inside frameBody loses the rest of that frame; a run on a throwing page is not a run
+    frameErrors: s.frameErrors ?? 0,
+    frameError: s.frameError ? String(s.frameError).slice(0, 140) : null };
 };
 
 const frames = [];                       // {dt, work, b{}, pan: bool}
