@@ -8,6 +8,10 @@
 //   GET /shell?dim&cx&cz            one heightmap shell frame (~1 KB)
 //   GET /shells?dim&cx0&cz0&w&h     a rectangle of shell frames
 //   GET /overview?dim=...           the whole dimension as one decimated heightmap frame
+//   GET /ledger/meta                the block-history index: players, dimensions, coverage
+//   GET /ledger/cells?dim=...       sparse per-chunk activity table (binary, 32 B per touched chunk)
+//   GET /ledger/rows?dim&cx&cz      what happened in one chunk, oldest first (JSON)
+//   GET /ledger/top?dim&cls&player  where the action is, most-changed chunks first (JSON)
 //   GET /assets/<file>              atlas.json / atlas.png / geometry.bin
 //   GET /*                          the web app
 import fs from 'node:fs';
@@ -23,6 +27,7 @@ import { buildStateIds } from './chunk-payload.mjs';
 import { classifyStates } from '../shared/cube-path.mjs';
 import { LOD_CELL } from '../shared/lod-format.mjs';
 import { summarizeLodDir } from './lod-pack.mjs';
+import { LedgerService } from './ledger-service.mjs';
 
 const argv = process.argv.slice(2);
 const arg = (name, dflt) => {
@@ -40,6 +45,7 @@ const ASSETS = arg('assets', 'build/assets');
 const CACHE = arg('cache', 'build/cache');
 const WEB = arg('web', 'web');
 const VENDOR_DIR = arg('vendor', path.join('node_modules', 'three', 'build'));
+const LEDGER = arg('ledger', 'build/ledger');
 const PORT = +arg('port', 8765);
 // All interfaces by default: the point of the renderer is that it runs in any browser, including one
 // on another machine. `--host 127.0.0.1` puts it back behind loopback. Note what that means — there is
@@ -85,6 +91,10 @@ const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
   // grew to 36 GB of unreachable generations, so it gets a byte budget and a startup sweep.
   cacheMaxGb: num('cache-max-gb', 8),
 });
+
+// M12: the block-history index. Optional by design - a world without a ledger (or before
+// tools/ledger-export.py has been run) just answers meta with `available: false`.
+const ledger = new LedgerService(LEDGER);
 
 // `--cache-sweep 0` keeps old generations on purpose (comparing two atlas stamps side by side).
 if (CACHE !== 'none' && num('cache-sweep', 1) !== 0) {
@@ -157,7 +167,7 @@ const server = http.createServer(async (req, res) => {
         world: WORLD, level: levelSummary(), dims: svc.dimList(),
         assets: { states: atlas.states.length, textures: atlas.textures.length, atlasSize: atlas.atlasSize, geometry: atlas.geometry },
         stats: svc.stats,
-        packed: { shells: fs.existsSync(PACKS), lod: lodSummary },
+        packed: { shells: fs.existsSync(PACKS), lod: lodSummary, ledger: ledger.ready },
       }), 'application/json; charset=utf-8');
     }
     if (u.pathname === '/voxel') {
@@ -201,6 +211,28 @@ const server = http.createServer(async (req, res) => {
       const b = svc.overviewBytes(q.get('dim') ?? 'minecraft:overworld');
       return b ? send(req, res, 200, b, 'application/octet-stream')
         : send(req, res, 404, 'no overview (run node server/bake-shells.mjs)', 'text/plain');
+    }
+    if (u.pathname === '/ledger/meta') {
+      return send(req, res, 200, JSON.stringify(ledger.metaJson()), 'application/json; charset=utf-8');
+    }
+    if (u.pathname === '/ledger/cells') {
+      const b = ledger.cellsBytes(q.get('dim') ?? 'minecraft:overworld');
+      return b ? send(req, res, 200, b, 'application/octet-stream')
+        : send(req, res, 404, 'no ledger index for that dimension', 'text/plain');
+    }
+    if (u.pathname === '/ledger/rows' || u.pathname === '/ledger/top') {
+      const dim = q.get('dim') ?? 'minecraft:overworld';
+      const opt = {
+        cls: +q.get('cls') || 0,
+        player: +q.get('player') || 0,
+        limit: Math.min(500, +q.get('limit') || 0),
+      };
+      const body = u.pathname === '/ledger/rows'
+        ? ledger.rowsAt(dim, +q.get('cx'), +q.get('cz'), { ...opt, limit: opt.limit || 120 })
+        : ledger.topCells(dim, { ...opt, limit: opt.limit || 40, near: q.has('nearx')
+          ? { cx: +q.get('nearx') >> 4, cz: +q.get('nearz') >> 4, r: +q.get('r') || 32 } : null });
+      if (!body) return send(req, res, 404, 'no ledger index for that dimension', 'text/plain');
+      return send(req, res, 200, JSON.stringify(body), 'application/json; charset=utf-8');
     }
     if (u.pathname.startsWith('/assets/')) return serveFile(res, req, path.join(ASSETS, u.pathname.slice(8)));
     if (u.pathname.startsWith('/shared/')) return serveFile(res, req, path.join('shared', u.pathname.slice(8)));

@@ -250,8 +250,10 @@ function lightOf(light, k, ctx) {
 const GREY = [136, 136, 136];
 const WHITE = [1, 1, 1];
 // The same curve three.js uses to get a texture out of sRGB; keeping it here lets the flat shell read
-// like the textured detail pass instead of like a washed out version of it.
-function srgbToLinear(v) { return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }
+// like the textured detail pass instead of like a washed out version of it. Exported because the
+// ledger overlay paints its own colours and must land in the same working space as everything else
+// (web/js/ledger-view.mjs), or a probe cannot predict the pixel it will read.
+export function srgbToLinear(v) { return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }
 
 // A cell's height is a quantile of its columns, not its maximum — the same rule
 // `overviewFromPacks` uses across chunks, for the same reason. Measured in DarkRPG at 2976 68 2007:

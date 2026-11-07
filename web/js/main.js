@@ -29,6 +29,18 @@ import { EYE_DIST, PITCH_LIMIT, look as walkLook, wish as walkWish, rising as wa
 import { BODY, C_FULL, C_PASS, C_UNKNOWN, FALL_MAX, FLY_V, SPRINT, WALK, dropToClear, newPlayer, place as placePlayer,
   simulate as simulatePlayer, floorTop as playerFloorTop, hits as playerHits } from '../../shared/player.mjs';
 import { makeCellAt } from './collision.js';
+// M12: the block-history overlay - "who placed this, and can I find it". The log holds 424,599 rows
+// for a 3.6 GB world, and only 20,322 of the overworld's 284,239 chunks were ever touched, so the page
+// gets a sparse table (34 B per touched chunk, 691 KB for the whole overworld) and asks for one chunk's
+// rows at a time. What the log *means* - the filter, the heat scale, the geometry, the wording of an
+// evidence line - is decided in web/js/ledger-view.mjs, which is tested without a browser; this page
+// only turns those numbers into a mesh, a card and two buttons.
+import {
+  buildHeatQuads, buildPins, collectCells, formatTime as fmtLedger, LEDGER_CLASSES, nearRows, rankCells,
+  rowLine, summarizeRows, timeAgo,
+} from './ledger-view.mjs';
+import { readPack } from '../../shared/ledger-pack.mjs';
+
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -163,6 +175,24 @@ const S = {
   // read as dug-out. `buried`/`buriedSky` keeps the deep dark instead; this takes the caves.
   // ?surface=1 asks for the skin. URL: ?surface=
   surface: params.has('nosurface') ? 0 : (num('surface', 0) ? 1 : 0),
+
+  // ---- M12: the ledger (block history) --------------------------------------------------------
+  // Off at boot: the overlay paints one decal per chunk the log touched, which is an answer to a
+  // question you only ask on purpose. URL: ?ledger=1, ?ledgercls=2 (place), ?ledgerwho=4 (a player id),
+  // ?ledgermin=20, ?noledgerxray, ?ledgerrows=, ?ledgerblockr=
+  ledger: params.has('ledger') ? (num('ledger', 1) ? 1 : 0) : 0,
+  ledgerCls: Math.max(0, Math.min(6, num('ledgercls', 0))),   // 0 = every kind of action summed
+  ledgerWho: Math.max(0, num('ledgerwho', 0)),                // 0 = anybody, fire/water/monsters included
+  ledgerMin: Math.max(1, num('ledgermin', 1)),                // hide chunks under this many actions
+  // A decal on the ground is hidden by the hill in front of it, which is honest and useless at the same
+  // time. Default draws through the world (it is an overlay, not terrain); ?noledgerxray puts it back on
+  // the ground so you can see what the overlay looks like where you actually are.
+  ledgerXray: params.has('noledgerxray') ? 0 : (num('ledgerxray', 1) ? 1 : 0),
+  // One click asks about one chunk: how many of its rows to fetch, and how wide "this block" is.
+  // 1 block of radius covers the block and its six face neighbours, which is what you meant when you
+  // clicked the lid of a chest rather than its body.
+  ledgerRows: Math.max(10, Math.min(2000, num('ledgerrows', 200))),
+  ledgerNear: Math.max(0, Math.min(4, num('ledgerblockr', 1))),
   // 9.6's two rules together, for A/B: skip a mesh whose payload and known border already answer it,
   // and hold a chunk while a neighbour is still in flight. 0 = mesh on every dirty mark (?meshkey=0).
   meshKey: num('meshkey', 1) ? 1 : 0,
@@ -683,6 +713,17 @@ canvas.addEventListener('click', (e) => {
   if (pressXY && Math.hypot(e.clientX - pressXY[0], e.clientY - pressXY[1]) > 6) return;
   canvas.requestPointerLock();
 });
+// M12: a click in orbit mode asks the ledger about the block under the cursor - "who placed this".
+// A click that was really a drag is not a click (same 6 px rule as pointer lock), and walk mode keeps
+// its click for the pointer, so there the question is asked with T at the crosshair instead.
+canvas.addEventListener('click', (e) => {
+  if (walk.on || !LEDGER.meta?.available) return;
+  if (pressXY && Math.hypot(e.clientX - pressXY[0], e.clientY - pressXY[1]) > 6) return;
+  const p = pickState(e.clientX, e.clientY);
+  if (!p || !p.block) { closeLedgerCard(); return; }      // clicking the sky closes the card
+  ledgerAsk(p.block[0], p.block[1], p.block[2]);
+});
+
 canvas.addEventListener('mousemove', (e) => {
   if (!walk.on || document.pointerLockElement !== canvas) return;
   const l = walkLook({ yaw: rig.yaw, pitch: rig.pitch, dx: e.movementX, dy: e.movementY,
@@ -707,6 +748,12 @@ addEventListener('keydown', (e) => {
   // Space and the arrows are walk keys here; the page must not scroll out from under them.
   if (walk.on && (e.code === 'Space' || e.code.startsWith('Arrow'))) e.preventDefault();
   if (e.code === 'KeyH') setReadouts(!readouts);   // instruments and the key line, together
+  // M12: L is the ledger overlay, T asks who touched what is in the middle of the view, and Escape
+  // closes the card. L rather than a panel-only switch because the overlay is a question you ask the
+  // world while looking at it, not a setting you tune.
+  if (e.code === 'KeyL') { setLedger(!S.ledger); return; }
+  if (e.code === 'KeyT') ledgerAskCentre();
+  if (e.code === 'Escape') { closeLedgerCard(); if (clearLedgerPins()) showLedger('markers cleared - F tours the hotspots again'); }
   if (e.code === 'BracketLeft') nudgeY(-4);
   if (e.code === 'BracketRight') nudgeY(4);
 });
@@ -3033,6 +3080,9 @@ function collectGpu() {
 function frameBody(now) {
   loopFrames++;
   collectGpu();
+  // Above the camera and above the layer policy, because both measure the picture in pixels: a new
+  // drawing buffer has to be the size the rest of this frame believes it is.
+  takeRes();
   pT = performance.now();
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
@@ -3204,13 +3254,56 @@ function abandonTimer(now) {
   timerExt = null;
 }
 
-// Who owns the drawing-buffer key: resize() is the only place that reallocates, so it is the only
-// place that decides whether the picture actually changed.
+// Who owns the drawing-buffer key: the two places that can change the buffer's size (takeRes, through
+// setPixelRatio, and resize, through setSize) both consult it, so a change that ends in the same buffer
+// is not counted and not paid for.
 let lastResKey = '', resDir = 0, resChanges = 0;
+// And *when* it reallocates. `setSize` throws away the drawing buffer along with what is in it, so a
+// change made after this frame has been drawn leaves an empty buffer to be composited: a black frame,
+// once per decision, and at the old controller's rate that is what "my screen flashes black every few
+// seconds" is. A wanted size is therefore a request, and the top of `frameBody` pays for it before
+// anything is drawn - so the frame a viewer ever sees is a painted one.
+let resDue = false;
 
-function applyRes() {
-  renderer.setPixelRatio(resWanted());
-  resize();
+// The governor's output is a reallocating change, and a realloc empties the drawing buffer: one frame
+// of black. The old controller walked a continuous multiplier (x0.9 down, x1.06 up) as often as every
+// 2.5 s, and a load that sits near the target band walks it down and then straight back up - which is
+// a black flash every few seconds, each one followed by the tens of milliseconds the realloc costs.
+// Three changes: a short ladder instead of a continuous multiplier, a wider dead band, and a lock - if
+// it is caught undoing itself twice, it stops moving and says so. A stopped picture beats a marginally
+// better target that flickers.
+const RES_LADDER = [1, 0.85, 0.72, 0.61, 0.5];
+const RES_GAP_MS = 2500;         // least time between two decisions
+const RES_UP_HOLD_MS = 8000;     // a shrink may be undone this soon at the earliest
+const RES_FLIP_MS = 30000;       // two shrink-after-climb events in this window = it cannot settle
+let resRung = 0, resDroppedAt = 0, resClimbedAt = 0, resFlips = 0, resLocked = false;
+// Anyone who changes the picture by hand (the draw-resolution row, setRes) owns the ladder now, so the
+// governor starts over: leaving rung 3 armed while the user put the multiplier back to 1 is how a
+// manual change ends up undone by the next automatic step.
+function resetResGovernor() {
+  resRung = 0; resAuto = RES_LADDER[0]; resDroppedAt = resClimbedAt = 0;
+  resFlips = 0; resLocked = false; resDir = 0;
+}
+
+function applyRes() { resDue = true; }
+
+// Only `frameBody` calls this. Everything else asks for a new picture and lets the frame boundary
+// decide when it is paid for.
+function takeRes() {
+  if (!resDue) return false;
+  resDue = false;
+  const pr = resWanted();
+  // `setPixelRatio` reallocates the buffer by itself (three.js calls setSize inside it), and the old
+  // path then called setSize a second time for the same CSS size: two emptied buffers and two
+  // reallocations per decision, the second one buying nothing at all. Ask once, and write down the
+  // size that ask produced, so `resize` below sees it as already paid for.
+  if (Math.abs(renderer.getPixelRatio() - pr) > 1e-4) {
+    renderer.setPixelRatio(pr);
+    lastResKey = `${Math.floor(innerWidth * pr)}x${Math.floor(innerHeight * pr)}`;
+    resChanges++;
+  }
+  resize();                       // camera and projection follow; a window move still reallocates
+  return true;
 }
 
 function tuneRes(now, force = false) {
@@ -3225,17 +3318,33 @@ function tuneRes(now, force = false) {
   // spent meshing, not drawing.
   const w = profWindow();
   if (!force && w.total - w.render > (1000 / S.targetFps) * 0.5) return;
-  if (gpuSamples === 0 || now - resTuneAt < 2500) return;
+  if (gpuSamples === 0 || now - resTuneAt < RES_GAP_MS) return;
+  if (resLocked) return;
   const want = 1000 / S.targetFps;
-  // Two readings in the same direction, and at least 2 s apart. A single noisy sample used to be
-  // enough to resize the picture, and the resize is the expensive part, not the decision.
-  const dir = gpuMs > want * 0.85 ? -1 : (gpuMs < want * 0.55 ? 1 : 0);
+  // Two readings in the same direction, and at least 2.5 s apart. A single noisy sample used to be
+  // enough to resize the picture, and the resize is the expensive part, not the decision. The dead band
+  // is wide on purpose: 0.85/0.55 let a frame time that simply oscillates around one rung walk the
+  // resolution down and back up forever.
+  const dir = gpuMs > want * 0.85 ? -1 : (gpuMs < want * 0.45 ? 1 : 0);
   if (dir !== resDir) { resDir = dir; return; }
   if (dir === 0) return;
   resTuneAt = now;
-  if (dir < 0 && resAuto > 0.5) resAuto = Math.max(0.5, resAuto * 0.9);
-  else if (dir > 0 && resAuto < 1) resAuto = Math.min(1, resAuto * 1.06);
-  else { resDir = 0; return; }
+  if (dir < 0) {
+    if (resRung >= RES_LADDER.length - 1) { resDir = 0; return; }
+    // Shrinking again shortly after a climb is the flap itself, not two separate corrections.
+    if (resClimbedAt && now - resClimbedAt < RES_FLIP_MS && ++resFlips >= 2) {
+      resLocked = true; resDir = 0; return;
+    }
+    resRung++;
+    resDroppedAt = now;
+  } else {
+    if (resRung <= 0) { resDir = 0; return; }
+    // The frame that looks cheap right after a shrink is the shrink. Give it time to be the fix.
+    if (now - resDroppedAt < RES_UP_HOLD_MS) return;
+    resRung--;
+    resClimbedAt = now;
+  }
+  resAuto = RES_LADDER[resRung];
   applyRes();
 }
 
@@ -3244,7 +3353,11 @@ function resize() {
   // setSize reallocates the drawing buffer, the depth buffer and the mip tree - tens of milliseconds on
   // a software GL, and a CPU profile of a pan showed WebGLRenderer.setSize at 29% of the render
   // thread's busy samples while auto-res re-decided the picture every second. Only pay for a change.
-  const key = `${w}x${h}@${renderer.getPixelRatio().toFixed(4)}`;
+  // The key is the buffer this call would ask for, in device pixels - not the CSS size and not the
+  // ratio string. Two ratios that floor to the same buffer are the same picture, and a key that
+  // mentions the ratio counts them as two changes: two reallocations, two emptied buffers.
+  const pr = renderer.getPixelRatio();
+  const key = `${Math.floor(w * pr)}x${Math.floor(h * pr)}`;
   if (key !== lastResKey) { lastResKey = key; resChanges++; renderer.setSize(w, h, false); }
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
@@ -3374,6 +3487,414 @@ function pickStack(x, y, limit = 8) {
   rc.far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
   return rc.intersectObjects(groups, true).slice(0, limit).map((h) => describeHit(h, rc.ray));
 }
+
+
+// ---- M12: the ledger - who placed this, and can I find it ---------------------------------------
+// Three questions, three different costs:
+//   "where has anyone built?"   one request for the dimension's sparse cell table, then a decal mesh
+//   "who touched this block?"   one request for that chunk's rows, narrowed to the clicked block here
+//   "where should I go?"        a ranked tour of those cells, one stop per press
+// None of them ships the 30 MB log to the browser, and none of them runs per frame: the overlay is
+// static geometry that only the filters re-cut. The server side of it is tools/ledger-export.py,
+// server/bake-ledger.mjs and server/ledger-service.mjs; the format is shared/ledger-pack.mjs.
+const LEDGER = {
+  meta: null,            // /ledger/meta, or { available: false, why } - the panel says which
+  pack: null,            // this dimension's cell table: readPack() of /ledger/cells
+  gen: 0,                // bumped on a dimension change, so a late answer is dropped, not installed
+  mesh: null, pin: null,
+  cells: [], max: 0, quads: 0, noHeight: 0, dropped: 0,
+  bytes: 0, fetchMs: 0, buildMs: 0,
+  top: null, topIdx: 0,  // the "find the bases" tour
+  card: null, cardRows: 0, cardTotal: 0,
+  err: '', asks: 0,
+};
+
+// Deliberately not inside `groups`: pickState raycasts those to answer "what block is under the
+// cursor", and an overlay that answered that question would replace the world under the cursor.
+const ledgerGroup = new THREE.Group();
+ledgerGroup.name = 'ledger';
+scene.add(ledgerGroup);
+
+// One material for the whole heat layer, because the colour lives per corner: 20,322 decal quads stay
+// one draw call. depthTest is the X-ray switch - paint through the world, or sit on the ground and be
+// hidden by the hill in front of it.
+let ledgerHeatMat = null, ledgerPinMat = null;
+function ledgerMat() {
+  if (!ledgerHeatMat) {
+    ledgerHeatMat = new THREE.MeshBasicMaterial({
+      // FrontSide, not DoubleSide: the decals face up, and 20,322 of them painted twice over a
+      // whole-world frame is a fill bill the overlay does not need.
+      vertexColors: true, transparent: true, opacity: 0.55, side: THREE.FrontSide,
+      depthWrite: false, fog: false,
+    });
+  }
+  ledgerHeatMat.depthTest = !S.ledgerXray;
+  return ledgerHeatMat;
+}
+function pinMat() {
+  if (!ledgerPinMat) {
+    ledgerPinMat = new THREE.LineBasicMaterial({
+      color: new THREE.Color().setRGB(1, 0.82, 0.4, THREE.SRGBColorSpace),
+      transparent: true, opacity: 0.85, depthTest: false, fog: false,
+    });
+  }
+  return ledgerPinMat;
+}
+
+// The small JSON that says whether this world has a ledger at all - and the player list the panel's
+// "who" menu is built from. Asked at boot even when the overlay is off, because a control whose choices
+// arrive later is a control that silently offers one choice.
+async function ledgerMetaLoad() {
+  try {
+    LEDGER.meta = await fetch('/ledger/meta').then((r) => r.json());
+  } catch (e) {
+    LEDGER.meta = { available: false, why: `/ledger/meta: ${e.message}` };
+  }
+  return LEDGER.meta;
+}
+
+const ledgerDimInfo = (dim) => (LEDGER.meta?.dims ?? [])
+  .find((d) => d.dimId === dim || d.dimKey === dim) ?? null;
+
+/** Fetch this dimension's cell table. Once per dimension: the filters never need another request. */
+async function ledgerLoad() {
+  const gen = ++LEDGER.gen;
+  LEDGER.pack = null; LEDGER.cells = []; LEDGER.max = 0; LEDGER.quads = 0;
+  LEDGER.top = null; LEDGER.topIdx = 0; LEDGER.err = '';
+  clearLedgerMesh();
+  if (!LEDGER.meta) await ledgerMetaLoad();
+  if (gen !== LEDGER.gen) return null;                     // the dimension changed under this request
+  if (!LEDGER.meta?.available) { LEDGER.err = LEDGER.meta?.why ?? 'no ledger'; return null; }
+  const dim = currentDim();
+  if (!ledgerDimInfo(dim)) { LEDGER.err = 'the ledger has no rows for this dimension'; return null; }
+  const t0 = performance.now();
+  let buf;
+  try {
+    const res = await fetch(`/ledger/cells?dim=${encodeURIComponent(dim)}`);
+    if (!res.ok) { LEDGER.err = `/ledger/cells: HTTP ${res.status}`; return null; }
+    buf = await res.arrayBuffer();
+  } catch (e) { LEDGER.err = `/ledger/cells: ${e.message}`; return null; }
+  if (gen !== LEDGER.gen) return null;
+  try {
+    LEDGER.pack = readPack(new Uint8Array(buf));   // readPack wants a byte view, not a fetched ArrayBuffer
+  } catch (e) {
+    // A pack this reader cannot parse is a re-bake, not an empty world: say which.
+    LEDGER.err = `ledger index: ${e.message} (re-run node server/bake-ledger.mjs)`;
+    return null;
+  }
+  LEDGER.bytes = buf.byteLength;
+  LEDGER.fetchMs = performance.now() - t0;
+  ledgerRebuild();
+  return LEDGER.pack;
+}
+
+function clearLedgerMesh() {
+  for (const k of ['mesh', 'pin']) {
+    const m = LEDGER[k];
+    if (m) { ledgerGroup.remove(m); m.geometry.dispose(); LEDGER[k] = null; }
+  }
+  LEDGER.quads = 0;
+}
+
+/** Re-cut the overlay from the table already in memory: a filter change is a rebuild, not a download. */
+function ledgerRebuild() {
+  clearLedgerMesh();
+  if (S.ledger && LEDGER.pack) {
+    const t0 = performance.now();
+    const got = collectCells(LEDGER.pack, { cls: S.ledgerCls, player: S.ledgerWho, minN: S.ledgerMin });
+    LEDGER.cells = got.cells; LEDGER.max = got.max;
+    LEDGER.noHeight = got.noHeight; LEDGER.dropped = got.dropped;
+    const g = buildHeatQuads(got.cells);
+    if (g.quads) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(g.col, 3));
+      // Four corners and six indices a chunk, the same layout as the detail meshes - and the index goes
+      // on the geometry, never as an attribute (9.8a: `geometry.attributes.index` is undefined in
+      // three.js, and an unindexed four-corners-a-quad buffer is drawn as a strip).
+      geo.setIndex(new THREE.BufferAttribute(g.idx, 1));
+      const mesh = new THREE.Mesh(geo, ledgerMat());
+      mesh.name = 'ledger-heat';
+      mesh.renderOrder = 900;
+      // One mesh spanning a whole dimension: its own bounding sphere is the world, so per-object
+      // frustum culling here could only be wrong.
+      mesh.frustumCulled = false;
+      ledgerGroup.add(mesh);
+      LEDGER.mesh = mesh;
+      LEDGER.quads = g.quads;
+    }
+    LEDGER.buildMs = performance.now() - t0;
+  }
+  // Markers are ranked from the same cells the picture is painted from, so a filter change re-cuts
+  // them with it and the two cannot disagree. Switching the heat layer off leaves them standing:
+  // "markers only" is a state the panel offers on purpose, and Escape is what dismisses them.
+  ledgerDrawPins();
+  if (panel) panel.refresh();
+}
+
+// Cages over the chunks the tour picked. Lines, not boxes: a marker has to survive 10 km of distance
+// without costing fill, and four corner lines still read as a column where one centre line does not.
+function ledgerDrawPins() {
+  if (LEDGER.pin) { ledgerGroup.remove(LEDGER.pin); LEDGER.pin.geometry.dispose(); LEDGER.pin = null; }
+  if (!LEDGER.top) return;
+  // 28 blocks, not 64: measured against the frame, a 64-block cage is a maypole that reads as taller
+  // than the trees around it and hides the chunk it is marking. 28 still clears a canopy.
+  const b = buildPins(LEDGER.top, { height: 28 });
+  if (!b.verts) return;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(b.pos, 3));
+  const seg = new THREE.LineSegments(geo, pinMat());
+  seg.name = 'ledger-pins';
+  seg.renderOrder = 901;
+  seg.frustumCulled = false;
+  ledgerGroup.add(seg);
+  LEDGER.pin = seg;
+}
+
+/**
+ * "Can I find it": rank the chunks the log touched and start a tour.
+ *
+ * Ranked from the cells already painted rather than from GET /ledger/top, so the tour cannot disagree
+ * with the picture on screen - and the endpoint stays what it is: the same query for a page (or a
+ * probe) that does not hold the table.
+ */
+function ledgerFind() {
+  if (!LEDGER.pack) return null;
+  if (!LEDGER.cells.length) {
+    const got = collectCells(LEDGER.pack, { cls: S.ledgerCls, player: S.ledgerWho, minN: S.ledgerMin });
+    LEDGER.cells = got.cells; LEDGER.max = got.max;
+  }
+  LEDGER.top = rankCells(LEDGER.cells, 12);
+  LEDGER.topIdx = 0;
+  ledgerDrawPins();
+  if (!LEDGER.top.length) { showLedger('nothing in this dimension matches those filters'); return null; }
+  showHotspotCard(LEDGER.top, LEDGER.cells.length);
+  ledgerJump();
+  return { total: LEDGER.cells.length, cells: LEDGER.top };
+}
+
+/**
+ * The panel buttons. The index is a request, and a button that reads `LEDGER.pack` before it has
+ * arrived answers nothing at all - which is exactly how the first version of these two buttons failed.
+ */
+async function ledgerTour(withHeat) {
+  if (withHeat) S.ledger = 1;
+  if (!LEDGER.pack) await ledgerLoad();
+  if (!LEDGER.pack) { showLedger(`no ledger index for this dimension: ${LEDGER.err || LEDGER.meta?.why || 'unknown'}`); return null; }
+  return ledgerFind();
+}
+
+/** How many players are in a cell's bit mask - the card says "all six", not "mask 63". */
+const maskCount = (m) => { let n = 0; for (let v = m | 0; v; v &= v - 1) n++; return n; };
+
+/** One tour stop: fly to the loudest chunk left, and say what it is. */
+function ledgerJump() {
+  const c = LEDGER.top?.[LEDGER.topIdx];
+  if (!c) return null;
+  LEDGER.topIdx = (LEDGER.topIdx + 1) % LEDGER.top.length;
+  const x = c.cx * 16 + 8, z = c.cz * 16 + 8;
+  gotoLedger(x, (c.y ?? 64) + 3, z, 110);
+  showLedger(`hotspot ${LEDGER.topIdx}/${LEDGER.top.length}: chunk ${c.cx},${c.cz} - ${c.n.toLocaleString()} actions`);
+  return c;
+}
+
+/**
+ * Move the view - or the body, when walking - to a place the ledger named. In walk mode the body owns
+ * position, so the answer is to drop the body there and let the voxels put its feet on ground, exactly
+ * as `?goto=` does.
+ */
+function gotoLedger(x, y, z, dist = 48) {
+  if (walk.on) {
+    player.x = x; player.z = z; player.y = y; player.vy = 0;
+    walk.placed = 0; walk.embedded = 0;
+    dropToClear(cellAt, player);
+    syncEye();
+    standPlayer(8);
+  } else {
+    rig.target.set(x, y, z);
+    rig.dist = Math.max(8, Math.min(S.maxZoom, dist));
+  }
+  lastCx = null; lastCz = null; lastDb = -1;
+  updateCamera(); updateView(); requestAround();
+}
+
+/**
+ * "Who placed this." The chunk is the unit the index is built around, so a block question is answered
+ * by fetching that chunk's rows (oldest first, capped) and picking the block out of them here - which
+ * is one binary search and a couple of kilobytes, not a scan of 424,599 rows.
+ */
+function ledgerAsk(x, y, z) {
+  if (!LEDGER.meta?.available) { showLedger(`no ledger: ${LEDGER.meta?.why ?? 'not asked for'}`); return null; }
+  const cx = Math.floor(x) >> 4, cz = Math.floor(z) >> 4;
+  const url = `/ledger/rows?dim=${encodeURIComponent(currentDim())}&cx=${cx}&cz=${cz}`
+    + `&cls=${S.ledgerCls}&player=${S.ledgerWho}&limit=${S.ledgerRows}`;
+  LEDGER.asks++;
+  return fetch(url).then((r) => {
+    if (!r.ok) { showLedger(`/ledger/rows: HTTP ${r.status}`); return null; }
+    return r.json();
+  }).then((out) => {
+    if (!out) return null;
+    const bx = Math.floor(x), by = Math.floor(y), bz = Math.floor(z);
+    const here = nearRows(out.rows ?? [], bx, by, bz, S.ledgerNear);
+    showLedgerCard({ block: [bx, by, bz], rows: here, out });
+    return { here: here.length, shown: (out.rows ?? []).length, total: out.total };
+  }).catch((e) => { showLedger(`/ledger/rows: ${e.message}`); return null; });
+}
+
+/** T: ask about the middle of the screen - the crosshair when walking, the orbit target otherwise. */
+function ledgerAskCentre() {
+  const p = pickState(innerWidth / 2, innerHeight / 2);
+  if (!p || !p.block) { showLedger('nothing is drawn at the middle of the view to ask about'); return null; }
+  return ledgerAsk(p.block[0], p.block[1], p.block[2]);
+}
+
+function setLedger(on) {
+  S.ledger = on ? 1 : 0;
+  if (S.ledger && !LEDGER.pack) ledgerLoad();
+  else ledgerRebuild();
+  if (panel) panel.refresh();
+  return !!S.ledger;
+}
+
+// ---- the card -----------------------------------------------------------------------------------
+// The answer first ("playerA placed this, 2.1 years ago"), the evidence under it. Every evidence line
+// is a button, because the next thing a person does after reading who placed a chest is want to stand
+// in front of it.
+function ledgerCardEl() {
+  if (LEDGER.card) return LEDGER.card;
+  const el = document.createElement('div');
+  el.className = 'lcard';
+  document.body.append(el);
+  LEDGER.card = el;
+  return el;
+}
+
+/** Escape: stop drawing what the ledger put there. The ranking stays, so F resumes the same tour. */
+function clearLedgerPins() {
+  if (!LEDGER.pin) return false;
+  ledgerGroup.remove(LEDGER.pin); LEDGER.pin.geometry.dispose(); LEDGER.pin = null;
+  return true;
+}
+
+function closeLedgerCard() {
+  if (!LEDGER.card) return;
+  LEDGER.card.remove();
+  LEDGER.card = null;
+  LEDGER.cardRows = 0; LEDGER.cardTotal = 0;
+}
+
+function showLedger(text) {
+  hud.msg.textContent = text;
+  hud.msg.classList.remove('err');
+}
+
+function showLedgerCard({ block, rows, out }) {
+  const el = ledgerCardEl();
+  el.textContent = '';
+  LEDGER.cardRows = rows.length; LEDGER.cardTotal = out.total ?? 0;
+  const head = document.createElement('div');
+  head.className = 'lcard-head';
+  const at = block.join(', ');
+  head.append(document.createTextNode(
+    rows.length
+      ? `${rows.length} of ${out.total} ledger rows in chunk ${block[0] >> 4},${block[2] >> 4} touched ${at}`
+      : `no ledger row touches ${at}${out.total ? ` - this chunk holds ${out.total}, none within ${S.ledgerNear} blocks` : ''}`));
+  const x = document.createElement('button');
+  x.className = 'lcard-x'; x.textContent = '\u00d7'; x.title = 'close (Esc)';
+  x.addEventListener('click', closeLedgerCard);
+  head.append(x);
+  el.append(head);
+  if (!rows.length) return;
+  const s = summarizeRows(rows);
+  const sub = document.createElement('div');
+  sub.className = 'lcard-sub';
+  sub.textContent = `who: ${Object.entries(s.byPlayer).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', ')}`
+    + `  |  kinds: ${Object.entries(s.byKind).map(([k, v]) => `${k} ${v}`).join(', ')}`
+    + `  |  ${fmtLedger(s.t0)} .. ${fmtLedger(s.t1)} (${timeAgo(s.t1)})`;
+  el.append(sub);
+  for (const rw of rows.slice(0, 14)) {
+    const b = document.createElement('button');
+    b.className = 'lcard-row';
+    // Distance from the block that was asked about, not its absolute coordinates: every row here is
+    // within a couple of blocks, and printing the same numbers 14 times is what overflows the card.
+    b.textContent = rowLine(rw, Date.now(), block);
+    b.title = 'go to that block';
+    b.addEventListener('click', () => gotoLedger(rw.x + 0.5, rw.y + 1, rw.z + 0.5, 20));
+    el.append(b);
+  }
+  if (rows.length > 14) {
+    const m = document.createElement('div');
+    m.className = 'lcard-sub';
+    m.textContent = `\u2026 ${rows.length - 14} more within ${S.ledgerNear} blocks (oldest first,`
+      + ` ${out.total} rows in the chunk, ${S.ledgerRows} fetched)`;
+    el.append(m);
+  } else if (out.total > rows.length) {
+    const m = document.createElement('div');
+    m.className = 'lcard-sub';
+    m.textContent = `${out.total - rows.length} other rows in this chunk are further away or filtered out`
+      + ` (filters: ${S.ledgerCls ? `kind ${S.ledgerCls}` : 'any kind'}, ${S.ledgerWho ? `player ${S.ledgerWho}` : 'anybody'})`;
+    el.append(m);
+  }
+}
+
+/** The tour as a list you can click: the chunks this dimension's ledger touched hardest. */
+function showHotspotCard(top, total) {
+  const el = ledgerCardEl();
+  el.textContent = '';
+  LEDGER.cardRows = top.length; LEDGER.cardTotal = total;
+  const head = document.createElement('div');
+  head.className = 'lcard-head';
+  head.append(document.createTextNode(`${top.length} loudest of ${total.toLocaleString()} chunks the ledger touched`));
+  const x = document.createElement('button');
+  x.className = 'lcard-x'; x.textContent = '\u00d7'; x.title = 'close (Esc)';
+  x.addEventListener('click', closeLedgerCard);
+  head.append(x);
+  el.append(head);
+  const sub = document.createElement('div');
+  sub.className = 'lcard-sub';
+  sub.textContent = `filtered to ${LEDGER_CLASSES.find((c) => c.id === S.ledgerCls)?.name ?? 'every kind'}`
+    + ` and ${(LEDGER.meta?.players ?? []).find((p) => p.id === S.ledgerWho)?.name ?? 'anybody'},`
+    + ` ${S.ledgerMin}+ rows per chunk - F jumps to the next one`;
+  el.append(sub);
+  top.forEach((c, i) => {
+    const b = document.createElement('button');
+    b.className = 'lcard-row';
+    b.textContent = `${String(i + 1).padStart(2)}  chunk ${String(c.cx).padStart(5)},${String(c.cz).padStart(5)}`
+      + `  ${c.n.toLocaleString().padStart(6)} actions  ${fmtLedger(c.t0).slice(0, 10)}.. ${fmtLedger(c.t1).slice(0, 10)}`
+      + `  ${maskCount(c.mask)} player(s)`;
+    b.title = 'stand in front of that chunk';
+    b.addEventListener('click', () => { LEDGER.topIdx = i; ledgerJump(); });
+    el.append(b);
+  });
+}
+
+// What the panel says about the ledger, in one line: whether there is one, how big it is, what this
+// dimension contributes, and what the last fetch cost. The numbers are the ones the endpoint measured.
+function ledgerNote() {
+  if (!LEDGER.meta) return 'ledger: not asked for yet';
+  if (!LEDGER.meta.available) return `ledger: ${LEDGER.meta.why}`;
+  const d = ledgerDimInfo(currentDim());
+  if (!d) return `ledger: rows for ${LEDGER.meta.dims.length} other dimensions, none for this one`;
+  if (!LEDGER.pack) return `ledger: ${d.rows.toLocaleString()} rows over ${d.cells.toLocaleString()} chunks`
+    + ` of this dimension, index not fetched`;
+  return `${d.rows.toLocaleString()} rows over ${d.cells.toLocaleString()} touched chunks`
+    + ` (${d.first.slice(0, 10)} .. ${d.last.slice(0, 10)})`
+    + `  |  ${(LEDGER.bytes / 1024) | 0} KB in ${LEDGER.fetchMs.toFixed(0)} ms,`
+    + ` ${LEDGER.cells.length.toLocaleString()} shown re-cut in ${LEDGER.buildMs.toFixed(1)} ms`
+    + (LEDGER.dropped ? `, ${LEDGER.dropped} under the floor` : '')
+    + (LEDGER.noHeight ? `, ${LEDGER.noHeight} with no baked ground` : '')
+    + (LEDGER.err ? `  |  ${LEDGER.err}` : '');
+}
+
+const ledgerWhoOptions = () => [
+  { value: '0', label: 'anybody (and fire, water, monsters)' },
+  ...(LEDGER.meta?.players ?? []).map((p) => ({ value: String(p.id), label: p.name })),
+];
+
+const ledgerClassOptions = () => [
+  { value: '0', label: 'any kind of action' },
+  ...LEDGER_CLASSES.map((c) => ({ value: String(c.id), label: c.name })),
+];
 
 // Which block is under a screen pixel? Raycast what is actually drawn, then floor the hit point
 // into block space. The hit lands exactly on a face plane, so nudge it a hair along the ray
@@ -3765,6 +4286,17 @@ window.__world = {
   lodAt: (wx, wz) => lodAt(wx, wz),
   pickState,
   pickStack,
+  ledgerTour,
+  ledger: () => ({
+    meta: LEDGER.meta ? 'yes' : 'no', err: LEDGER.err, cells: LEDGER.cells.length, max: LEDGER.max, quads: LEDGER.quads,
+    dropped: LEDGER.dropped, noHeight: LEDGER.noHeight, kb: (LEDGER.bytes / 1024) | 0,
+    fetchMs: +LEDGER.fetchMs.toFixed(1), buildMs: +LEDGER.buildMs.toFixed(1),
+    asks: LEDGER.asks, cardRows: LEDGER.cardRows, cardTotal: LEDGER.cardTotal,
+    top: LEDGER.top?.map((c) => [c.cx, c.cz, c.n]) ?? null, topIdx: LEDGER.topIdx,
+    drawn: !!LEDGER.mesh, pins: !!LEDGER.pin, cls: S.ledgerCls, who: S.ledgerWho, minN: S.ledgerMin,
+  }),
+  ledgerLoad, ledgerFind, ledgerJump, ledgerAsk, ledgerAskCentre, setLedger, clearLedgerPins,
+  ledgerNote, rankCells, collectCells, summarizeRows, readPack,
   // Ray for a screen point, so a probe can walk the world along the line of sight instead of only
   // asking what the rasteriser happened to draw there.
   ray: (x, y) => {
@@ -3781,19 +4313,27 @@ window.__world = {
   // Bucket means in ms/frame over the last HUD tick (0.5 s). The honest answer to "what is slow".
   prof: () => profWindow(),
   res: () => ({ scale: resWanted(), cap: DPR_CAP, auto: resAuto, setting: S.res, autoOn: !!S.resAuto,
-    changes: resChanges,
+    changes: resChanges, pending: resDue, reallocAt: 'top of frameBody',
+    ladder: RES_LADDER, rung: resRung, flips: resFlips, locked: resLocked,
     gpuTimer: !!timerExt, timerDead, gpuMs, cpuRenderMs, samples: gpuSamples }),
   // Drive the resolution governor from a probe: claim a GPU time and run one step of the control
   // loop. Without this the shrink path only shows up on a card that is actually slow, and a probe
-  // cannot tell "the governor is off" from "the governor decided correctly".
-  tuneResNow: (ms, force = true) => {
+  // cannot tell "the governor is off" from "the governor decided correctly". `now` lets a probe walk a
+  // synthetic timeline, which is the only way to see the hold and the flap lock at all.
+  tuneResNow: (ms, force = true, now = null) => {
     if (typeof ms === 'number' && ms > 0) { gpuMs = ms; gpuSamples = Math.max(1, gpuSamples); }
-    resTuneAt = 0;
-    tuneRes(performance.now(), !!force);
-    return { auto: +resAuto.toFixed(3), gpuMs: +gpuMs.toFixed(2), want: 1000 / S.targetFps,
+    const t = typeof now === 'number' ? now : performance.now();
+    resTuneAt = t - RES_GAP_MS;
+    tuneRes(t, !!force);
+    // A probe asks a question and wants the answer in the same call, so this path takes the new buffer
+    // immediately. The production path - every caller of applyRes - waits for the frame boundary.
+    takeRes();
+    return { auto: +resAuto.toFixed(3), rung: resRung, flips: resFlips, locked: resLocked,
+      gpuMs: +gpuMs.toFixed(2), want: 1000 / S.targetFps,
       px: [renderer.getContext().drawingBufferWidth, renderer.getContext().drawingBufferHeight] };
   },
-  setRes: (v) => { S.res = Math.max(0.4, Math.min(2, +v)); resAuto = 1; applyRes(); },
+  resetRes: () => { resetResGovernor(); applyRes(); return { rung: resRung, auto: resAuto }; },
+  setRes: (v) => { S.res = Math.max(0.4, Math.min(2, +v)); resetResGovernor(); applyRes(); },
   markCounts: () => ({ ...markWhy }),
   profAll: () => {
     const n = Math.max(1, prof.frames);
@@ -4151,6 +4691,12 @@ function switchDim(id) {
   if (lodStore) lodStore.clear();
   if (S.lod && S.shellOn) { makeLodStore(id); lodIndexLoad(lodStore); } else lodStore = null;
   if (S.overview) loadOverview(id); else clearOverview();
+  // M12: the ledger index is per dimension, and so is the question being asked of it.
+  LEDGER.gen++;
+  LEDGER.pack = null; LEDGER.cells = []; LEDGER.max = 0; LEDGER.top = null;
+  clearLedgerMesh();
+  closeLedgerCard();
+  if (S.ledger) ledgerLoad(); else panel?.refresh();
   resetWorkers();
 
   // Keep the camera where it is if that world has ground under it; otherwise go to the middle of
@@ -4319,6 +4865,30 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         fmt: (v) => `${(+v).toFixed(4)} rad/px`,
         hint: 'Click-to-lock mouse-look only; a drag has always been 0.006 rad/px and still is.\nURL: ?look=',
         get: () => S.walkSens, set: (v) => { S.walkSens = Math.max(0.0004, +v); } },
+      { kind: 'section', key: 'sec_ledger', label: 'who placed this', open: false,
+        hint: 'The world keeps a ledger of block actions - 424,599 of them here, 351,531 in this\n'
+          + 'dimension across 20,322 chunks. It answers who touched a block, and where the map has\nhistory worth visiting.' },
+      { key: 'ledger', label: 'activity overlay', kind: 'check',
+        fmt: () => (S.ledger ? `on, ${LEDGER.quads.toLocaleString()} decals` : 'off'),
+        get: () => !!S.ledger, set: (v) => setLedger(v),
+        hint: 'paint every chunk the ledger has rows for, coloured by how much happened there:\nteal a handful, amber hundreds, red thousands. The loudest chunk here holds 4,254 rows and\nthe median touched chunk holds 3, so the colour scale is logarithmic. One 674 KB request per\ndimension, then a re-cut per filter change - never per frame. L.' },
+      { key: 'ledgerCls', label: 'kind of action', kind: 'select', options: ledgerClassOptions(),
+        get: () => S.ledgerCls, set: (v) => { S.ledgerCls = +v || 0; ledgerRebuild(); },
+        hint: 'which kind of row to count. block-place and block-break are what a player building\nlooks like; any kind also counts fire spreading, water flowing, decay, trampling and kills,\nwhich is where the map turns red for no human reason.' },
+      { key: 'ledgerWho', label: 'whose actions', kind: 'select', options: ledgerWhoOptions(),
+        get: () => S.ledgerWho, set: (v) => { S.ledgerWho = +v || 0; ledgerRebuild(); },
+        hint: 'attribute the overlay to one named player. anybody leaves in the 301,367 rows the log\ndoes not attribute to a player: fluid, fire, growth, mobs.' },
+      { key: 'ledgerMin', label: 'quietest chunk', min: 0, max: 400, step: 1,
+        stops: [1, 2, 4, 8, 16, 32, 64, 128, 256, 400], fmt: (v) => `${v} row${v === 1 ? '' : 's'}+`,
+        get: () => S.ledgerMin, set: (v) => { S.ledgerMin = Math.max(0, +v || 0); ledgerRebuild(); },
+        hint: 'throw away the quiet chunks. most touched chunks hold two or three rows of something\nfalling over, and they are the bulk of the 20,322 decals; the floor is how you find the few that\nmatter, and it costs fill rather than requests. Panel stops, URL exact (?ledgermin=).' },
+      { key: 'ledgerXray', label: 'see through terrain', kind: 'check',
+        fmt: () => (S.ledgerXray ? 'decals paint over the world' : 'hills hide them'),
+        get: () => !!S.ledgerXray,
+        set: (v) => { S.ledgerXray = v ? 1 : 0; if (ledgerHeatMat) ledgerHeatMat.depthTest = !S.ledgerXray; },
+        hint: 'an overlay that sits on the ground is honest and unreadable at whole-world scale: the hill\nin front of the valley hides the valley. Painting through the terrain turns it into a map of the\nlog; turn it off to ask whether the activity is visible from where you are. URL: ?noledgerxray' },
+      { kind: 'note', text: () => ledgerNote() },
+      { kind: 'note', text: 'click a block for its history - L the overlay - T middle of view - F tour - Esc clears the card and the markers' },
       { kind: 'section', key: 'sec_far', label: 'the far world', open: false,
         hint: 'The ground outside the close ring: how it is drawn, how coarse it is allowed to get, and\n'
           + 'what that costs in triangles.' },
@@ -4431,7 +5001,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         hint: 'How many pixels are drawn, as a fraction of the screen. Below 1 the image is rendered smaller\nand stretched, which is the cheapest way to gain frame rate; above 1 it is drawn bigger than\nthe screen and shrunk back, which costs a third of the frame rate at 4x pixels and takes the\nstaircase off quad edges. It also grows the sharp ring, because that ring is measured in pixels.\nAuto mode only lowers it when the GPU itself is the limit and the view is loaded. Edge staircases\nare also smoothed by MSAA, on every screen, unless ?noaa. URL: ?res=1.5 ?noaa',
         get: () => S.res,
         fmt: (v) => (v === 1 ? 'native' : v < 1 ? `${v}x softer` : `${v}x bigger`),
-        set: (v) => { S.res = Math.max(0.4, Math.min(2, v)); resAuto = 1; applyRes(); } },
+        set: (v) => { S.res = Math.max(0.4, Math.min(2, v)); resetResGovernor(); applyRes(); } },
       { key: 'resAuto', label: 'auto resolution', min: 0, max: 1, step: 1, live: true,
         labels: ['manual', 'auto'],
         hint: 'Shrink the drawn resolution only when the graphics card is the limit, the view is fully\nloaded, and the frame is still slower than the target. Needs a browser that reports GPU time. URL: ?noautores',
@@ -4470,6 +5040,10 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         hint: 'draw the unlit underground, and stop hiding ground that is merely buried\nor in the dark' },
       { label: 'fast', run: () => preset('fast'),
         hint: 'fewer pixels, fewer threads, less drawn: for a machine that is struggling' },
+      { label: 'hotspots', run: () => ledgerTour(true),
+        hint: 'rank the chunks the ledger touched, most actions first, and fly to the loudest; press\nagain for the next. The loudest overworld chunk holds 4,254 rows. GET /ledger/top answers the\nsame ranking for a page that holds nothing.' },
+      { label: 'markers only', run: () => ledgerTour(false),
+        hint: 'the same ranking as cages over the ground, without the heat layer: 12 markers over the\nchunks where the log is loudest.' },
       { label: 'undo', run: undoPreset, hint: 'back to what the panel said before the last preset' },
       { label: 'fit world', run: () => fitWorld(), hint: 'zoom out to the whole loaded extent (f)' },
       { label: 'spawn', run: () => { rig.target.set(SPAWN[0], SPAWN[1], SPAWN[2]); rig.dist = 40; },
@@ -4599,6 +5173,10 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     rig.dist = Math.min(rig.dist, S.maxZoom);
     updateView();
     requestAround();
+    // M12: ask whether this world keeps a ledger before the panel is built, because the "whose
+    // actions" menu is made from the player list and a control that fills itself in later is a control
+    // that silently offers one choice. A missing ledger is a note, not an error: the viewer works.
+    await ledgerMetaLoad();
     buildPanel();
     // Walking is turned on after the panel exists (its rows report the mode) and after the spawn
     // point and the ?goto target are known, so ?view=walk&goto=x,y,z lands the eye on that place at
