@@ -39,7 +39,11 @@ import {
   buildHeatQuads, buildPins, collectCells, formatTime as fmtLedger, LEDGER_CLASSES, nearRows, rankCells,
   rowLine, summarizeRows, timeAgo,
 } from './ledger-view.mjs';
-import { readPack } from '../../shared/ledger-pack.mjs';
+import { decodeTimeline, readPack } from '../../shared/ledger-pack.mjs';
+// M12b: the time machine's data half - filters, decal geometry and the playhead index, all of it
+// testable without a browser (tests/web-timemachine.test.mjs). This page owns the mesh and the
+// scrubber; the numbers in the readouts come from the tested functions.
+import { actionName, buildTimeQuads, filterRows, playhead, quadAt } from './ledger-time.mjs';
 
 
 const $ = (id) => document.getElementById(id);
@@ -193,6 +197,18 @@ const S = {
   // clicked the lid of a chest rather than its body.
   ledgerRows: Math.max(10, Math.min(2000, num('ledgerrows', 200))),
   ledgerNear: Math.max(0, Math.min(4, num('ledgerblockr', 1))),
+  // M12b: the time machine. `timeAt` is a MOMENT - seconds since this dimension's first logged row -
+  // not a percentage, so a URL can point at a date and a probe can ask for one. The panel slider
+  // speaks in permille of the current filter and converts.
+  time: num('time', 0) ? 1 : 0,
+  timeAt: Math.max(0, num('timeat', 0)),
+  timePlay: num('timeplay', 0) ? 1 : 0,
+  timeSpeed: Math.max(1, Math.min(5e6, num('timespeed', 20000))),  // LOGGED CHANGES per wall-clock second
+  // Not days per second. This dimension logged changes on 9 of the 822 days its log spans, with 99 % of
+  // its rows inside the first week and 83,101 of them on one day. A calendar-driven playhead would sit
+  // motionless for a month and then blur; an event-driven one builds at a rate the eye can read.
+  timeCls: Math.max(0, Math.min(7, num('timecls', 2))),             // 0 = any change, 2 = block place
+  timeLimit: Math.max(0, num('timelimit', 0)),                      // 0 = draw every row of the filter
   // 9.6's two rules together, for A/B: skip a mesh whose payload and known border already answer it,
   // and hold a chunk while a neighbour is still in flight. 0 = mesh on every dirty mark (?meshkey=0).
   meshKey: num('meshkey', 1) ? 1 : 0,
@@ -337,7 +353,8 @@ function setReadouts(on) {
 // numbers are up. It fades on its own once you have clearly started driving, and H brings it back.
 // Two key lines, because the keys change: an orbit is dragged and zoomed, a walk is driven.
 const HELP_ORBIT = '<b>drag</b> orbit &nbsp; <b>right-drag</b> pan &nbsp; <b>wheel</b> zoom &nbsp; <b>WASD</b> move'
-  + ' &nbsp; <b>V</b> walk &nbsp; <b>P</b> settings &nbsp; <b>F</b> whole world &nbsp; <b>H</b> readouts';
+  + ' &nbsp; <b>V</b> walk &nbsp; <b>P</b> settings &nbsp; <b>F</b> whole world &nbsp; <b>M</b> time machine'
+  + ' &nbsp; <b>K</b> play &nbsp; <b>H</b> readouts';
 const HELP_WALK = '<b>WASD</b> walk &nbsp; <b>Space</b> jump &nbsp; <b>Ctrl</b> sprint &nbsp; <b>Shift</b> sneak'
   + ' &nbsp; <b>click</b> look with the mouse &nbsp; <b>wheel</b> view depth &nbsp; <b>V</b> orbit again';
 function setHelp(on) {
@@ -753,6 +770,13 @@ addEventListener('keydown', (e) => {
   // world while looking at it, not a setting you tune.
   if (e.code === 'KeyL') { setLedger(!S.ledger); return; }
   if (e.code === 'KeyT') ledgerAskCentre();
+  // M12b: M runs the time machine and K plays or stops it. K is separate from M because watching a
+  // build go up is a different question from asking whether the layer is on at all.
+  if (e.code === 'KeyM') { setTime(!S.time); return; }
+  if (e.code === 'KeyK') {
+    if (!S.time) { setTime(true); S.timePlay = 1; } else setTimePlay(!S.timePlay);
+    return;
+  }
   if (e.code === 'Escape') { closeLedgerCard(); if (clearLedgerPins()) showLedger('markers cleared - F tours the hotspots again'); }
   if (e.code === 'BracketLeft') nudgeY(-4);
   if (e.code === 'BracketRight') nudgeY(4);
@@ -3155,6 +3179,10 @@ function frameBody(now) {
   if (now - lastBytesSweep > 1000) { lastBytesSweep = now; sweepMeshBytes(); }
   lap('demote');
 
+  // M12b: playing moves the calendar, and the mesh follows with a draw range. This is the only
+  // per-frame work the time machine does - one binary search over the filtered seconds and one
+  // setDrawRange. Re-cutting the mesh is a filter change, never a frame.
+  if (S.timePlay) { timeStep(dt); if (S.timePlay && panel && !panel.busy()) panel.refresh(); } lap('time');
   verts = 0; tris = 0; drawn = 0; detailVerts = 0;
   recomputeAgg();
   for (const list of meshLists()) {
@@ -3891,6 +3919,282 @@ const ledgerWhoOptions = () => [
   ...(LEDGER.meta?.players ?? []).map((p) => ({ value: String(p.id), label: p.name })),
 ];
 
+// ---- M12b: the time machine -----------------------------------------------------------------------
+//
+// The heat layer answers "where did things happen". This answers "when". They stay separate layers with
+// separate requests because their costs are different shapes: 674 KB of cells for this dimension's 20,322
+// touched chunks, against 4.7 MB of rows for its 351,531 logged changes.
+//
+// The playhead is a DRAW RANGE, not a rebuild. The timeline arrives sorted by time and buildTimeQuads
+// emits one quad per row in that order, so moving through two years of history is
+// `setDrawRange(0, n * 6)` - measured at 0.3 ms for a thousand moves, against the ~100 ms a
+// whole-dimension re-cut costs when a FILTER changes (tests/web-timemachine.test.mjs). Nothing here
+// rebuilds geometry per frame, and that is what makes "30 fps through the whole history" a measurement
+// rather than a hope.
+const TLAYER = {
+  tl: null,              // decodeTimeline() of /ledger/timeline for this dimension
+  gen: 0,                // bumped on a dimension switch, so a late answer cannot install
+  mesh: null,
+  quadSec: null,         // the playhead index: one ascending second per drawn quad
+  quads: 0, verts: 0, drawn: 0, sec: 0,
+  cur: 0,                        // the playhead as a ROW INDEX into the current filter
+  activeDays: 0, busyDay: 0, busyN: 0,   // how much of the calendar the log actually covers
+  rows: 0, other: 0, truncated: false,
+  bytes: 0, fetchMs: 0, filterMs: 0, buildMs: 0,
+  err: '',
+};
+
+let timeDecalMat = null;
+function timeMat() {
+  if (!timeDecalMat) {
+    timeDecalMat = new THREE.MeshBasicMaterial({
+      // FrontSide, like the heat layer: these decals face up, and over a whole-dimension history the back
+      // faces are pure overdraw - the place set alone is 90,045 quads, the whole log 351,531.
+      // Less transparent than the heat layer: one decal is a fact about one block, and a viewer has to
+      // be able to pick one out of a whole canopy of them.
+      vertexColors: true, transparent: true, opacity: 0.92, side: THREE.FrontSide,
+      depthWrite: false, fog: false,
+    });
+  }
+  // Same X-ray switch as the heat layer. A marker standing on a block top is invisible from 3 km away
+  // behind a hill, and the time machine is almost always watched from a long way up.
+  timeDecalMat.depthTest = !S.ledgerXray;
+  return timeDecalMat;
+}
+
+function clearTimeMesh() {
+  if (TLAYER.mesh) {
+    ledgerGroup.remove(TLAYER.mesh);
+    TLAYER.mesh.geometry.dispose();
+    TLAYER.mesh = null;
+  }
+  TLAYER.quads = 0; TLAYER.verts = 0; TLAYER.drawn = 0; TLAYER.quadSec = null;
+}
+
+/**
+ * This dimension's history, in time order: one request, and only when the layer is asked for. The whole
+ * overworld table is 4.7 MB, so a map view that never scrubs must not pay for it.
+ */
+async function timeLoad() {
+  const gen = ++TLAYER.gen;
+  TLAYER.tl = null; TLAYER.err = '';
+  clearTimeMesh();
+  if (!LEDGER.meta) await ledgerMetaLoad();
+  if (gen !== TLAYER.gen) return null;                     // the dimension changed under this request
+  if (!LEDGER.meta?.available) { TLAYER.err = LEDGER.meta?.why ?? 'no ledger'; return null; }
+  const dim = currentDim();
+  if (!ledgerDimInfo(dim)) { TLAYER.err = 'this dimension has no ledger rows'; return null; }
+  const t0 = performance.now();
+  let buf;
+  try {
+    const res = await fetch(`/ledger/timeline?dim=${encodeURIComponent(dim)}`);
+    if (!res.ok) { TLAYER.err = `/ledger/timeline: HTTP ${res.status}`; return null; }
+    buf = await res.arrayBuffer();
+  } catch (e) { TLAYER.err = `/ledger/timeline: ${e.message}`; return null; }
+  if (gen !== TLAYER.gen) return null;
+  try {
+    TLAYER.tl = decodeTimeline(new Uint8Array(buf));       // a byte view, not a fetched ArrayBuffer
+  } catch (e) {
+    // A v2 pack has no timeline section at all. That reads as a decode error, and the fix is a re-bake.
+    TLAYER.err = `timeline: ${e.message} - re-run node server/bake-ledger.mjs`;
+    return null;
+  }
+  TLAYER.bytes = buf.byteLength;
+  TLAYER.fetchMs = performance.now() - t0;
+  // How much of the CALENDAR this log has anything to say about. `sec` is ascending (the decoder checks
+  // it), so this is one pass over runs rather than 351 531 Map inserts. Without the number on screen, a
+  // scrub that races through empty months looks like a bug in the scrubber instead of a fact about the server.
+  let days = 0, busy = -1, busyN = 0, day = -1, run = 0;
+  for (let i = 0; i < TLAYER.tl.count; i++) {
+    const d = (TLAYER.tl.sec[i] / 86400) | 0;
+    if (d !== day) { if (run > busyN) { busyN = run; busy = day; } day = d; days++; run = 1; } else run++;
+  }
+  if (run > busyN) { busyN = run; busy = day; }
+  TLAYER.activeDays = days;
+  TLAYER.busyDay = Math.max(0, busy);
+  TLAYER.busyN = busyN;
+  // A timeline row carries a chunk INDEX, not a chunk coordinate: the cell table is what turns it into a
+  // place in the world. So the time machine needs the other layer's table even when the heat overlay
+  // itself is off. That is the one dependency between the two layers, and it is a request, not a merge.
+  if (!LEDGER.pack) await ledgerLoad();
+  if (gen !== TLAYER.gen) return null;
+  if (!LEDGER.pack) { TLAYER.err = 'the timeline needs the cell table, and that failed to load'; return null; }
+  timeRebuild();
+  return TLAYER.tl;
+}
+
+/** Re-cut the decal mesh from rows already in memory. A filter change, never a per-frame cost. */
+function timeRebuild() {
+  clearTimeMesh();
+  if (!S.time || !TLAYER.tl || !LEDGER.pack) { if (panel) panel.refresh(); return; }
+  const t0 = performance.now();
+  const got = filterRows(TLAYER.tl, { who: S.ledgerWho, cls: S.timeCls, limit: S.timeLimit });
+  TLAYER.filterMs = performance.now() - t0;
+  TLAYER.rows = got.n; TLAYER.other = got.other; TLAYER.truncated = got.truncated;
+  if (!got.n) {
+    TLAYER.err = got.other
+      ? `no rows of that kind by that player - ${got.other.toLocaleString()} rows were filtered out`
+      : 'this dimension has no rows at all';
+    if (panel) panel.refresh();
+    return;
+  }
+  TLAYER.err = '';
+  const t1 = performance.now();
+  const g = buildTimeQuads(TLAYER.tl, LEDGER.pack, got.order);
+  TLAYER.buildMs = performance.now() - t1;
+  TLAYER.quadSec = g.quadSec;
+  TLAYER.quads = g.quads; TLAYER.verts = g.verts;
+  if (g.skipped) TLAYER.err = `${g.skipped.toLocaleString()} rows had no baked ground under them`;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(g.col, 3));
+  // The index goes on the geometry, never as an attribute (gotcha 132-134), and it is 32-bit here: a
+  // whole dimension of rows is 1.4M corners, over the 65 535 a Uint16 would reach.
+  geo.setIndex(new THREE.BufferAttribute(g.idx, 1));
+  // One mesh spanning a whole dimension. Let three compute a sphere from 1.4M positions and it spends the
+  // frame on it, so hand it a sphere that covers the map and turn culling off anyway.
+  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 1e9);
+  const mesh = new THREE.Mesh(geo, timeMat());
+  mesh.name = 'ledger-time';
+  mesh.renderOrder = 902;                                   // over the heat layer (900) and pins (901)
+  mesh.frustumCulled = false;
+  ledgerGroup.add(mesh);
+  TLAYER.mesh = mesh;
+  // No mesh-park for this layer: it is one mesh, not 350, and its draw range IS the animation. A re-cut
+  // happens on a filter change, which is a user action, not on streaming.
+  timeApply();
+  // The cursor follows the MOMENT, not the row number: switching from every change to one player mid-play
+  // should keep showing the same point in the log and keep running forward from there.
+  TLAYER.cur = Math.max(0, quadAt(TLAYER.quadSec, TLAYER.sec) - 1);
+  if (panel) panel.refresh();
+}
+
+/**
+ * Move the playhead: one binary search and one draw range. `drawn` is what the readout and every probe
+ * assert, because "the layer exists" is not evidence that the playhead moved anything.
+ */
+function timeApply() {
+  if (!TLAYER.mesh || !TLAYER.quadSec) return 0;
+  const ph = playhead(TLAYER.tl, S.timeAt);
+  const n = quadAt(TLAYER.quadSec, ph.sec);
+  TLAYER.mesh.geometry.setDrawRange(0, n * 6);
+  TLAYER.drawn = n;
+  TLAYER.sec = ph.sec;
+  return n;
+}
+
+/**
+ * Playing. The cursor is a ROW INDEX and it advances by `S.timeSpeed` logged changes per wall-clock second,
+ * so a slow machine shows less history per frame rather than wrong history, and the number the viewer sets
+ * is a rate of EVENTS - the only unit that means anything for a log that put 99 % of its rows in one week.
+ */
+function timeStep(dt) {
+  if (!S.timePlay || !TLAYER.quadSec || !TLAYER.quads) return;
+  const last = TLAYER.quads - 1;
+  TLAYER.cur = Math.min(last, TLAYER.cur + dt * S.timeSpeed);
+  S.timeAt = TLAYER.quadSec[Math.floor(TLAYER.cur)];
+  timeApply();
+  if (TLAYER.cur >= last) {
+    S.timePlay = 0;
+    showLedger('the log ends at ' + fmtLedger(playhead(TLAYER.tl, S.timeAt).ms)
+      + ` - ${TLAYER.quads.toLocaleString()} ${timeClsName()} changes, on ${TLAYER.activeDays} of the`
+      + ` ${(TLAYER.tl.spanSec / 86400).toFixed(0)} days this log spans`);
+  }
+}
+
+/** The slider speaks in permille of the CURRENT filter's rows, so its thumb is as smooth as the history is dense. */
+// Permille of the CURRENT FILTER's rows, read from the cursor rather than the drawn count. Many logged
+// changes share one second, so the drawn count climbs in steps while the cursor moves smoothly.
+const timePermille = () => (TLAYER.quads > 1
+  ? Math.round((Math.min(TLAYER.quads - 1, TLAYER.cur) / (TLAYER.quads - 1)) * 1000) : 0);
+const timeRowAt = (p) => (TLAYER.quads
+  ? Math.max(0, Math.min(TLAYER.quads - 1, Math.round((p / 1000) * (TLAYER.quads - 1)))) : 0);
+
+/** Put the cursor on a row of the current filter and draw it. This is what the slider does. */
+function timeSeekRow(i) {
+  if (!TLAYER.quadSec || !TLAYER.quads) return 0;
+  TLAYER.cur = Math.max(0, Math.min(TLAYER.quads - 1, +i || 0));
+  S.timeAt = TLAYER.quadSec[Math.floor(TLAYER.cur)];
+  timeApply();
+  return TLAYER.drawn;
+}
+
+/** Jump to a moment: `sec` is seconds since the first logged row in this dimension. */
+function timeGoto(sec) {
+  S.timeAt = Math.max(0, Math.round(+sec || 0));
+  TLAYER.cur = Math.max(0, quadAt(TLAYER.quadSec ?? new Uint32Array(0), S.timeAt) - 1);
+  timeApply();
+  if (panel) panel.refresh();
+  return TLAYER.drawn;
+}
+
+function setTimePlay(on) {
+  if (!TLAYER.tl) { showLedger('the timeline is still loading, or this dimension has none'); return false; }
+  S.timePlay = on ? 1 : 0;
+  // Playing again after the end restarts at the first logged change, not at the first calendar second:
+  // the log's oldest instant may precede anything being built by weeks.
+  if (S.timePlay && TLAYER.cur >= Math.max(0, TLAYER.quads - 1)) timeSeekRow(0);
+  if (panel) panel.refresh();
+  return !!S.timePlay;
+}
+
+function setTime(on) {
+  S.time = on ? 1 : 0;
+  TLAYER.err = '';
+  if (!S.time) { S.timePlay = 0; clearTimeMesh(); if (panel) panel.refresh(); return false; }
+  if (!LEDGER.meta?.available) {
+    TLAYER.err = LEDGER.meta?.why ?? 'no ledger in this world';
+    if (panel) panel.refresh();
+    return false;
+  }
+  if (!TLAYER.tl) timeLoad(); else timeRebuild();
+  if (panel) panel.refresh();
+  return true;
+}
+
+// The same six classes as the heat layer, plus "any other action the log records": a timeline row stores
+// the six as indices 0..5 and reserves 6 for an action id outside them, which needs its own filter value
+// rather than falling through to "everything" (see filterRows).
+const timeClassOptions = () => [
+  { value: '0', label: 'any change at all' },
+  ...LEDGER_CLASSES.map((c) => ({ value: String(c.id), label: c.name })),
+  { value: String(LEDGER_CLASSES.length + 1), label: 'any other logged action' },
+];
+const timeClsName = () => (S.timeCls > LEDGER_CLASSES.length ? 'other action' : actionName(S.timeCls));
+
+
+/** The one sentence that answers "am I watching a bug, or an empty decade?". */
+function timeNote() {
+  if (!S.time) {
+    return 'M replays this dimension\'s ledger oldest first: 351,531 rows here, 820 days of it. One 4.7 MB\n'
+      + 'request and one mesh; the scrubber costs a draw range, so a filter change is the only rebuild.';
+  }
+  if (TLAYER.err) return `time machine: ${TLAYER.err}`;
+  if (!TLAYER.tl) return 'time machine: loading the timeline...';
+  const ph = playhead(TLAYER.tl, S.timeAt);
+  const who = S.ledgerWho
+    ? (LEDGER.meta?.players?.find((p) => p.id === S.ledgerWho)?.name ?? `player ${S.ledgerWho}`) : 'anybody';
+  const span = TLAYER.tl.spanSec;
+  const playSecs = TLAYER.quads / Math.max(1, S.timeSpeed);
+  return `${fmtLedger(ph.ms)} - ${(TLAYER.drawn ?? 0).toLocaleString()} of ${TLAYER.quads.toLocaleString()}`
+    + ` ${timeClsName()} rows by ${who}, of ${TLAYER.tl.count.toLocaleString()} in the log`
+    + ` (${(TLAYER.filterMs).toFixed(0)}/${(TLAYER.buildMs).toFixed(0)} ms to re-cut, ${(TLAYER.bytes / 1048576).toFixed(1)} MB in ${(TLAYER.fetchMs / 1000).toFixed(2)} s)`
+    + `\nthe log spans ${fmtLedger(ph.firstMs)} to ${fmtLedger(ph.lastMs)}, but only ${TLAYER.activeDays}`
+    + ` of those ${(span / 86400).toFixed(0)} days hold any change at all, and day ${TLAYER.busyDay + 1}`
+    + ` alone holds ${TLAYER.busyN.toLocaleString()} of them: at ${S.timeSpeed.toLocaleString()} changes/s`
+    + ` this filter plays in ${playSecs.toFixed(1)} s${TLAYER.truncated ? ', and this view is capped short of the end' : ''}`;
+}
+
+/** Short wall clock for the slider's value column, scaled to what the history actually spans. */
+function timeStamp(ms) {
+  const d = new Date(ms);
+  const p = (v, n = 2) => String(v).padStart(n, '0');
+  // Month-day and clock, not the year: the log spans 27 months and the interesting motion is inside a
+  // day. The full span is spelled out in the sentence under the controls.
+  return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`
+    + ` ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
 const ledgerClassOptions = () => [
   { value: '0', label: 'any kind of action' },
   ...LEDGER_CLASSES.map((c) => ({ value: String(c.id), label: c.name })),
@@ -4295,6 +4599,24 @@ window.__world = {
     top: LEDGER.top?.map((c) => [c.cx, c.cz, c.n]) ?? null, topIdx: LEDGER.topIdx,
     drawn: !!LEDGER.mesh, pins: !!LEDGER.pin, cls: S.ledgerCls, who: S.ledgerWho, minN: S.ledgerMin,
   }),
+  // M12b: the time machine's readout. `drawn` is the number that proves the playhead moved -
+  // "the layer exists" is not evidence. `quads` is the size of the current filter, and the three ms
+  // figures are the fetch, the filter and the mesh build, which are three different questions.
+  time: () => ({
+    on: !!S.time, playing: !!S.timePlay, tl: !!TLAYER.tl, err: TLAYER.err,
+    rows: TLAYER.rows, other: TLAYER.other, quads: TLAYER.quads, verts: TLAYER.verts,
+    cur: TLAYER.cur, activeDays: TLAYER.activeDays, busyDay: TLAYER.busyDay, busyN: TLAYER.busyN,
+    drawn: TLAYER.drawn, sec: TLAYER.sec, at: S.timeAt, speed: S.timeSpeed,
+    cls: S.timeCls, who: S.ledgerWho, limit: S.timeLimit, truncated: TLAYER.truncated,
+    span: TLAYER.tl?.spanSec ?? 0, base: TLAYER.tl?.baseSec ?? 0,
+    kb: (TLAYER.bytes / 1024) | 0, fetchMs: +TLAYER.fetchMs.toFixed(1),
+    filterMs: +TLAYER.filterMs.toFixed(1), buildMs: +TLAYER.buildMs.toFixed(1),
+    drawRange: TLAYER.mesh ? [TLAYER.mesh.geometry.drawRange.start, TLAYER.mesh.geometry.drawRange.count] : null,
+    depthTest: timeDecalMat ? timeDecalMat.depthTest : null, xray: !!S.ledgerXray,
+    bytes: TLAYER.mesh ? TLAYER.mesh.geometry.attributes.position.array.byteLength + TLAYER.mesh.geometry.index.array.byteLength : 0,
+  }),
+  timeLoad, timeRebuild, timeApply, timeGoto, timePermille, timeSeekRow, timeRowAt, setTime, setTimePlay, timeNote,
+  TLAYER,
   ledgerLoad, ledgerFind, ledgerJump, ledgerAsk, ledgerAskCentre, setLedger, clearLedgerPins,
   ledgerNote, rankCells, collectCells, summarizeRows, readPack,
   // Ray for a screen point, so a probe can walk the world along the line of sight instead of only
@@ -4697,6 +5019,12 @@ function switchDim(id) {
   clearLedgerMesh();
   closeLedgerCard();
   if (S.ledger) ledgerLoad(); else panel?.refresh();
+  // M12b: and so is its timeline. A stale timeline would animate another dimension's history over
+  // this dimension's cell table, which is the one ledger bug that would look like a correct picture.
+  TLAYER.gen++;
+  TLAYER.tl = null; TLAYER.err = ''; TLAYER.bytes = 0; TLAYER.fetchMs = 0;
+  clearTimeMesh();
+  if (S.time) timeLoad();
   resetWorkers();
 
   // Keep the camera where it is if that world has ground under it; otherwise go to the middle of
@@ -4865,7 +5193,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         fmt: (v) => `${(+v).toFixed(4)} rad/px`,
         hint: 'Click-to-lock mouse-look only; a drag has always been 0.006 rad/px and still is.\nURL: ?look=',
         get: () => S.walkSens, set: (v) => { S.walkSens = Math.max(0.0004, +v); } },
-      { kind: 'section', key: 'sec_ledger', label: 'who placed this', open: false,
+      { kind: 'section', key: 'sec_ledger', label: 'who placed this, and when', open: false,
         hint: 'The world keeps a ledger of block actions - 424,599 of them here, 351,531 in this\n'
           + 'dimension across 20,322 chunks. It answers who touched a block, and where the map has\nhistory worth visiting.' },
       { key: 'ledger', label: 'activity overlay', kind: 'check',
@@ -4876,7 +5204,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         get: () => S.ledgerCls, set: (v) => { S.ledgerCls = +v || 0; ledgerRebuild(); },
         hint: 'which kind of row to count. block-place and block-break are what a player building\nlooks like; any kind also counts fire spreading, water flowing, decay, trampling and kills,\nwhich is where the map turns red for no human reason.' },
       { key: 'ledgerWho', label: 'whose actions', kind: 'select', options: ledgerWhoOptions(),
-        get: () => S.ledgerWho, set: (v) => { S.ledgerWho = +v || 0; ledgerRebuild(); },
+        get: () => S.ledgerWho, set: (v) => { S.ledgerWho = +v || 0; ledgerRebuild(); if (S.time) timeRebuild(); },
         hint: 'attribute the overlay to one named player. anybody leaves in the 301,367 rows the log\ndoes not attribute to a player: fluid, fire, growth, mobs.' },
       { key: 'ledgerMin', label: 'quietest chunk', min: 0, max: 400, step: 1,
         stops: [1, 2, 4, 8, 16, 32, 64, 128, 256, 400], fmt: (v) => `${v} row${v === 1 ? '' : 's'}+`,
@@ -4885,9 +5213,31 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
       { key: 'ledgerXray', label: 'see through terrain', kind: 'check',
         fmt: () => (S.ledgerXray ? 'decals paint over the world' : 'hills hide them'),
         get: () => !!S.ledgerXray,
-        set: (v) => { S.ledgerXray = v ? 1 : 0; if (ledgerHeatMat) ledgerHeatMat.depthTest = !S.ledgerXray; },
+        set: (v) => { S.ledgerXray = v ? 1 : 0;
+          if (ledgerHeatMat) ledgerHeatMat.depthTest = !S.ledgerXray;
+          if (timeDecalMat) timeDecalMat.depthTest = !S.ledgerXray; },
         hint: 'an overlay that sits on the ground is honest and unreadable at whole-world scale: the hill\nin front of the valley hides the valley. Painting through the terrain turns it into a map of the\nlog; turn it off to ask whether the activity is visible from where you are. URL: ?noledgerxray' },
-      { kind: 'note', text: () => ledgerNote() },
+      { key: 'time', label: 'time machine', kind: 'check',
+        fmt: () => (S.time ? `on - ${(TLAYER.drawn ?? 0).toLocaleString()} / ${(TLAYER.quads || 0).toLocaleString()}` : 'off'),
+        get: () => !!S.time, set: (v) => setTime(v),
+        hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one decal per\nlogged change that has happened by the playhead. Costs one 4.7 MB request per dimension\n(/ledger/timeline) and one mesh; moving the playhead is a draw range, not a rebuild, so two years of\nhistory play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole dimension,\n35 ms for one player. M. URL: ?time=1' },
+      { key: 'timeAt', label: 'playhead', min: 0, max: 1000, step: 1, live: false,
+        get: () => timePermille(), set: (v) => timeSeekRow(timeRowAt(+v)),
+        fmt: () => (TLAYER.tl ? timeStamp(playhead(TLAYER.tl, TLAYER.sec).ms) : '-'),
+        hint: 'Permille of THIS FILTER\'s rows drawn, oldest first - deliberately not a date slider, because a\ndate slider shows nothing at all across the 60% of days with no logged change. The value column is the\nwall clock at the playhead. Drag to scrub, K to play. URL: ?timeat=<seconds since the first row>' },
+      { key: 'timePlay', label: 'play (K)', kind: 'check',
+        fmt: () => (S.timePlay ? `${S.timeSpeed.toLocaleString()}/s` : 'paused'),
+        get: () => !!S.timePlay, set: (v) => setTimePlay(v),
+        hint: 'The playhead, not the frame: a slow machine shows less history per frame rather than wrong\nhistory. Reaching the end of the log stops; K from the end restarts at the first logged change, not at\nthe oldest calendar second.' },
+      { key: 'timeSpeed', label: 'changes per second', stops: [200, 1000, 5000, 20000, 80000, 250000],
+        fmt: (v) => `${(+v).toLocaleString()}/s`, get: () => S.timeSpeed, set: (v) => { S.timeSpeed = Math.max(1, +v || 1); },
+        hint: 'Logged changes per wall-clock second, because that is the only rate that works here: this\nserver logged activity on 9 of the 822 days its log spans, and one of those days holds 83,101 rows. A\nplayhead driven by the calendar would sit still for a month and then blur. At 20,000/s the whole\noverworld log plays in 18 s and one player\'s places in 0.2 s; the sentence below does that arithmetic.\nURL: ?timespeed=' },
+      { key: 'timeCls', label: 'replay which action', kind: 'select', options: timeClassOptions(),
+        get: () => S.timeCls, set: (v) => { S.timeCls = +v || 0; timeRebuild(); },
+        hint: 'Which rows get a decal, and what colour it is. Blocks only is the one that reads as building:\n90,045 place rows against 202,826 break rows. The playhead counts THIS filter, so switching mid-play\nkeeps the fraction of the filtered history, not the date. Any colour is 7.4 M triangles - the place set\nis 1.1 M.' },
+      { kind: 'note', text: () => timeNote(),
+        hint: 'The one sentence that answers "am I watching a bug, or an empty decade?". Unattributed rows -\n269,358 of this dimension\'s 351,531, most of them water, fire, growth and mobs - belong to anybody:\nfiltering to one player is a much smaller claim, and it costs 35 ms to re-cut instead of 100.' },      { kind: 'note', text: () => ledgerNote() },
+      { kind: 'note', text: 'M the time machine - K play or pause - drag playhead to scrub - Esc clears the card and the markers' },
       { kind: 'note', text: 'click a block for its history - L the overlay - T middle of view - F tour - Esc clears the card and the markers' },
       { kind: 'section', key: 'sec_far', label: 'the far world', open: false,
         hint: 'The ground outside the close ring: how it is drawn, how coarse it is allowed to get, and\n'
@@ -5178,6 +5528,10 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     // that silently offers one choice. A missing ledger is a note, not an error: the viewer works.
     await ledgerMetaLoad();
     buildPanel();
+    // M12b: the timeline is deliberately not a boot request - 4.7 MB for the overworld, and most
+    // visits never scrub. But a URL that asks for the layer gets it, filters included, before the
+    // first frame is worth comparing against.
+    if (S.time) timeLoad();
     // Walking is turned on after the panel exists (its rows report the mode) and after the spawn
     // point and the ?goto target are known, so ?view=walk&goto=x,y,z lands the eye on that place at
     // head height rather than aiming at it from 40 blocks away.

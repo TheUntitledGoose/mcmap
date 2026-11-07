@@ -26,6 +26,7 @@ const fakeLog = (rows) => {
     count: R.length,
     worldId: (i) => R[i].worldId,
     x: (i) => R[i].x,
+    y: (i) => R[i].y,
     z: (i) => R[i].z,
     actionId: (i) => R[i].actionId,
     playerId: (i) => R[i].playerId,

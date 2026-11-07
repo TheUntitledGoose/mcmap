@@ -100,8 +100,24 @@ export class LedgerService {
     const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
     dv.setUint32(24, 0, true);      // chunkCount: not shipped, the overlay does not use it
     dv.setUint32(28, 0, true);      // rowCount
+    dv.setUint32(40, 0, true);      // tlCount: the timeline is /ledger/timeline, not this response
     this.stats.cellsServed++;
     return out;
+  }
+
+  /**
+   * The playhead data: this dimension's rows in time order, each carrying its block position.
+   *
+   * A separate endpoint because of the size asymmetry. The cells slice the heat layer needs is 691 KB
+   * for 20,322 chunks; this is 4.9 MB for the same dimension's 351,531 rows. Time travel should cost
+   * that 4.9 MB, and an ordinary map view should not.
+   */
+  timelineBytes(dim) {
+    const p = this.packFor(dim);
+    if (!p || !p.tlBytes) return null;
+    const [a, b] = p.tlBytes;
+    this.stats.timelinesServed = (this.stats.timelinesServed ?? 0) + 1;
+    return this.raws.get(p.dimKey).subarray(a, b);
   }
 
   loadLog() {

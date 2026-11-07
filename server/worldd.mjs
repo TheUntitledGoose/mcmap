@@ -10,6 +10,7 @@
 //   GET /overview?dim=...           the whole dimension as one decimated heightmap frame
 //   GET /ledger/meta                the block-history index: players, dimensions, coverage
 //   GET /ledger/cells?dim=...       sparse per-chunk activity table (binary, 32 B per touched chunk)
+//   GET /ledger/timeline?dim=...    this dimension's rows in time order (binary, 14 B per row)
 //   GET /ledger/rows?dim&cx&cz      what happened in one chunk, oldest first (JSON)
 //   GET /ledger/top?dim&cls&player  where the action is, most-changed chunks first (JSON)
 //   GET /assets/<file>              atlas.json / atlas.png / geometry.bin
@@ -314,6 +315,13 @@ const server = http.createServer(async (req, res) => {
       const b = ledger.cellsBytes(q.get('dim') ?? 'minecraft:overworld');
       return b ? send(req, res, 200, b, 'application/octet-stream')
         : send(req, res, 404, 'no ledger index for that dimension', 'text/plain');
+    }
+    if (u.pathname === '/ledger/timeline') {
+      // Opt-in on purpose: 4.9 MB of rows for the overworld. The heat layer costs 691 KB and is drawn
+      // by default; this is the time machine, and a viewer that does not scrub should not pay for it.
+      const b = ledger.timelineBytes(q.get('dim') ?? 'minecraft:overworld');
+      return b ? send(req, res, 200, b, 'application/octet-stream')
+        : send(req, res, 404, 'no ledger timeline for that dimension', 'text/plain');
     }
     if (u.pathname === '/ledger/rows' || u.pathname === '/ledger/top') {
       const dim = q.get('dim') ?? 'minecraft:overworld';

@@ -11,6 +11,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fromWire, makeReader } from '../shared/regionbits.mjs';
+import { decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
 
 const PORT = 8790 + (process.pid % 90);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -75,6 +76,28 @@ test('a correct block still answers, and /regions describes the save', async () 
 test('an unknown dimension is a 404 on /regions, not an empty grid', async () => {
   const r = await get('/regions?dim=not:a:dimension');
   assert.equal(r.code, 404);
+});
+
+test('the ledger answers cells and timeline as two sizes, and both decode', async () => {
+  const cells = await get('/ledger/cells?dim=minecraft:overworld');
+  assert.equal(cells.code, 200);
+  assert.equal(readPack(cells.buf).tlBytes, null,
+    'the heat layer bytes declare no timeline, so a viewer cannot read past them by accident');
+
+  const tl = await get('/ledger/timeline?dim=minecraft:overworld');
+  assert.equal(tl.code, 200);
+  const TL = decodeTimeline(tl.buf);
+  assert.equal(TL.count, 351531, 'the whole overworld history is addressable from this one response');
+  for (let i = 1; i < TL.count; i++) {
+    if (TL.sec[i] < TL.sec[i - 1]) assert.fail(`row ${i} went back in time on the wire`);
+  }
+  const meta = JSON.parse((await get('/ledger/meta')).text);
+  const dim = meta.dims.find((d) => d.dimKey === 'region');
+  assert.equal(dim.rows, TL.count, 'and it agrees with what /ledger/meta claims for that dimension');
+
+  // A dimension with no baked pack has no timeline. graveyard:past is the real case in this save: the
+  // ledger knows the world, the copied save has no region folder for it.
+  assert.equal((await get('/ledger/timeline?dim=not:a:dimension')).code, 404);
 });
 
 test('the log stays quiet enough to read', () => {

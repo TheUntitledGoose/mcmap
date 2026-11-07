@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { RECORD_SIZE, readLedger } from '../shared/ledger-format.mjs';
-import { CELL_BYTES, CELL_H_BYTES, LEDPACK_HEADER, LEDPACK_VERSION, readPack } from '../shared/ledger-pack.mjs';
+import { CELL_BYTES, CELL_H_BYTES, LEDPACK_HEADER, LEDPACK_VERSION, TL_HEADER, TL_NO_PLAYER, TL_REC, decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import { LedgerService } from '../server/ledger-service.mjs';
 
@@ -117,6 +117,37 @@ test('the cells answer is the overlay whole: header, cells, and the height plane
   assert.equal(S.stats.cellsServed, 1);
 });
 
+test('the timeline is a separate answer, and the cells slice does not carry it', () => {
+  const { dir } = fixture();
+  const S = new LedgerService(dir);
+
+  // The overlay layer loads the cells for every dimension it paints. The timeline is 14 B a row, so it
+  // has to be askable on its own or every map view would pay for the time machine.
+  const tl = S.timelineBytes('region');
+  assert.ok(tl && tl.length > 0);
+  const TL = decodeTimeline(tl);
+  assert.equal(TL.count, 3, 'three rows in this fixture, all in dimension 1');
+  assert.deepEqual(TL.dimKey, 'region');
+
+  // Same rows as the point query, and the point query is the one that names the block.
+  const rows = S.rowsAt('region', -3, -8, {}).rows;
+  assert.equal(rows.length, 2, 'two of them are in chunk -3,-8');
+  const cells = readPack(S.cellsBytes('region'));
+  assert.equal(cells.tlBytes, null, 'the bytes the overlay downloads declare no timeline');
+  assert.equal(tl.length, TL_HEADER + 'region'.length + TL.count * TL_REC,
+    'the timeline is self-describing: 28 B header, dim key, 14 B a row');
+
+  // A dimension with no pack has no timeline, and that is a 404 upstream rather than an empty table.
+  assert.equal(S.timelineBytes('graveyard:past'), null);
+  assert.equal(S.timelineBytes('nope'), null);
+
+  // Time order, and the position each row points at.
+  const at = (i) => { const c = cells.cell(TL.cellOf(i)); return [c.cx * 16 + TL.x(i), TL.y(i), c.cz * 16 + TL.z(i)]; };
+  assert.deepEqual([at(0), at(1)], [[-40, 64, -122], [-41, 64, -122]], 'break then place, one block apart');
+  assert.deepEqual([...TL.player], [0, 0, TL_NO_PLAYER], 'the kill by a source has no player');
+  assert.ok(TL.sec[0] < TL.sec[1] && TL.sec[1] < TL.sec[2], 'oldest first');
+});
+
 test('a pack older than the export it indexes is refused, not answered with someone else\'s rows', () => {
   const { dir, packPath } = fixture();
   // push the pack into the past: re-exporting without re-baking is the exact mistake this guards
@@ -141,7 +172,7 @@ test('a pack this build cannot read says so instead of throwing at the browser',
   const S = new LedgerService(dir);
   assert.equal(S.cellsBytes('region'), null);
   assert.equal(S.stats.badPack.dimKey, 'region');
-  assert.match(S.stats.badPack.why, /version 1 != 2/, 'named the actual problem');
+  assert.match(S.stats.badPack.why, /version 1 != \d+/, 'named the actual problem');
   assert.deepEqual(S.metaJson().stats.badPack, S.stats.badPack);
 });
 

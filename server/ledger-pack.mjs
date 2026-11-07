@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   CELL_BYTES, CELL_H_BYTES, CHUNK_BYTES, LEDPACK_HEADER, LEDPACK_MAGIC, LEDPACK_VERSION, MAX_PLAYERS_IN_MASK,
-  NCLASS,
+  NCLASS, TL_HEADER, TL_MAGIC, TL_NO_PLAYER, TL_REC, TL_VERSION, tlPackCoord,
 } from '../shared/ledger-pack.mjs';
 import { HEIGHT_BIAS } from '../shared/chunk-format.mjs';
 
@@ -43,6 +43,9 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
       if (pid > MAX_PLAYERS_IN_MASK) {
         throw new Error(`ledger pack: player id ${pid} does not fit a ${MAX_PLAYERS_IN_MASK}-bit mask`);
       }
+      if (pid - 1 > TL_NO_PLAYER - 1) {
+        throw new Error(`ledger pack: player id ${pid} does not fit a timeline byte (max ${TL_NO_PLAYER})`);
+      }
       e.mask |= 1 << (pid - 1);
     }
     const sec = Math.floor(L.timeMs(i) / 1000);
@@ -61,10 +64,21 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
   list.sort((a, b) => (a.cz - b.cz) || (a.cx - b.cx));
   for (const e of list) e.rows.sort(byTime);
 
+  // Timeline: the same rows, ordered by time instead of by chunk, and carrying the block position.
+  // Every chunk's row list is already in time order, so this is a k-way merge over 20k short runs -
+  // a plain sort is fast enough at 351k rows and much easier to trust than a hand-rolled heap.
+  const tl = new Array(rows);
+  let k = 0;
+  for (let ci = 0; ci < list.length; ci++) {
+    for (const i of list[ci].rows) tl[k++] = [Math.floor(L.timeMs(i) / 1000), ci, i];
+  }
+  tl.sort((a, b) => (a[0] - b[0]) || (a[2] - b[2]));
+
   const dimKeyBuf = Buffer.from(dimKey, 'utf8');
   const head = LEDPACK_HEADER + dimKeyBuf.length;
+  const tlSize = rows ? TL_HEADER + dimKeyBuf.length + rows * TL_REC : 0;
   const out = Buffer.alloc(head + list.length * (CELL_BYTES + CELL_H_BYTES)
-    + list.length * CHUNK_BYTES + rows * 4);
+    + list.length * CHUNK_BYTES + rows * 4 + tlSize);
   const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
   out.write(LEDPACK_MAGIC, 0, 'latin1');
   dv.setUint32(8, LEDPACK_VERSION, true);
@@ -75,6 +89,7 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
   dv.setUint32(28, rows, true);
   dv.setUint32(32, tMin === Infinity ? 0 : tMin, true);
   dv.setUint32(36, tMax === -Infinity ? 0 : tMax - (tMin === Infinity ? 0 : tMin), true);
+  dv.setUint32(40, rows, true);      // tlCount: the timeline section trails the row index
   dimKeyBuf.copy(out, LEDPACK_HEADER);
 
   let p = head;
@@ -112,7 +127,30 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
   for (const e of list) {
     for (const i of e.rows) { dv.setUint32(p, i, true); p += 4; }
   }
-  return { buf: out, cellCount: list.length, rowCount: rows, tMin, tMax };
+
+  // The timeline section carries its own magic and dim key so a slice of it is self-describing:
+  // /ledger/timeline ships these bytes and nothing else.
+  if (rows) {
+    out.write(TL_MAGIC, p, 'latin1');
+    dv.setUint32(p + 8, TL_VERSION, true);
+    dv.setUint32(p + 12, rows, true);
+    dv.setUint32(p + 16, tMin === Infinity ? 0 : tMin, true);
+    dv.setUint32(p + 20, tMax === -Infinity ? 0 : tMax - (tMin === Infinity ? 0 : tMin), true);
+    dv.setUint32(p + 24, dimKeyBuf.length, true);
+    dimKeyBuf.copy(out, p + TL_HEADER);
+    p += TL_HEADER + dimKeyBuf.length;
+    for (const [sec, ci, i] of tl) {
+      dv.setUint32(p, ci, true);
+      dv.setUint32(p + 4, tlPackCoord(L.x(i) & 15, L.y(i), L.z(i) & 15), true);
+      const aid = L.actionId(i);
+      dv.setUint8(p + 8, aid >= 1 && aid <= NCLASS ? aid - 1 : NCLASS, true);
+      const pid = L.playerId(i);
+      dv.setUint8(p + 9, pid ? pid - 1 : TL_NO_PLAYER, true);
+      dv.setUint32(p + 10, sec - (tMin === Infinity ? 0 : tMin), true);
+      p += TL_REC;
+    }
+  }
+  return { buf: out, cellCount: list.length, rowCount: rows, tMin, tMax, tlBytes: tlSize };
 }
 
 export const packPath = (dir, dimKey) => path.join(dir, `${dimKey}.ledpack`);
