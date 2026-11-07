@@ -2,6 +2,7 @@
 // an index, not by rebuilding geometry, and that when a rebuild IS needed (a filter change) it is a
 // measured cost rather than a guess. Everything here is the pure data layer: no DOM, no three.
 import assert from 'node:assert/strict';
+import { fakeLog } from './fake-ledger.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import { TL_NO_PLAYER, decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
@@ -11,19 +12,6 @@ import {
 } from '../web/js/ledger-time.mjs';
 
 const T = (s) => 1717174690000 + s * 1000;
-
-const fakeLog = (rows) => {
-  const R = rows.map(([worldId, x, y, z, actionId, playerId, timeMs]) =>
-    ({ worldId, x, y, z, actionId, playerId, timeMs }));
-  return {
-    count: R.length,
-    worldId: (i) => R[i].worldId,
-    x: (i) => R[i].x, y: (i) => R[i].y, z: (i) => R[i].z,
-    actionId: (i) => R[i].actionId,
-    playerId: (i) => R[i].playerId,
-    timeMs: (i) => R[i].timeMs,
-  };
-};
 
 // Two chunks, eight rows, in a deliberately shuffled log order: one player's house going up, one block
 // placed then broken then placed again, one unattributed row, and one kill with no player.

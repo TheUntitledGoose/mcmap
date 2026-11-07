@@ -121,8 +121,8 @@ test('the timeline is a separate answer, and the cells slice does not carry it',
   const { dir } = fixture();
   const S = new LedgerService(dir);
 
-  // The overlay layer loads the cells for every dimension it paints. The timeline is 14 B a row, so it
-  // has to be askable on its own or every map view would pay for the time machine.
+  // The overlay layer loads the cells for every dimension it paints. The timeline is 16 B a row plus a
+  // name table, so it has to be askable on its own or every map view would pay for the time machine.
   const tl = S.timelineBytes('region');
   assert.ok(tl && tl.length > 0);
   const TL = decodeTimeline(tl);
@@ -134,8 +134,11 @@ test('the timeline is a separate answer, and the cells slice does not carry it',
   assert.equal(rows.length, 2, 'two of them are in chunk -3,-8');
   const cells = readPack(S.cellsBytes('region'));
   assert.equal(cells.tlBytes, null, 'the bytes the overlay downloads declare no timeline');
-  assert.equal(tl.length, TL_HEADER + 'region'.length + TL.count * TL_REC,
-    'the timeline is self-describing: 28 B header, dim key, 14 B a row');
+  let nameBytes = 0;
+  for (const nm of TL.names) nameBytes += 2 + Buffer.from(nm, 'utf8').length;
+  assert.equal(tl.length, TL_HEADER + 'region'.length + nameBytes + TL.count * TL_REC,
+    'the timeline is self-describing: header, dim key, name table, 16 B a row');
+  assert.ok(TL.names.length > 0, 'a v2 timeline names the blocks its rows are about');
 
   // A dimension with no pack has no timeline, and that is a 404 upstream rather than an empty table.
   assert.equal(S.timelineBytes('graveyard:past'), null);

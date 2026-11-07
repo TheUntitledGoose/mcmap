@@ -5,6 +5,7 @@
 // Packs are built with the real writer over a made-up log, so a layout change in shared/ledger-pack.mjs
 // breaks this file rather than silently feeding the overlay nonsense.
 import test from 'node:test';
+import { fakeLog } from './fake-ledger.mjs';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { buildPack } from '../server/ledger-pack.mjs';
@@ -19,21 +20,6 @@ const T = (s) => 1717174690000 + s * 1000;
 
 // A log is only ever read through accessors, so a test log is built the same way (see
 // tests/ledger-pack.test.mjs for the same helper).
-const fakeLog = (rows) => {
-  const R = rows.map(([worldId, x, y, z, actionId, playerId, timeMs]) =>
-    ({ worldId, x, y, z, actionId, playerId, timeMs }));
-  return {
-    count: R.length,
-    worldId: (i) => R[i].worldId,
-    x: (i) => R[i].x,
-    y: (i) => R[i].y,
-    z: (i) => R[i].z,
-    actionId: (i) => R[i].actionId,
-    playerId: (i) => R[i].playerId,
-    timeMs: (i) => R[i].timeMs,
-  };
-};
-
 // One row per chunk, at a chosen chunk coordinate, with a ground height so the geometry has somewhere
 // to stand. `[[cx, cz, actionId, playerId]]`.
 const packOf = (spec, heightOf = (cx, cz) => 70 + ((cx + cz) & 7)) => {

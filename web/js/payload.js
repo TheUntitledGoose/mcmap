@@ -127,7 +127,7 @@ export function openChunk(buf, byteOffset = 0, length = buf.byteLength - byteOff
     throw new Error(`chunk frame length drift ${p} != ${length}`);
   }
 
-  return {
+  return withAccessors({
     cx, cz, yMin, yCount, palette, sections, height, heightMotion, blockEntities, unknownStates,
     // A fingerprint of the bytes this chunk was read from. Two fetches of ground nobody edited give
     // the same number, which is what lets the viewer say "I already have the triangles for this" -
@@ -135,26 +135,40 @@ export function openChunk(buf, byteOffset = 0, length = buf.byteLength - byteOff
     // the same world.
     digest: frameDigest(new Uint8Array(buf, (buf.byteOffset ?? 0) + byteOffset, length)),
     classicSections: !!(flags & FLAG_CLASSIC),
-    /** the section covering a *world block* y, or null */
-    sectionAt(y) { return byY.get(y >> 4) ?? null; },
-    /** global state id at a block coordinate, or 0 outside the chunk */
-    stateAt(x, y, z) {
-      const s = byY.get(y >> 4);
-      if (!s) return 0;
-      return palette[s.single ? s.single - 1 : s.vox[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)]];
-    },
-    /** highest visible block in a column (chunk-local x,z), or yMin*16 - 1 when empty */
-    surfaceAt(x, z) { return (height ? height[((z & 15) << 4) | (x & 15)] : 0) - HEIGHT_BIAS; },
-    /** [sky, block] light at a chunk-local block coordinate; flat sections cost nothing to read */
-    lightAt(x, y, z) {
-      const s = byY.get(y >> 4);
-      if (!s) return [0, 0];
-      if (s.sky !== LIGHT_VARIES && s.blk !== LIGHT_VARIES) return [s.sky ?? 0, s.blk ?? 0];
-      const i = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
-      const nib = (a) => { const b = a[i >> 1]; return (i & 1) ? (b >> 4) : (b & 15); };
-      return [s.sky === LIGHT_VARIES ? nib(s.skyArr) : (s.sky ?? 0), s.blk === LIGHT_VARIES ? nib(s.blkArr) : (s.blk ?? 0)];
-    },
+  });
+}
+
+/**
+ * Attach the coordinate accessors to a chunk-shaped object.
+ *
+ * Exported because a patched chunk (the time machine's "as of T" voxels, web/js/ledger-terrain.mjs) is
+ * the same data with different sections, and an accessor built twice is a rule that can drift. The
+ * section map is rebuilt here rather than passed in so a caller that added a section cannot keep a
+ * stale map.
+ */
+export function withAccessors(ch) {
+  const byY = new Map(ch.sections.map((s) => [s.y, s]));
+  const { palette, height } = ch;
+  /** the section covering a *world block* y, or null */
+  ch.sectionAt = (y) => byY.get(y >> 4) ?? null;
+  /** global state id at a block coordinate, or 0 outside the chunk */
+  ch.stateAt = (x, y, z) => {
+    const s = byY.get(y >> 4);
+    if (!s) return 0;
+    return palette[s.single ? s.single - 1 : s.vox[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)]];
   };
+  /** highest visible block in a column (chunk-local x,z), or yMin*16 - 1 when empty */
+  ch.surfaceAt = (x, z) => (height ? height[((z & 15) << 4) | (x & 15)] : 0) - HEIGHT_BIAS;
+  /** [sky, block] light at a chunk-local block coordinate; flat sections cost nothing to read */
+  ch.lightAt = (x, y, z) => {
+    const s = byY.get(y >> 4);
+    if (!s) return [0, 0];
+    if (s.sky !== LIGHT_VARIES && s.blk !== LIGHT_VARIES) return [s.sky ?? 0, s.blk ?? 0];
+    const i = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+    const nib = (a) => { const b = a[i >> 1]; return (i & 1) ? (b >> 4) : (b & 15); };
+    return [s.sky === LIGHT_VARIES ? nib(s.skyArr) : (s.sky ?? 0), s.blk === LIGHT_VARIES ? nib(s.blkArr) : (s.blk ?? 0)];
+  };
+  return ch;
 }
 
 /**

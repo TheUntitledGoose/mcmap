@@ -23,10 +23,12 @@
 //     rows:   rowCount x u32     indices into the exported log, in time order within a chunk
 //     timeline (version 3): its own magic + dim key copy, so a slice of it is self-describing:
 //       8 magic 'LEDTL1  ', u32 version, u32 count, u32 timeBaseSec, u32 spanSec, u32 dimKeyLen,
-//       dimKey bytes, then count x 14 B in ascending second:
+//       u32 nameCount, u32 namesBytes, dimKey bytes, nameCount x (u16 len + utf8 bytes),
+//       then count x 16 B in ascending second:
 //         u32 cell index (the same index cells/chunks/heights use), u32 packed local coord
 //         (x 4b, z 4b, y+4096 in 13 bits), u8 action class 0..5 (6 = an action id outside the six),
-//         u8 player index (255 = none), u32 second since timeBaseSec
+//         u8 player index (255 = none), u32 second since timeBaseSec,
+//         u16 name index (1-based into this section's name table; 0 = the row names no block)
 //
 // The timeline is version 3 and it exists for the time machine (PLAN M12b): everything else in this
 // pack answers "how much happened in this chunk", which cannot replay anything. Rows are ordered by
@@ -34,9 +36,12 @@
 // so /ledger/cells can keep serving 674 KB while /ledger/timeline serves the 4.9 MB of rows only for a
 // viewer that means to travel.
 //
-// What is deliberately NOT in a timeline record: the object id (22,341 distinct ids, and the point query
-// already carries them), and the block properties (the log fills block_state for 2,828 of 424,599 rows,
-// so there is nearly nothing to carry). Point queries still go to /ledger/rows, which has both.
+// What is deliberately NOT in a timeline record: the object id *string* (22,341 distinct ids, which
+// would double the row), and the block properties (the log fills block_state for 2,828 of 424,599 rows,
+// so there is nearly nothing to carry). What version 2 adds is the object id as a u16 into a
+// per-dimension name table, because "what was this block" is the difference between decal dots and a
+// terrain time machine: to put a broken block back you have to know its name. Point queries still go
+// to /ledger/rows, which carries properties too.
 //
 // The height plane is version 2 and it is there so the overlay can be drawn without the browser
 // owning a second whole-dimension height source. The world layer (/overview) is off by default here
@@ -57,9 +62,15 @@ export const MAX_PLAYERS_IN_MASK = 32;
 
 // --- the timeline section (version 3) -------------------------------------------------------------
 export const TL_MAGIC = 'LEDTL1  ';
-export const TL_VERSION = 1;
-export const TL_HEADER = 28;         // magic, version, count, timeBase, span, dimKeyLen
-export const TL_REC = 14;
+export const TL_VERSION = 2;
+export const TL_HEADER = 36;         // magic, version, count, timeBase, span, dimKeyLen, nameCount, namesBytes
+export const TL_REC = 16;            // + u16 name index (1-based into the section's own name table)
+// Version 1 is still readable. It has no name table and a 14 B record, and it cannot answer "what
+// block was here", which is the whole question the terrain time machine asks; a v1 slice therefore
+// decodes with an empty name table and the terrain layer refuses to run on it.
+export const TL_VERSION_1 = 1;
+export const TL_HEADER_1 = 28;
+export const TL_REC_1 = 14;
 export const TL_NO_PLAYER = 255;
 export const Y_BIAS = 4096;          // packed y covers -4096..4095; this log spans -512..299
 
@@ -85,26 +96,47 @@ export function decodeTimeline(buf) {
   const magic = new TextDecoder('latin1').decode(new Uint8Array(view.buffer, view.byteOffset, 8));
   if (magic !== TL_MAGIC) throw new Error(`timeline: magic ${JSON.stringify(magic)}`);
   const version = dv.getUint32(8, true);
-  if (version !== TL_VERSION) throw new Error(`timeline: version ${version} != ${TL_VERSION}`);
+  if (version !== TL_VERSION && version !== TL_VERSION_1) {
+    throw new Error(`timeline: version ${version}, expected ${TL_VERSION} or ${TL_VERSION_1}`);
+  }
+  const recSize = version === 1 ? TL_REC_1 : TL_REC;
+  const headSize = version === 1 ? TL_HEADER_1 : TL_HEADER;
   const count = dv.getUint32(12, true);
   const timeBaseSec = dv.getUint32(16, true);
   const spanSec = dv.getUint32(20, true);
   const dimKeyLen = dv.getUint32(24, true);
+  const nameCount = version === 1 ? 0 : dv.getUint32(28, true);
+  const namesBytes = version === 1 ? 0 : dv.getUint32(32, true);
   const dimKey = new TextDecoder('utf-8').decode(
-    new Uint8Array(view.buffer, view.byteOffset + TL_HEADER, dimKeyLen));
-  const at = TL_HEADER + dimKeyLen;
-  if (view.byteLength < at + count * TL_REC) {
-    throw new Error(`timeline ${dimKey}: ${at + count * TL_REC} bytes needed, got ${view.byteLength}`);
+    new Uint8Array(view.buffer, view.byteOffset + headSize, dimKeyLen));
+  const at = headSize + dimKeyLen;
+  if (view.byteLength < at + namesBytes + count * recSize) {
+    throw new Error(`timeline ${dimKey}: ${at + namesBytes + count * recSize} bytes needed, got ${view.byteLength}`);
   }
+  // The name table is per dimension, not global: 22,341 object ids exist across the log, but a
+  // dimension touches a few thousand of them, and a u16 column is what keeps a row at 16 B.
+  const names = [];
+  {
+    const dec = new TextDecoder('utf-8');
+    let q = at;
+    for (let i = 0; i < nameCount; i++) {
+      const l = dv.getUint16(q, true); q += 2;
+      if (q + l > view.byteLength) throw new Error(`timeline ${dimKey}: name ${i} runs past the slice`);
+      names.push(dec.decode(new Uint8Array(view.buffer, view.byteOffset + q, l))); q += l;
+    }
+  }
+  const recAt = at + namesBytes;
   const cell = new Uint32Array(count), coord = new Uint32Array(count);
   const action = new Uint8Array(count), player = new Uint8Array(count), sec = new Uint32Array(count);
+  const name = new Uint16Array(count);
   for (let i = 0; i < count; i++) {
-    const p = at + i * TL_REC;
+    const p = recAt + i * recSize;
     cell[i] = dv.getUint32(p, true);
     coord[i] = dv.getUint32(p + 4, true);
     action[i] = dv.getUint8(p + 8);
     player[i] = dv.getUint8(p + 9);
     sec[i] = dv.getUint32(p + 10, true);
+    name[i] = recSize === TL_REC ? dv.getUint16(p + 14, true) : 0;
   }
   // The rows are the playhead, so "ascending second" is not a detail of the writer, it is the thing
   // the page depends on. Say so in code that runs in the browser, not only in the bake.
@@ -121,10 +153,12 @@ export function decodeTimeline(buf) {
     return [lower(fromSec), lower(toSec + 1)];
   };
   return {
-    version, dimKey, count, timeBaseSec, spanSec, cell, coord, action, player, sec, range,
+    version, dimKey, count, timeBaseSec, spanSec, cell, coord, action, player, sec, name, names, range,
     x: (i) => tlX(coord[i]), y: (i) => tlY(coord[i]), z: (i) => tlZ(coord[i]),
     second: (i) => timeBaseSec + sec[i],
     cellOf: (i) => cell[i],
+    /** the block name this row is about, or '' when the row carries none (a v1 slice always answers '') */
+    nameOf: (i) => (name[i] ? names[name[i] - 1] ?? '' : ''),
   };
 }
 
@@ -204,7 +238,10 @@ export function readPack(buf) {
     const magic = new TextDecoder('latin1').decode(new Uint8Array(view.buffer, view.byteOffset + tlAt, 8));
     if (magic !== TL_MAGIC) throw new Error(`ledger pack: timeline magic ${JSON.stringify(magic)}`);
     const tlDimKeyLen = dv.getUint32(tlAt + 24, true);
-    const need = tlAt + TL_HEADER + tlDimKeyLen + tlCount * TL_REC;
+    const tlVer = dv.getUint32(tlAt + 8, true);
+    const tlNameBytes = tlVer === 1 ? 0 : dv.getUint32(tlAt + 32, true);
+    const need = tlAt + (tlVer === 1 ? TL_HEADER_1 : TL_HEADER) + tlDimKeyLen + tlNameBytes
+      + tlCount * (tlVer === 1 ? TL_REC_1 : TL_REC);
     if (view.byteLength < need) where('timeline');
     tlBytes = [tlAt, need];
   }

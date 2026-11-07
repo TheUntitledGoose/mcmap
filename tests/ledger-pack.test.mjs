@@ -8,22 +8,10 @@ import test from 'node:test';
 import { LEDPACK_MAGIC, LEDPACK_VERSION, NCLASS, TL_HEADER, TL_NO_PLAYER, TL_REC, decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import { readLedger } from '../shared/ledger-format.mjs';
+import { fakeLog } from './fake-ledger.mjs';
 
-// A log is only ever read through its accessor functions, so a test log can be built the same way.
-const fakeLog = (rows) => {
-  const R = rows.map(([worldId, x, y, z, actionId, playerId, timeMs]) =>
-    ({ worldId, x, y, z, actionId, playerId, timeMs }));
-  return {
-    count: R.length,
-    worldId: (i) => R[i].worldId,
-    x: (i) => R[i].x,
-    y: (i) => R[i].y,
-    z: (i) => R[i].z,
-    actionId: (i) => R[i].actionId,
-    playerId: (i) => R[i].playerId,
-    timeMs: (i) => R[i].timeMs,
-  };
-};
+// The log shape this file needs is the shared fake (tests/fake-ledger.mjs): the real reader's accessor
+// surface plus interned object ids, which is what the timeline's name column resolves through.
 
 const T = (s) => 1717174690000 + s * 1000;
 
@@ -170,6 +158,28 @@ test('the timeline walks the same rows in time order and carries the block posit
   assert.equal(readPack(cellsOnly).tlBytes, null, 'a cells-only slice says it has no timeline');
 });
 
+test('the timeline names the block each row is about, which is what lets terrain be put back', () => {
+  const L = fakeLog([
+    [1, 5, 64, 5, 3, 2, T(30), 'minecraft:air', 'minecraft:stone'],   // a break names what left
+    [1, 5, 65, 5, 2, 2, T(40), 'minecraft:oak_stairs[facing=north]', 'minecraft:air'],
+    [1, 5, 66, 5, 5, 2, T(50)],                                       // an action with nothing on it
+    [1, 5, 67, 5, 3, 2, T(60), '', 'minecraft:stone'],                // same name again: one table slot
+  ]);
+  const { buf, nameCount } = buildPack(L, 1, 'region');
+  const P = readPack(buf);
+  const TL = decodeTimeline(buf.subarray(P.tlBytes[0], P.tlBytes[1]));
+  assert.equal(TL.version, 2);
+  assert.deepEqual([...TL.name], [1, 2, 0, 1], 'interned, deduplicated, and 0 means the row names nothing');
+  assert.equal(TL.names.length, 2, 'the table is per dimension, and repeats cost nothing');
+  assert.equal(nameCount, 2);
+  assert.equal(TL.nameOf(0), 'minecraft:stone', 'a break reads its old object, not the air left behind');
+  assert.equal(TL.nameOf(1), 'minecraft:oak_stairs[facing=north]');
+  assert.equal(TL.nameOf(2), '', 'a row that names nothing answers the empty string, not undefined');
+  assert.equal(TL.nameOf(3), 'minecraft:stone');
+  // The name table sits between the dim key and the rows, so a slice cut inside it is a broken file.
+  assert.throws(() => decodeTimeline(buf.subarray(P.tlBytes[0], P.tlBytes[0] + 60)), /bytes needed/);
+});
+
 test('a timeline that stops short is refused, not read as a shorter history', () => {
   const L = fakeLog([[1, 0, 0, 0, 1, 1, T(0)], [1, 1, 0, 1, 2, 1, T(5)], [1, 2, 0, 2, 3, 2, T(9)]]);
   const { buf } = buildPack(L, 1, 'region');
@@ -235,9 +245,12 @@ test('the baked timeline is the same rows as the point query, reordered', (t) =>
   const raw = readFileSync(packPath);
   const P = readPack(raw);
   const TL = decodeTimeline(raw.subarray(P.tlBytes[0], P.tlBytes[1]));
-  // The size asymmetry that justifies two endpoints: 34 B per touched chunk against 14 B per row.
-  // Overworld that is 691 KB of heat versus 4.9 MB of playhead, so the heat layer must not carry it.
-  assert.equal(P.tlBytes[1] - P.tlBytes[0], TL_HEADER + P.dimKey.length + TL.count * TL_REC);
+  // The size asymmetry that justifies two endpoints: 34 B per touched chunk against 16 B per row.
+  // Overworld that is 691 KB of heat versus 5.6 MB of playhead, so the heat layer must not carry it.
+  let nameBytes = 0;
+  for (const s of TL.names) nameBytes += 2 + Buffer.from(s, 'utf8').length;
+  assert.equal(P.tlBytes[1] - P.tlBytes[0], TL_HEADER + P.dimKey.length + nameBytes + TL.count * TL_REC);
+  assert.ok(TL.names.length > 100, 'the overworld names a few hundred distinct blocks');
   assert.ok(P.tlBytes[1] - P.tlBytes[0] > 4.5e6, 'the overworld timeline is a few MB, not a rounding error');
 
   // Row count, first and last second, and the rows per cell: the timeline may not invent, lose, or

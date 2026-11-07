@@ -75,8 +75,33 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
   tl.sort((a, b) => (a[0] - b[0]) || (a[2] - b[2]));
 
   const dimKeyBuf = Buffer.from(dimKey, 'utf8');
+  // Name table for the timeline. A row names the block it is about: for a break that is the block that
+  // left (old_object_id), for everything else the object the action is attached to. Interning per
+  // dimension is what keeps the column a u16: the log knows 22,341 objects, this one uses a fraction.
+  const nameIdx = new Map();          // object id string -> 1-based slot
+  const nameList = [];
+  const blockNameOf = (i) => {
+    const aid = L.actionId(i);
+    const key = aid === 3 ? L.oldObjectId(i) : L.objectId(i);
+    const s = key ? L.objects.get(key)?.id ?? '' : '';
+    if (!s) return 0;
+    let n = nameIdx.get(s);
+    if (n === undefined) {
+      if (nameList.length >= 0xFFFF) throw new Error(`ledger pack ${dimKey}: name table overflow`);
+      n = nameList.push(s);
+      nameIdx.set(s, n);
+    }
+    return n;
+  };
+  // Intern before allocating: the name table's byte size is part of the buffer size and of the header,
+  // so it has to be finished before a single row is written.
+  const tlName = new Uint16Array(tl.length);
+  for (let k = 0; k < tl.length; k++) tlName[k] = blockNameOf(tl[k][2]);
+  const nameBufs = nameList.map((s) => Buffer.from(s, 'utf8'));
+  let namesBytes = 0;
+  for (const b of nameBufs) namesBytes += b.length + 2;
   const head = LEDPACK_HEADER + dimKeyBuf.length;
-  const tlSize = rows ? TL_HEADER + dimKeyBuf.length + rows * TL_REC : 0;
+  const tlSize = rows ? TL_HEADER + dimKeyBuf.length + namesBytes + rows * TL_REC : 0;
   const out = Buffer.alloc(head + list.length * (CELL_BYTES + CELL_H_BYTES)
     + list.length * CHUNK_BYTES + rows * 4 + tlSize);
   const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
@@ -137,9 +162,13 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
     dv.setUint32(p + 16, tMin === Infinity ? 0 : tMin, true);
     dv.setUint32(p + 20, tMax === -Infinity ? 0 : tMax - (tMin === Infinity ? 0 : tMin), true);
     dv.setUint32(p + 24, dimKeyBuf.length, true);
+    dv.setUint32(p + 28, nameList.length, true);
+    dv.setUint32(p + 32, namesBytes, true);
     dimKeyBuf.copy(out, p + TL_HEADER);
     p += TL_HEADER + dimKeyBuf.length;
-    for (const [sec, ci, i] of tl) {
+    for (const b of nameBufs) { dv.setUint16(p, b.length, true); p += 2; b.copy(out, p); p += b.length; }
+    for (let k = 0; k < tl.length; k++) {
+      const [sec, ci, i] = tl[k];
       dv.setUint32(p, ci, true);
       dv.setUint32(p + 4, tlPackCoord(L.x(i) & 15, L.y(i), L.z(i) & 15), true);
       const aid = L.actionId(i);
@@ -147,10 +176,12 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
       const pid = L.playerId(i);
       dv.setUint8(p + 9, pid ? pid - 1 : TL_NO_PLAYER, true);
       dv.setUint32(p + 10, sec - (tMin === Infinity ? 0 : tMin), true);
+      dv.setUint16(p + 14, tlName[k], true);
       p += TL_REC;
     }
   }
-  return { buf: out, cellCount: list.length, rowCount: rows, tMin, tMax, tlBytes: tlSize };
+  return { buf: out, cellCount: list.length, rowCount: rows, tMin, tMax, tlBytes: tlSize,
+    nameCount: nameList.length };
 }
 
 export const packPath = (dir, dimKey) => path.join(dir, `${dimKey}.ledpack`);
