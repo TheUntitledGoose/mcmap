@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { recordCut, cutPrice, decideCut } from '../shared/cutpolicy.mjs';
+import { recordCut, cutPrice, decideCut, mayTakeThread } from '../shared/cutpolicy.mjs';
 
 test('a per-cell table separates a 47 ms patch from a 2 ms patch', () => {
   const t = new Map();
@@ -68,4 +68,39 @@ test('cost grows as the cell gets finer, so a fine cell is the one that needs a 
     if (cell <= 4) assert.notEqual(d, 'inline', `cell ${cell} costs ${p} ms`);
     if (cell === 16) assert.equal(d, 'inline', 'the cheap cell is exactly what inline is for');
   }
+});
+
+test('an idle thread is not a reason to block an expensive cut', () => {
+  // The cap holds threads back for chunk detail meshes. At cell 1 that reservation is protecting the
+  // render thread from nothing: the alternative to the thread is a 33 ms mesh on it.
+  assert.equal(mayTakeThread({ inflight: 4, cap: 4, poolSize: 8, priceMs: 33, stealMs: 20,
+    workerFree: true }), true);
+  // ... but a cheap cut has no such excuse, and stays inside the reservation.
+  assert.equal(mayTakeThread({ inflight: 4, cap: 4, poolSize: 8, priceMs: 9, stealMs: 20,
+    workerFree: true }), false);
+  // Nothing is idle: there is no thread to take, however expensive the cut is.
+  assert.equal(mayTakeThread({ inflight: 4, cap: 4, poolSize: 8, priceMs: 33, stealMs: 20,
+    workerFree: false }), false);
+  // Every thread is already on a far cut: stealing would just be double-booking.
+  assert.equal(mayTakeThread({ inflight: 8, cap: 4, poolSize: 8, priceMs: 33, stealMs: 20,
+    workerFree: true }), false);
+  // ?stealms=0 is the A/B: the old hard cap.
+  assert.equal(mayTakeThread({ inflight: 4, cap: 4, poolSize: 8, priceMs: 33, stealMs: 0,
+    workerFree: true }), false);
+  // Under the cap, a free thread is taken whatever the price.
+  assert.equal(mayTakeThread({ inflight: 1, cap: 4, poolSize: 8, priceMs: 1, stealMs: 20,
+    workerFree: true }), true);
+});
+
+test('a thread is only spare when chunk detail has no use for it', () => {
+  // The cap reserves threads for chunk detail. An idle thread while detail waits belongs to detail -
+  // it will be asked for a mesh inside the same frame.
+  assert.equal(mayTakeThread({ inflight: 4, cap: 4, poolSize: 8, priceMs: 33, stealMs: 20,
+    workerFree: true, detailWaiting: 3 }), false, 'detail is next in line');
+  // With nothing waiting, the same thread is spare, and a 33 ms inline cut would be the worse answer.
+  assert.equal(mayTakeThread({ inflight: 4, cap: 4, poolSize: 8, priceMs: 33, stealMs: 20,
+    workerFree: true, detailWaiting: 0 }), true);
+  // Cheap cuts still stay inside the reservation whatever is waiting: inline is cheap for them.
+  assert.equal(mayTakeThread({ inflight: 4, cap: 4, poolSize: 8, priceMs: 6, stealMs: 20,
+    workerFree: true, detailWaiting: 0 }), false);
 });

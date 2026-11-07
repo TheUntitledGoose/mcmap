@@ -46,6 +46,9 @@ process.stdin.on('end', () => {
     cutByCell: c.settled.cutByCell ? JSON.parse(c.settled.cutByCell) : undefined,
     deferredBig: (c.settled.deferredBig ?? 0) - (c.before.deferredBig ?? 0),
     forced: (c.settled.forced ?? 0) - (c.before.forced ?? 0),
+    // threads the far-cap held back while idle, and expensive cuts that took one anyway
+    cappedIdle: (c.settled.cappedIdle ?? 0) - (c.before.cappedIdle ?? 0),
+    stolen: (c.settled.stolen ?? 0) - (c.before.stolen ?? 0),
     queueLeft: c.settled.patchQueue, patches: c.settled.patches, retired: c.settled.retired,
     verts: c.settled.verts, drawn: c.settled.drawn });
 });

@@ -12,7 +12,7 @@ import { openOverview } from './payload.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
 import { PATCH_REACH, packPatchFrames, packPatchPolicy, patchFrameGetter, patchPolicy } from './shell-batch.js';
 import { cutReserve, patchThreadCap } from '../../shared/pool.mjs';
-import { recordCut, cutPrice, decideCut } from '../../shared/cutpolicy.mjs';
+import { recordCut, cutPrice, decideCut, mayTakeThread } from '../../shared/cutpolicy.mjs';
 import { meshKeyTool } from './mesh-key.js';
 import { parkPasses, indexedMatch } from './mesh-bytes.js';
 import { mountPanel } from './ui.js';
@@ -87,6 +87,11 @@ const S = {
   // before the render thread cuts it anyway (`shared/cutpolicy.mjs`). It has to be finite: a patch
   // with no mesh is a hole in the ground, and a patch that stays dirty means the pan never settles.
   patchStarve: num('starvems', 400),
+  // A cut above this cost may take a worker thread even when the cap on far cuts is already full
+  // (`mayTakeThread` in shared/cutpolicy.mjs). Refusing it does not free a thread - a thread was idle -
+  // it only moves a 30-50 ms mesh onto the render thread. 20 ms sits between the cell-2 cut (14 ms,
+  // fine inline) and the cell-1 cut (33 ms, not). `?stealms=0` is the A/B: never take a reserved thread.
+  patchStealMs: num('stealms', 20),
   // Price a far cut by its own cell, or by the average of all cuts (the pre-9.9 rule). `?cutavg=1`
   // is the A/B; the average rule is what let a 47 ms cell-1 patch start 1 ms into a 10 ms frame.
   cutCellPrice: !params.has('cutavg'),
@@ -1575,6 +1580,20 @@ let patchSeq = 0, patchInflight = 0, patchPosted = 0, patchDropped = 0, patchOut
 // (dist 150). But the same threads are the only thing meshing chunk detail, so the pool keeps two:
 // asking for 6 on a machine that started 4 workers gets 2, and a 2-worker pool cuts its own patches.
 const patchCap = () => patchThreadCap({ poolSize: pool.length, want: S.patchWorkers });
+// Chunk detail waiting or running: the only reason the cap on far cuts exists.
+const detailWaiting = () => Math.max(0, wave.length - waveAt) + jobs.size;
+/**
+ * How many far cuts this patch may have in flight. Normally the pool cap; past it when the cap is
+ * full, a thread is idle, nothing is waiting for detail, and this cut is expensive enough that the
+ * render thread paying for it is the worse answer (`mayTakeThread`, shared/cutpolicy.mjs). The gate in
+ * drainShellPatches and the path in rebuildPatch ask through this one helper, so they cannot disagree
+ * about whether a thread exists - which is how a deferred 27 ms cut and an idle worker kept missing
+ * each other (97 idle-cap-full samples, one steal).
+ */
+const threadCapFor = (price, inflight = patchInflight) =>
+  mayTakeThread({ inflight, cap: patchCap(), poolSize: pool.length, priceMs: price,
+    stealMs: S.patchStealMs, workerFree: pool.some((w) => !w.busy), detailWaiting: detailWaiting() })
+    ? pool.length : patchCap();
 
 /**
  * Decide a patch cut without paying for it: tier, paint mode, the frames, and the two per-chunk
@@ -1722,7 +1741,16 @@ function rebuildPatch(pk) {
   // The cut goes to a worker when one is free, and the previous mesh stays on screen until the new one
   // arrives: that is also what stops a re-cut from blanking a patch for a frame, which is what far
   // terrain flickering during a drag used to mean.
-  if (patchInflight < patchCap() && postPatchJob(pk, plan)) {
+  //
+  // The cap on far cuts in flight holds threads back for chunk detail. When it is already full and a
+  // thread is idle anyway, refusing it does not save a thread - it moves a 30-50 ms mesh onto the
+  // render thread. So an expensive cut may go past the cap; a cheap one stays inside it.
+  const hardCap = patchCap();
+  const cap = threadCapFor(cutPrice(cutByCell, plan.cell, shellCutAvg));
+  const free = pool.some((w) => !w.busy);
+  if (patchInflight >= hardCap && free) patchCappedIdle++;
+  if (patchInflight < cap && postPatchJob(pk, plan)) {
+    if (patchInflight > hardCap) patchStolen++;
     const ms = performance.now() - tJob;
     patchJobAvg += (ms - patchJobAvg) / ++patchJobN;
     return 'worker';
@@ -1772,6 +1800,9 @@ let shellCutAvg = 0, shellCuts = 0, PATCH_CUT_MAX = 64;
 // 47 ms cut starting 9 ms into a 10 ms frame.
 const cutByCell = new Map();
 let patchDeferredBig = 0, patchForced = 0, patchCutMax = 0, patchCutMaxCell = 0, patchCutMaxPk = '';
+// How often the cap on far cuts was full while a thread sat idle, and how often an expensive cut then
+// took it. Both name the same thing from either side: the reservation was holding a thread nobody used.
+let patchCappedIdle = 0, patchStolen = 0;
 // The last cuts, named: cell, ms, path, first-mesh. A "shell 47 ms" frame has to be answerable.
 const cutLog = (pk, cell, ms, path, first) => {
   patchCutLog.push({ pk, cell, ms: +ms.toFixed(1), path, first });
@@ -1857,6 +1888,7 @@ function drainShellPatches(now) {
     // and the frame paid 47 ms. It also allowed the first cut of a frame unconditionally.
     const pcell = cellOfTier(patchTier.get(pk) ?? patchTierFor(pk, 0));
     const price = cutPrice(cutByCell, pcell, shellCutAvg);
+    const pcap = threadCapFor(price);
     if (!S.cutCellPrice) {
       // The old rule, kept for A/B: one blended average for every patch, and the first cut of a frame
       // free. It stopped the pass instead of skipping just the unaffordable patch, which starved the
@@ -1868,7 +1900,7 @@ function drainShellPatches(now) {
       }
     } else {
       const act = decideCut({ cell: pcell, priceMs: price, remainingMs: deadline - performance.now(),
-        inflight: patchInflight, cap: patchCap(), waitedMs: now - (dirtySince.get(pk) ?? now),
+        inflight: patchInflight, cap: pcap, waitedMs: now - (dirtySince.get(pk) ?? now),
         starveMs: S.patchStarve, hasMesh: !!live });
       if (act === 'defer') {
         dirtyAdd(pk, 'budget'); patchDeferredN++;
@@ -3262,6 +3294,7 @@ window.__world = {
       // The far pass priced each cut by its own cell, and what that said:
       patchCutMsByCell: Object.fromEntries([...cutByCell].map(([c, e]) => [c, +e.ms.toFixed(2)])),
       patchDeferredBig, patchForced, patchStarveMs: S.patchStarve, patchCutLog,
+      patchCappedIdle, patchStolen, patchStealMs: S.patchStealMs,
       patchCellPrice: S.cutCellPrice ? 1 : 0,
       patchCutMax: +patchCutMax.toFixed(2), patchCutMaxCell, patchCutMaxPk,
       shellBudgetMs: S.shellBudget, demoteBudgetMs: S.demoteBudget,
@@ -3578,7 +3611,8 @@ window.__world = {
   gridEst: () => ({ columns: gridColumns(), costScale, floorBoost, vpc: +vertsPerColumn().toFixed(1),
     cutMs: +shellCutAvg.toFixed(2), cuts: shellCuts, dirty: dirtyPatches.size,
     cutByCell: Object.fromEntries([...cutByCell].map(([c, e]) => [c, +e.ms.toFixed(2)])),
-    deferredBig: patchDeferredBig, forced: patchForced,
+    deferredBig: patchDeferredBig, forced: patchForced, cappedIdle: patchCappedIdle,
+    stolen: patchStolen, stealMs: S.patchStealMs,
     jobs: patchJobs.size, outside: patchOutside, posted: patchPosted, dropped: patchDropped,
     detailMarks: patchDetailMarks,
     caps: [...shellMeshes.values()].reduce((s, e) => s + (e.caps || 0), 0),

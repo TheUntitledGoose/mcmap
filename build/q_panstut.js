@@ -39,6 +39,7 @@ const cheap = () => {
     cutMax: s.patchCutMax, cutMaxCell: s.patchCutMaxCell, cutMaxPk: s.patchCutMaxPk,
     cutByCell: JSON.stringify(s.patchCutMsByCell ?? {}),
     deferredBig: s.patchDeferredBig, forced: s.patchForced,
+    cappedIdle: s.patchCappedIdle, stolen: s.patchStolen,
     meshBuilds: s.meshBuilds, chunks: s.chunks, meshTotalMs: s.mesh, meshAvgMs: s.meshMs };
 };
 
@@ -117,7 +118,7 @@ return {
     workers: w.state.workers, workerReady: w.state.workerReady, aa: w.state.aa,
     shellBudgetMs: w.state.shellBudgetMs, demoteBudgetMs: w.state.demoteBudgetMs,
     patchQuiesce: w.state.patchQuiesce, cellPrice: w.state.patchCellPrice,
-    starveMs: w.state.patchStarveMs },
+    starveMs: w.state.patchStarveMs, stealMs: w.state.patchStealMs },
   framesSampled: frames.length, panWallS: +((performance.now() - panStart) / 1000).toFixed(1),
   settleAfterPanS: waited / 1000, settleNot: why,
   // [second, dirty far patches, cuts since pan start, signature tests, patches left marked]. A queue
@@ -148,6 +149,7 @@ return {
   // 47 ms frames have to be answerable, so the last cuts are named: cell, ms, path, first-mesh.
   cutBill: { starveMs: w.state.patchStarveMs, byCell: w.state.patchCutMsByCell,
     deferredBig: w.state.patchDeferredBig, forced: w.state.patchForced,
+    cappedIdle: w.state.patchCappedIdle, stolen: w.state.patchStolen, stealMs: w.state.patchStealMs,
     cuts: w.state.patchCuts, cutMsAvg: w.state.patchCutMsAvg, workerJobs: w.state.patchWorkerJobs,
     biggest: (w.state.patchCutLog ?? []).slice().sort((x, y) => y.ms - x.ms).slice(0, 4) },
 };

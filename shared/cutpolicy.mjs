@@ -64,3 +64,31 @@ export function decideCut({ cell = 1, priceMs = 0, remainingMs = 0, inflight = 0
   if (starveMs > 0 && waitedMs >= starveMs) return 'force';
   return 'defer';
 }
+
+/**
+ * May this patch take a worker thread, even past the cap held back for chunk detail?
+ *
+ * The cap exists so a pan's detail chunks are never queued behind far terrain: a far patch holds a
+ * thread for as long as it meshes, 30-50 ms at cell 1. But when the cap is already full and a thread
+ * is idle anyway, the alternative to taking that thread is cutting on the render thread - which costs
+ * the whole frame, and every other layer waiting in it. So the exception is priced: an *expensive*
+ * cut may go past the cap, cheap ones stay inside it, because a cheap inline cut is what inline is
+ * actually for.
+ *
+ * @param inflight   far cuts running now
+ * @param cap        far cuts the pool policy allows at once
+ * @param poolSize   threads in the pool
+ * @param priceMs    expected cost of this cut (see cutPrice)
+ * @param stealMs    a cut above this cost may use a reserved thread (0 = never)
+ * @param workerFree at least one pool thread is not busy with anything
+ * @param detailWaiting chunk detail meshes queued or running: what the reservation is for
+ */
+export function mayTakeThread({ inflight = 0, cap = 0, poolSize = 0, priceMs = 0, stealMs = 0,
+  workerFree = false, detailWaiting = 0 } = {}) {
+  if (!workerFree) return false;
+  if (inflight < cap) return true;
+  // The cap exists for chunk detail. If detail is waiting, the idle thread belongs to it - it will be
+  // asked for a mesh within the frame. If nothing is waiting, the thread is idle either way.
+  if (detailWaiting > 0 || stealMs <= 0 || inflight >= poolSize) return false;
+  return priceMs > stealMs;
+}
