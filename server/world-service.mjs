@@ -16,13 +16,24 @@ import { ShellPack } from './shell-pack.mjs';
 import { loadLodTile, listLodTiles, lodPath } from './lod-pack.mjs';
 import { LOD_HEADER, LOD_BYTES_PER_VERT } from '../shared/lod-format.mjs';
 
-const MAX_OPEN_REGIONS = 24;
+const MAX_OPEN_REGIONS = 48;
+// Remembered "no such region file" answers. Generous, because the cost is one Map entry, and the
+// alternative is a stat() per chunk slot of unwritten ground on every far pan.
+const MAX_REMEMBERED_REGIONS = 200000;
 // A payload on disk is 124 KB of voxel truth; the wire only ever needs 6-9 KB of it. Storing it raw
 // meant one whole-world sweep = 35 GB of cache for 25 minutes of saved CPU, and 1.4 M small files made
 // the directory unusable (du alone ran for minutes). Compressed cache files are sniffed by prefix, so
 // older uncompressed ones in the same tree still read correctly.
 const CZIP = Buffer.from('DVZ1');
 const CACHE_SWEEP_MIN_MS = 60000;
+// How many cache files one reconcile sweep will look at (and delete) before stopping. The cap keeps
+// a sweep a bounded background job: the last full walk of this tree covered 665 427 files, and
+// tools/cache-prune.mjs is the right way to clean a mess that big in one go.
+const SWEEP_CAP = 60000;
+// How many written files this process keeps in its eviction list. 8 GB of ~2 KB cache files is 4 M
+// paths, and a path string is worth more than the payload it names, so the in-session list is a window;
+// what falls out of the window is counted in baseBytes and left to the off-request reconcile sweep.
+const MAX_TRACKED = 200000;
 // A missing shell pack is remembered so an unbaked world does not stat the same path thousands of
 // times per view, but it has to expire: `npm run bake:shells` can finish while the server is up, and a
 // permanent negative is a server that never notices its far view got cheap.
@@ -31,6 +42,12 @@ const PACK_MISS_MS = 30000;
 // region is ~1000 decodes, ~13 s of frozen server if it runs as one loop; a browser watching that
 // reports "a full second per chunk" because its detail requests queued behind it.
 const YIELD_EVERY = 48;
+// How long a request path may hold the thread before it lets other work in. A slot count cannot be the
+// only rule: 48 chunk slots of unwritten ground is ~0.1 ms of header reading, so a 64x64 far block
+// inserted 85 event-loop turns into 10 ms of work, and every one of those turns then queued behind the
+// other requests already in flight. Measured on build/dbg-farpan.mjs: an entirely empty 64x64 shell
+// block took 435 ms of wall time for 10 ms of work.
+const YIELD_MS = 4;
 const yieldNow = () => new Promise((r) => setImmediate(r));
 export { BATCH_MAGIC };
 
@@ -82,7 +99,9 @@ export class WorldService {
   constructor(worldRoot, stateIds, cacheDir = 'build/cache', opts = {}) {
     this.worldRoot = worldRoot;
     this.stateIds = stateIds;
-    this.cacheDir = cacheDir;
+    // 'none' means no cache. It used to be taken as a directory name, and a WorldService built with
+    // the usual 'none' sentinel quietly created ./none/<tag>/... next to the repo.
+    this.cacheDir = cacheDir && cacheDir !== 'none' ? cacheDir : null;
     // state id -> "does this state render as a full cube?", from the packed assets. The shell pass
     // uses it to look past flowers, signs and saplings to the block a column is really made of.
     this.isCubeState = opts.isCubeState ?? null;
@@ -116,9 +135,26 @@ export class WorldService {
       const dir = path.join(worldRoot, d.dir);
       this.dims.set(d.id, { ...d, dir, key: d.dir.replace(/[/\\]/g, '_'), ...dimExtent(dir) });
     }
-    this.regions = new Map();          // path -> { rgn, mtime }
-    this.order = [];                  // LRU of region paths
-    this.stats = { cacheHits: 0, decodes: 0, empty: 0, regionOpens: 0, cacheWrites: 0, cacheBytes: 0, cachePruned: 0 };
+    this.regions = new Map();          // path -> { rgn, mtime } for open files, { rgn: null, seenAt } for misses
+    this.order = [];                  // eviction list: open region files only, oldest first
+    this.missingTtlMs = +(opts.missingTtlMs ?? 300000);
+    // What this process wrote into the payload cache, oldest first: the eviction list. The bound used
+    // to be a full walk of the cache tree, and that walk is not cheap - build/cache had grown to
+    // 665 427 files holding 1.42 GB of payloads, 411 776 of them 0-byte "no such chunk" markers, and
+    // walking it takes 98 s (build/dbg-cachewalk.mjs). A server that does not run its event loop for
+    // 98 s is, to whoever is looking at the map, a server that died: heartbeats stop, requests pile up
+    // in CLOSE_WAIT, and the viewport freezes on the last chunks it fetched.
+    this.written = [];
+    this.writtenBytes = 0;
+    this.baseBytes = 0;               // cache bytes this process did not write (from a reconcile sweep)
+    this._sweep = null;               // single-flight guard for sweepCacheBudget()
+    this.stats = {
+      cacheHits: 0, decodes: 0, empty: 0, holes: 0, regionOpens: 0, cacheWrites: 0, cacheBytes: 0,
+      cachePruned: 0, sweeps: 0, sweepMs: 0, sweepFiles: 0,
+      // missing: distinct region files remembered as absent; missHits: lookups answered from that
+      // memory. A far pan's whole cost profile sits in these two numbers.
+      missing: 0, missHits: 0,
+    };
     // 0 disables; the running total of what this process has written is the trip wire, so the cap
     // costs nothing until it is actually exceeded.
     // cacheMaxBytes is bytes; cacheMaxGb is the flag form the server takes.
@@ -150,25 +186,55 @@ export class WorldService {
 
   #regionFile(dim, rx, rz) {
     const p = path.join(dim.dir, `r.${rx}.${rz}.mca`);
-    let hit = this.regions.get(p);
+    const hit = this.regions.get(p);
     if (hit) {
-      this.#touch(p);
-      return hit.rgn;
+      if (hit.rgn) { this.#touch(p); return hit.rgn; }
+      // A remembered miss. It is deliberately NOT in the eviction list - there is no handle to close -
+      // and it is only trusted for missingTtlMs, so a region file that appears later is still found.
+      if (Date.now() - hit.seenAt <= this.missingTtlMs) { this.stats.missHits++; return null; }
+      this.regions.delete(p);
     }
-    if (!fs.existsSync(p)) { this.regions.set(p, { rgn: null, mtime: 0 }); return null; }
+    if (!fs.existsSync(p)) {
+      this.regions.set(p, { rgn: null, mtime: 0, seenAt: Date.now() });
+      this.stats.missing++;
+      // Remembering misses is the cheap answer to a far pan, but it is still memory: let go of the
+      // oldest remembered misses (a Map keeps insertion order) well above what any save has.
+      if (this.regions.size > MAX_REMEMBERED_REGIONS) {
+        for (const k of this.regions.keys()) {
+          if (this.regions.get(k)?.rgn) continue;
+          this.regions.delete(k);
+          if (this.regions.size <= MAX_REMEMBERED_REGIONS) break;
+        }
+      }
+      return null;
+    }
     const mtime = fs.statSync(p).mtimeMs;
     const rgn = new RegionFile(p);
     this.stats.regionOpens++;
     this.regions.set(p, { rgn, mtime });
     this.#touch(p);
+    // `order` now holds only files that are actually open, so every entry in this loop is evictable
+    // and the loop terminates. It used to hold remembered misses as well and re-queue each one, which
+    // is a loop that cannot make progress: a pull-back touching the ~950 unwritten region slots inside
+    // this save's own extent filled the list, and the next real open spun forever. That is the 11/07
+    // "worldd is dead, I panned far out" wedge - the process was at 100 % CPU, not slow.
     while (this.order.length > MAX_OPEN_REGIONS) {
       const old = this.order.shift();
       const e = this.regions.get(old);
       if (e?.rgn) e.rgn.close();
-      // keep the negative (missing file) entries forever, they are cheap and avoid repeated stat()
-      if (!e?.rgn) this.order.push(old); else this.regions.delete(old);
+      this.regions.delete(old);
     }
     return rgn;
+  }
+
+  /** Close and forget an open region: the next lookup re-opens it and re-reads its header. */
+  #dropRegion(p) {
+    const e = this.regions.get(p);
+    if (!e) return;
+    if (e.rgn) { try { e.rgn.close(); } catch { /* already gone */ } }
+    this.regions.delete(p);
+    const i = this.order.indexOf(p);
+    if (i >= 0) this.order.splice(i, 1);
   }
 
   #touch(p) {
@@ -188,6 +254,15 @@ export class WorldService {
     const lx = cx & 31, lz = cz & 31;
     const cpath = this.cacheDir ? this.#cachePath(dim, cx, cz) : null;
 
+    // Absence first, answered from the region header, before a single file in the cache directory is
+    // touched. The header is read once when a region opens and entry() is a bit test, so "there is no
+    // chunk here" costs nothing - and it has to, because pulling far back sweeps thousands of
+    // unwritten slots a second. The old order stat'd the cache path and then left a 0-byte marker for
+    // every hole: a million files, and a cache bound that could only be enforced by walking them.
+    const rgn = this.#regionFile(dim, rx, rz);
+    if (!rgn) { this.stats.empty++; return null; }
+    if (!rgn.entry(lx, lz)) { this.stats.empty++; this.stats.holes++; return null; }
+
     if (cpath && !fresh) {
       try {
         const st = fs.statSync(cpath);
@@ -197,13 +272,16 @@ export class WorldService {
           this.stats.cacheHits++;
           return this.#uncache(fs.readFileSync(cpath));
         }
+        // The cache is older than the region: the save moved under us, so the header read at open time
+        // may have too. Drop the open region so the next lookup re-opens it and re-reads the header.
+        if (st.size > 0 && rm > st.mtimeMs) this.#dropRegion(path.join(dim.dir, `r.${rx}.${rz}.mca`));
       } catch { /* miss */ }
     }
 
-    const rgn = this.#regionFile(dim, rx, rz);
-    if (!rgn) { this.stats.empty++; return null; }
     const raw = rgn.readChunkNbtBytes(lx, lz);
-    if (!raw) { this.stats.empty++; if (cpath) this.#writeCache(cpath, null); return null; }
+    // The header said this slot is present, so a null read means a bogus or raced entry - rare enough
+    // to re-decide on the next request rather than leave a marker file behind for it.
+    if (!raw) { this.stats.empty++; return null; }
     // The region header says where the chunk is; its NBT xPos/zPos are unreliable in old saves, so
     // the payload position always comes from the header entry.
     const nbt = readNbt(zlib.inflateSync(raw)).value;
@@ -268,10 +346,16 @@ export class WorldService {
    */
   async batchBytesAsync(dimId, cx0, cz0, w, h, every = YIELD_EVERY) {
     const frames = [];
+    let due = performance.now() + YIELD_MS;
     for (let j = 0; j < h; j++) {
       for (let i = 0; i < w; i++) {
         frames.push(this.chunkBytes(dimId, cx0 + i, cz0 + j) ?? Buffer.alloc(0));
-        if (every > 0 && frames.length % every === 0) await yieldNow();
+        // 'every' bounds how often the clock is consulted; the clock decides whether a yield is worth
+        // taking. Decodes blow through 4 ms in a handful of chunks, so a heavy batch still interleaves.
+        if (every > 0 && frames.length % every === 0 && performance.now() >= due) {
+          await yieldNow();
+          due = performance.now() + YIELD_MS;
+        }
       }
     }
     return packBatch(frames);
@@ -279,10 +363,14 @@ export class WorldService {
 
   async shellBatchBytesAsync(dimId, cx0, cz0, w, h, every = YIELD_EVERY) {
     const frames = [];
+    let due = performance.now() + YIELD_MS;
     for (let j = 0; j < h; j++) {
       for (let i = 0; i < w; i++) {
         frames.push(this.shellBytes(dimId, cx0 + i, cz0 + j) ?? Buffer.alloc(0));
-        if (every > 0 && frames.length % every === 0) await yieldNow();
+        if (every > 0 && frames.length % every === 0 && performance.now() >= due) {
+          await yieldNow();
+          due = performance.now() + YIELD_MS;
+        }
       }
     }
     return packBatch(frames);
@@ -420,54 +508,53 @@ export class WorldService {
   }
 
   /**
-   * Keep the payload cache inside a size budget by dropping the least recently written files. The
-   * cache is saved CPU, never data, so evicting is always safe - it costs a re-decode, not a repair.
+   * Keep the payload cache inside its budget using what this process wrote, oldest first. No tree walk
+   * on the request path: the walk is what stalled the loop (see the constructor note), and cleaning up
+   * generations this server never wrote is a janitorial job - tools/cache-prune.mjs, or the
+   * off-request sweepCacheBudget() below.
    */
-  #sweepCache() {
-    const root = path.join(this.cacheDir, String(this.tableTag), this.lightTag);
-    if (!fs.existsSync(root)) return;
-    const files = [];
-    let total = 0;
-    const walk = (d) => {
-      let ent;
-      try { ent = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-      for (const e of ent) {
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else {
-          try { const st = fs.statSync(p); files.push([p, st.mtimeMs, st.size]); total += st.size; }
-          catch { /* raced */ }
-        }
+  #noteCacheWrite(p, sz) {
+    this.stats.cacheWrites++;
+    this.written.push([p, sz]);
+    this.writtenBytes += sz;
+    this.stats.cacheBytes = this.baseBytes + this.writtenBytes;
+    if (!this.cacheMaxBytes) return;
+    if (this.baseBytes + this.writtenBytes <= this.cacheMaxBytes) {
+      // Keep the window bounded: what falls off the old end is still on disk, it just stops being
+      // something this path can evict cheaply.
+      if (this.written.length > MAX_TRACKED) {
+        const cut = this.written.length - MAX_TRACKED;
+        for (let i = 0; i < cut; i++) { this.baseBytes += this.written[i][1]; this.writtenBytes -= this.written[i][1]; }
+        this.written.splice(0, cut);
       }
-    };
-    walk(root);
-    if (total <= this.cacheMaxBytes) { this.stats.cacheBytes = total; return; }
-    files.sort((a, b) => a[1] - b[1]);
+      return;
+    }
     let freed = 0, gone = 0;
-    for (const [p, , sz] of files) {
-      if (total - freed <= this.cacheMaxBytes) break;
-      try { fs.rmSync(p); freed += sz; gone++; } catch { /* raced */ }
+    while (this.written.length && this.baseBytes + this.writtenBytes > this.cacheMaxBytes * 0.9) {
+      const [victim, sz2] = this.written.shift();
+      try { fs.rmSync(victim, { force: true }); } catch { /* raced: someone else got there first */ }
+      this.writtenBytes -= sz2; freed += sz2; gone++;
     }
     this.stats.cachePruned += gone;
-    this.stats.cacheBytes = total - freed;
-    console.log(`  cache: over ${(this.cacheMaxBytes / 1e9).toFixed(1)} GB, dropped ${gone} payloads ` +
-      +(`(freed ${(freed / 1e9).toFixed(2)} GB, ${(files.length - gone)} kept)`));
-  }
-
-  #noteCacheWrite(sz) {
-    this.stats.cacheWrites++;
-    this.stats.cacheBytes += sz;
-    this._sinceSweep += sz;
-    if (!this.cacheMaxBytes) return;
+    this.stats.cacheBytes = this.baseBytes + this.writtenBytes;
+    if (gone) {
+      // Steady-state eviction is a fact about the budget, not an event worth a line each time: with an
+      // 8 GB cap and a busy pan this fires constantly, so it says so at most every 30 s.
+      const now = Date.now();
+      if (gone >= 50 || now - (this._lastEvictLog ?? 0) > 30000) {
+        this._lastEvictLog = now;
+        console.log(`  cache: over the ${(this.cacheMaxBytes / 1e9).toFixed(1)} GB budget - dropped ${gone} `
+          + `payloads this server wrote (${(freed / 1e6).toFixed(1)} MB), cache ~`
+          + `${(this.stats.cacheBytes / 1e9).toFixed(2)} GB, ${this.written.length} tracked`);
+      }
+      return;
+    }
+    // Nothing left that we wrote and still over budget: the overage is older generations. Reconcile
+    // that off the request path, at most once a minute.
     const now = Date.now();
-    if (this.stats.cacheBytes < this.cacheMaxBytes * 1.25) return;
-    // A time floor stops a big cache being swept every write; a bytes floor keeps the cap honest when
-    // the budget is small (tests, or a --cache-max-gb set low on purpose).
-    if (now - this._lastSweep < CACHE_SWEEP_MIN_MS && this._sinceSweep < this.cacheMaxBytes * 2) return;
+    if (now - this._lastSweep < CACHE_SWEEP_MIN_MS) return;
     this._lastSweep = now;
-    this._sinceSweep = 0;
-    this.stats.cacheBytes = 0;
-    this.#sweepCache();
+    this.sweepCacheBudget().catch((e) => console.log('  cache: sweep failed: ' + (e.message ?? e)));
   }
 
   #writeCache(cpath, bytes) {
@@ -479,7 +566,76 @@ export class WorldService {
     const out = this.#cacheFile(bytes);
     fs.writeFileSync(tmp, out);
     fs.renameSync(tmp, cpath);
-    this.#noteCacheWrite(out.length);
+    this.#noteCacheWrite(cpath, out.length);
+  }
+
+  /**
+   * Reconcile the cache against its byte budget without blocking requests: async directory and stat
+   * calls in chunks, so requests fit between the chunks instead of queueing behind one 98 s walk.
+   * 0-byte "no such chunk" markers go first - an older build left a file behind for every hole, and
+   * absence now comes from the region header, so they buy nothing - then the oldest payloads.
+   *
+   * Public, and never called from inside a request. Bounded: at most SWEEP_CAP files are examined or
+   * deleted per sweep, and the log says so when there is more, pointing at the offline tool.
+   */
+  async sweepCacheBudget() {
+    if (this._sweep) return this._sweep;
+    if (!this.cacheDir || !this.cacheMaxBytes) return null;
+    const root = path.join(this.cacheDir, String(this.tableTag), this.lightTag);
+    this._sweep = (async () => {
+      const t0 = Date.now();
+      const paths = [];
+      const stack = [root];
+      while (stack.length) {
+        const d = stack.pop();
+        let ent;
+        try { ent = await fs.promises.readdir(d, { withFileTypes: true }); } catch { continue; }
+        for (const e of ent) {
+          const p = path.join(d, e.name);
+          if (e.isDirectory()) stack.push(p); else paths.push(p);
+          if (paths.length >= SWEEP_CAP) break;
+        }
+        await null;                       // hand the loop back between directories
+      }
+      const files = [];
+      for (let i = 0; i < paths.length; i += 2000) {
+        const got = await Promise.all(paths.slice(i, i + 2000).map(async (p) => {
+          try { const st = await fs.promises.stat(p); return [p, st.mtimeMs, st.size]; } catch { return null; }
+        }));
+        for (const f of got) if (f) files.push(f);
+        this.stats.sweepFiles = files.length;
+      }
+      let total = 0;
+      for (const [, , sz] of files) total += sz;
+      this.baseBytes = total;
+      this.stats.cacheBytes = total + this.writtenBytes;
+
+      // Markers first (they cost an inode and free no bytes), then oldest payload first.
+      files.sort((a, b) => ((a[2] === 0 ? 0 : 1) - (b[2] === 0 ? 0 : 1)) || a[1] - b[1]);
+      const budget = this.cacheMaxBytes * 0.9;
+      let freed = 0, gone = 0, markers = 0, capped = false;
+      for (const [p, , sz] of files) {
+        if (sz > 0 && total - freed <= budget) break;
+        if (gone >= SWEEP_CAP) { capped = true; break; }
+        try { await fs.promises.rm(p, { force: true }); } catch { continue; }
+        freed += sz; gone++;
+        if (sz === 0) markers++;
+        if (gone % 250 === 0) await null;
+      }
+      this.stats.cachePruned += gone;
+      this.baseBytes = total - freed;
+      this.stats.cacheBytes = this.baseBytes + this.writtenBytes;
+      this.stats.sweeps++;
+      this.stats.sweepMs = Date.now() - t0;
+      const ms = this.stats.sweepMs;
+      console.log(`  cache: reconciled ${files.length} files (${(total / 1e9).toFixed(2)} GB) in ${ms} ms `
+        + `without blocking: dropped ${markers} empty markers and ${gone - markers} payloads `
+        + `(${(freed / 1e6).toFixed(1)} MB freed)` + (capped ? `, capped at ${SWEEP_CAP} - run `
+          + 'tools/cache-prune.mjs for the rest' : ''));
+      return { files: files.length, bytes: total, dropped: gone, markers, ms, capped };
+    })();
+    this._sweep.finally(() => { this._sweep = null; });
+    return this._sweep;
   }
 }
 

@@ -4,19 +4,29 @@ rem   1. keep it up, and
 rem   2. record *why* it went away - a node process that disappears with no stack in the log is
 rem      otherwise unanswerable. The launch/exit lines below timestamp every death and its code.
 rem      (worldd itself also prints a 60 s heartbeat and an exit line; see server/worldd.mjs.)
-rem Usage: tools\serve-worldd.cmd            (port 8765, all interfaces)
+rem Usage: tools\serve-worldd.cmd            (port 8765, all interfaces, pinned runtime)
 rem        tools\serve-worldd.cmd 8766      (different port)
+rem        tools\serve-worldd.cmd 8765 "C:\other\node.exe"   (override the runtime on purpose)
 setlocal enabledelayedexpansion
 set PORT=%1
 if "%PORT%"=="" set PORT=8765
+set NODE2=%~2
 cd /d "%~dp0.."
 
 rem Pin the runtime. PATH here can resolve to a per-tool node shim (pi-node\current) that gets
 rem replaced under us; when its DLLs go away node.exe dies with 0xC0000135 (DLL not found) before
 rem running a line of our code, which is exactly what build\worldd.log recorded 108 times on 11/05.
-set NODE=%NODE%
+rem
+rem An inherited NODE env var must NOT decide this. A supervisor started from an agent shell
+rem inherits that shell's NODE (its own runtime), and that shim is exactly the thing that gets
+rem replaced under us - the 11/07 worldd wedge ran on pi-node for exactly that reason. Only an
+rem explicit second argument may override the pin:  tools\serve-worldd.cmd 8765 "C:\path\to\node.exe"
+set NODE=!NODE2!
 if "!NODE!"=="" set "NODE=C:\Program Files\nodejs\node.exe"
-if not exist "!NODE!" set NODE=node
+if not exist "!NODE!" (
+  echo ==== supervisor: refused to start - no runtime at "!NODE!" ==== >> build\worldd.log
+  echo supervisor: no runtime at "!NODE!" - pass one as the second argument. & exit /b 1
+)
 echo ==== supervisor: runtime "!NODE!" at %DATE% %TIME% ==== >> build\worldd.log
 
 set STUCK=0

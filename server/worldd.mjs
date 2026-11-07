@@ -105,6 +105,17 @@ if (CACHE !== 'none' && num('cache-sweep', 1) !== 0) {
   if (r.files) console.log('  cache: swept ' + r.files + ' unreachable files, ' + (r.bytes / 1e9).toFixed(2) + ' GB');
 }
 
+// Reconcile the payload cache against its byte budget in the background, once, after the first requests
+// are being served. This used to happen inside the write path as a synchronous walk of the whole tree,
+// which is how a busy pan could freeze the server for over a minute (build/dbg-cachewalk.mjs timed that
+// walk at 98 s for 665 427 files). `--cache-reconcile 0` skips it; tools/cache-prune.mjs is the offline
+// version of the same job.
+if (CACHE !== 'none' && num('cache-reconcile', 1) !== 0) {
+  setTimeout(() => {
+    svc.sweepCacheBudget().catch((e) => console.log('  cache: reconcile failed: ' + (e.message ?? e)));
+  }, 5000).unref();
+}
+
 function levelSummary() {
   try {
     const dat = zlib.gunzipSync(fs.readFileSync(path.join(WORLD, 'level.dat')));
@@ -135,6 +146,11 @@ function send(req, res, code, body, type, extra = {}) {
   }
   headers['Content-Length'] = body ? body.length : 0;
   headers['Content-Type'] = type ?? 'application/octet-stream';
+  // Stash the size where it is known: by the time 'finish' fires, getHeader('Content-Length') is not a
+  // reliable read on every Node, and a NaN there used to zero the whole byte column of /stats. This is
+  // the payload size, before the gzip this same function may apply - it answers "what is big", not
+  // "what hit the wire".
+  res.__sent = body ? body.length : 0;
   res.writeHead(code, headers);
   res.end(body);
 }
@@ -151,15 +167,62 @@ function serveFile(res, req, file) {
   send(req, res, 200, body, type, { 'Cache-Control': cache });
 }
 
+// "The server stopped loading chunks" used to be unanswerable from the log: there were global counters
+// but no per-path cost, so one request taking 30 s and the whole process being stuck for 30 s looked
+// identical (and both were true at different times). Now every path is counted, anything slower than
+// --slow-ms is logged with the parameters that reproduce it, and the heartbeat names whatever request
+// has been in flight for more than two seconds.
+const SLOW_MS = num('slow-ms', 400);
+const REQ = new Map();            // path -> { n, ms, max, bytes, slow }
+const INFLIGHT = new Map();       // seq -> { tag, since }
+let reqSeq = 0;
+
+// Just enough of the query to replay the request; the asset and vendor paths carry nothing useful.
+function reqTag(u) {
+  const q = u.searchParams, p = u.pathname;
+  if (p === '/voxels' || p === '/shells') {
+    return `${p} ${q.get('dim') ?? '-'} ${q.get('cx0')},${q.get('cz0')} ${q.get('w')}x${q.get('h')}`;
+  }
+  if (p === '/lod') return `${p} ${q.get('dim') ?? '-'} cell=${q.get('cell')} ${q.get('rx')},${q.get('rz')}`;
+  if (p === '/voxel' || p === '/shell') return `${p} ${q.get('dim') ?? '-'} ${q.get('cx')},${q.get('cz')}`;
+  return p;
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
   const q = u.searchParams;
+  const seq = ++reqSeq;
+  const tag = reqTag(u);
+  const t0 = performance.now();
+  INFLIGHT.set(seq, { tag, since: t0 });
+  let counted = false;
+  const count = () => {
+    if (counted) return;
+    counted = true;
+    INFLIGHT.delete(seq);
+    const ms = performance.now() - t0;
+    const e = REQ.get(u.pathname) ?? { n: 0, ms: 0, max: 0, bytes: 0, slow: 0 };
+    e.n++; e.ms += ms; e.bytes += res.__sent ?? 0;
+    if (ms > e.max) e.max = ms;
+    if (ms >= SLOW_MS) e.slow++;
+    REQ.set(u.pathname, e);
+    if (ms >= SLOW_MS) {
+      console.log(`  slow ${tag}: ${ms.toFixed(0)} ms, ${((+res.getHeader('Content-Length') || 0) / 1024).toFixed(0)} KB, code ${res.statusCode}`);
+    }
+  };
+  res.on('finish', count);
+  res.on('close', count);
   try {
     // Where the time actually goes: a decode is 25 ms of work hidden behind a 0.1 ms file read, and
     // a regionOpen means the payload cache did not absorb the request.
     if (u.pathname === '/stats') {
-      send(req, res, 200, JSON.stringify({ ...svc.stats, packsOpen: svc.packs.size }),
-        'application/json');
+      const byPath = {};
+      for (const [p, e] of REQ) {
+        byPath[p] = { n: e.n, ms: +e.ms.toFixed(0), max: +e.max.toFixed(0), slow: e.slow,
+          kb: +(e.bytes / 1024).toFixed(0) };
+      }
+      send(req, res, 200, JSON.stringify({ ...svc.stats, packsOpen: svc.packs.size,
+        inflight: INFLIGHT.size, byPath }), 'application/json');
       return;
     }
     if (u.pathname === '/meta') {
@@ -272,11 +335,28 @@ const T0 = Date.now();
 const HEARTBEAT = Math.max(0, +arg('heartbeat', 60));
 if (HEARTBEAT) {
   let prev = { ...svc.stats };
+  // A 1 s timer that only stamps the time is how the loop gets watched: if the callback lands late, the
+  // loop was blocked, and by how much. That is the difference between "the server is slow" and "the
+  // server is stuck", which is the question the 11/07 incident was about.
+  let lastTick = Date.now(), lagMax = 0;
+  setInterval(() => {
+    const now = Date.now();
+    lagMax = Math.max(lagMax, now - lastTick - 1000);
+    lastTick = now;
+  }, 1000).unref();
   setInterval(() => {
     const d = [];
     for (const [k, v] of Object.entries(svc.stats)) { if (v !== prev[k]) d.push(`${k}+${v - prev[k]}`); prev[k] = v; }
+    let reqN = 0, slowN = 0;
+    for (const e of REQ.values()) { reqN += e.n; slowN += e.slow; }
+    // Name the stuck requests, not just that something is stuck: one line saying `/voxels ... 64x64 has
+    // been running for 41 s` turns a bug hunt into a bug.
+    const stuck = [...INFLIGHT.values()].filter((v) => performance.now() - v.since > 2000)
+      .map((v) => `${v.tag} ${(Math.round((performance.now() - v.since) / 100) / 10)}s`);
     console.log(`hb ${Math.round((Date.now() - T0) / 1000)}s rss=${(process.memoryUsage().rss / 1048576).toFixed(0)}MB` +
-      ` packs=${svc.packs.size}${d.length ? ' ' + d.join(' ') : ''}`);
+      ` packs=${svc.packs.size} lagMax=${lagMax}ms reqs=${reqN}${slowN ? ` slow=${slowN}` : ''}` +
+      `${d.length ? ' ' + d.join(' ') : ''}${stuck.length ? ` INFLIGHT ${stuck.join(' | ')}` : ''}`);
+    lagMax = 0;
   }, HEARTBEAT * 1000).unref();
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) {

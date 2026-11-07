@@ -31,6 +31,10 @@ const svcIn = (dir, extra = {}) => new WorldService('DarkRPG/world', ids, dir, {
 const HIT = [2, 2];
 // A chunk slot inside the present region range that the save left empty.
 const MISS = [400, -400];
+// A hole inside a region file that *exists*: measured with build/find-hole.mjs, 294 of the 437 overworld
+// region files are only partly filled (r.-4.18.mca holds 1 chunk of its 1024 slots), which is exactly
+// what the camera sweeps when it pulls far back. This is the case that used to leave a file behind.
+const HOLE = [-128, 576];
 
 test('cache round trip: a stored payload opens as the chunk that was decoded', () => {
   const dir = path.join(tmpRoot, 'rt');
@@ -66,6 +70,82 @@ test('cache: an empty chunk slot is remembered, not re-probed', () => {
   const b = svcIn(dir);
   assert.equal(b.chunkBytes('minecraft:overworld', MISS[0], MISS[1]), null);
   assert.equal(b.stats.decodes, 0, 'a recorded hole must not cost another region read');
+});
+
+// The 11/07 incident. Pulling far back in the viewer sweeps thousands of unwritten chunk slots a second,
+// and each one used to cost a stat of the cache path plus a 0-byte "no such chunk" marker file. That is
+// how build/cache reached 665 427 files for 1.42 GB (411 776 of them empty), and the cache bound could
+// only be enforced by walking those files - 98 s of blocked event loop, which to anyone looking at the
+// map was a server that had died. Absence now comes from the region header, which is already in memory.
+test('a hole costs no file: absence is answered from the region header', () => {
+  const dir = path.join(tmpRoot, 'holes');
+  const svc = svcIn(dir);
+  const N = 24;
+  let nulls = 0;
+  for (let dz = 0; dz < N; dz++) {
+    for (let dx = 0; dx < N; dx++) {
+      if (svc.chunkBytes('minecraft:overworld', HOLE[0] + dx, HOLE[1] + dz) === null) nulls++;
+    }
+  }
+  assert.ok(nulls >= N * N - 4, `an unwritten corner should be nearly all holes, got ${nulls} of ${N * N}`);
+  assert.ok(svc.stats.holes >= N * N - 4, `the holes are counted as holes, saw ${svc.stats.holes}`);
+  assert.equal(svc.stats.cacheWrites, 0, 'a hole must not leave a file behind');
+  assert.equal(svc.stats.decodes, 0, 'a hole must not decode anything');
+  assert.ok(svc.stats.regionOpens <= 2, `one 24x24 box sits in one region, saw ${svc.stats.regionOpens} opens`);
+  // And the cache directory must not even have been created for this dimension.
+  const dimDir = path.join(dir, String(svc.tableTag), svc.lightTag, 'region');
+  const left = fs.existsSync(dimDir) ? fs.readdirSync(dimDir) : [];
+  assert.equal(left.length, 0, `hole lookups left ${left.length} files behind`);
+
+  // The other half: a region file that is not there at all. The negative answer is remembered, so the
+  // second lookup does not stat the path again either.
+  const m = svcIn(dir);
+  assert.equal(m.chunkBytes('minecraft:overworld', MISS[0], MISS[1]), null);
+  const opens = m.stats.regionOpens;
+  assert.equal(m.chunkBytes('minecraft:overworld', MISS[0] + 1, MISS[1] + 1), null);
+  assert.equal(m.stats.regionOpens, opens, 'a missing region stays a known-missing region');
+  assert.equal(m.stats.cacheWrites, 0, 'a missing region must not leave marker files either');
+});
+
+test('the cache bound evicts what this server wrote, oldest first, and never walks the tree', () => {
+  const dir = path.join(tmpRoot, 'lru');
+  const svc = svcIn(dir, { cacheMaxBytes: 40000 });
+  const wrote = [];
+  for (let i = 0; i < 12; i++) {
+    const b = svc.chunkBytes('minecraft:overworld', i, 7);
+    if (b) wrote.push(path.join(dir, String(svc.tableTag), svc.lightTag, 'region', `${i}_7.bin`));
+  }
+  assert.ok(wrote.length >= 6, 'need several real payloads to evict');
+  assert.ok(svc.stats.cachePruned > 0, 'over budget must evict, not just grow');
+  assert.equal(svc.stats.sweeps, 0, 'the request path must not run a reconcile sweep');
+  assert.ok(fs.existsSync(wrote[wrote.length - 1]), 'the newest payload stays');
+  assert.ok(!fs.existsSync(wrote[0]), 'the oldest payload goes');
+  assert.ok(svc.stats.cacheBytes <= 40000, `cache estimate ${svc.stats.cacheBytes} over budget`);
+});
+
+test('sweepCacheBudget clears 0-byte markers off the event loop, payloads only when over budget', async () => {
+  const dir = path.join(tmpRoot, 'sweep');
+  const svc = svcIn(dir, { cacheMaxBytes: 20000 });
+  const root = path.join(dir, String(svc.tableTag), svc.lightTag, 'region');
+  fs.mkdirSync(root, { recursive: true });
+  for (let i = 0; i < 1200; i++) fs.writeFileSync(path.join(root, `h_${i}.bin`), Buffer.alloc(0));
+  for (let i = 0; i < 20; i++) fs.writeFileSync(path.join(root, `p_${i}.bin`), Buffer.alloc(2000, 7));
+
+  // Proof it does not run as one blocking pass: a queued continuation has to get a turn while it works.
+  let yielded = false;
+  setImmediate(() => { yielded = true; });
+  const r = await svc.sweepCacheBudget();
+  assert.ok(yielded, 'a sweep must hand the event loop back, not run 1 200 stats in one pass');
+  assert.equal(r.files, 1220, 'it saw every file');
+  const left = fs.readdirSync(root);
+  assert.equal(left.filter((f) => f.startsWith('h_')).length, 0, 'empty markers buy nothing: all gone');
+  const payloads = left.filter((f) => f.startsWith('p_')).length;
+  assert.ok(payloads < 20 && payloads > 0, `expected partial payload eviction, kept ${payloads}`);
+  assert.ok(svc.stats.cacheBytes <= 20000, `still over budget: ${svc.stats.cacheBytes}`);
+  assert.equal(svc.stats.sweeps, 1);
+  // A second call while nothing changed must not stack another sweep up (single-flight guard).
+  const [x, y] = await Promise.all([svc.sweepCacheBudget(), svc.sweepCacheBudget()]);
+  assert.equal(svc.stats.sweeps, 2, 'the two concurrent calls share one sweep');
 });
 
 test('cache size cap evicts old payloads instead of filling the disk', () => {

@@ -99,3 +99,21 @@ test('a pack baked after the server started stops being remembered as missing', 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an empty far block costs work, not event-loop turns', async () => {
+  // 64x64 of ground that was never written: ~10 ms of header reading. Counting yields by slot count put
+  // 85 `setImmediate` turns inside it, and each turn queued behind whatever else was in flight, which
+  // is how an empty tile came back in 435 ms (build/dbg-farpan.mjs, 11/07).
+  const s = svc();
+  let ticks = 0, stop = false;
+  const tick = async () => { while (!stop) { await new Promise((r) => setImmediate(r)); ticks++; } };
+  const t = tick();
+  const t0 = performance.now();
+  const buf = await s.shellBatchBytesAsync(DIM, -9000, 5000, 64, 64);
+  const ms = performance.now() - t0;
+  stop = true;
+  await t;
+  assert.ok(buf.length > 8, 'an empty block is still a batch of empty frames');
+  assert.ok(ms < 250, `64x64 of unwritten ground took ${ms.toFixed(0)} ms`);
+  assert.ok(ticks < 60, `the batch cost ${ticks} event-loop turns for ${ms.toFixed(0)} ms`);
+});
