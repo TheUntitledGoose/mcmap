@@ -220,6 +220,8 @@ row also has a URL parameter, so a view is a link:
 ?time=1               the time machine; ?timecls=2 (kind), ?timeplay=0 (paused),
                       ?timelook=blocks|plates|tiles, ?timegeommb=128, ?timetiles=0,
                       ?timeterrain=0 (undo the log in the voxels), ?hover=0
+?nocov=1              stop using the region listing: ask for every tile again (the pan A/B)
+?groundttl=120000     how long the page believes that listing, ms
 ?debug=1              instrument panel and HUD
 ```
 
@@ -231,8 +233,8 @@ the knobs that are only interesting while measuring.
 ## Tests and measurement
 
 ```bash
-npm test                # 384 tests: formats, codecs, stores, mesher, lighting, collision,
-                        # pool split, ledger, coverage, HTTP endpoints
+npm test                # 388 tests: formats, codecs, stores, mesher, lighting, collision,
+                        # pool split, ledger, region coverage, HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds
 npm run browser:probe   # headless Chromium against a live server: eval, framebuffer, shot
 node tools/mprobe.mjs --shot N url          # A/B two URLs by pixel band difference

@@ -34,6 +34,12 @@ export class ShellStore {
     // enforces has actually changed.
     this.evCx = null; this.evCz = null; this.evLimit = -1;
     this.evSweeps = 0; this.evSkipped = 0; this.evVisited = 0;
+    // Same region-coverage answer ChunkStore uses (an object with hasAny(cx0, cz0, w, h)). A skin
+    // asks for a far wider square than the detail ring - 37 000 chunk slots over this save's extent -
+    // and 75 % of the region cells inside its bounding box were never written. Absence from that
+    // answer is an optimisation, never truth: unknown listing says ground.
+    this.coverage = opts.coverage ?? null;
+    this.covSkipped = 0; this.covSlots = 0;
     this.listeners = [];
   }
 
@@ -61,6 +67,10 @@ export class ShellStore {
         const h = Math.min(this.tile, z1 - ty + 1);
         const id = `${tx},${ty},${w},${h}`;
         if (this.pending.has(id) || this.queued.has(id)) continue;
+        if (this.coverage && !this.coverage.hasAny(tx, ty, w, h)) {
+          this.covSkipped++; this.covSlots += w * h;      // a shell tile is 16x16: usually one region cell
+          continue;
+        }
         let need = 0;
         for (let dz = 0; dz < h; dz++) {
           for (let dx = 0; dx < w; dx++) {

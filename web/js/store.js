@@ -45,6 +45,15 @@ export class ChunkStore {
     this.onDirty = opts.onDirty ?? null;
     this.center = null;
     this.missing = new Set();              // confirmed-empty coordinates, so we stop asking
+    // Which region files the save has, in the shape of `shared/regionbits.mjs`'s reader: an object
+    // with hasAny(cx0, cz0, w, h). A save's bounding box is mostly unwritten ground (the overworld
+    // spans 1,734 region cells and holds 437 files), and a tile inside a rectangle that was never
+    // written still costs a request, a round trip, a queue slot and an all-empty frame. Absence from
+    // this answer is an optimisation, never truth: while the listing is unknown the caller says
+    // "ground" and the request goes out.
+    this.coverage = opts.coverage ?? null;
+    this.covSkipped = 0;                   // tiles never fetched because coverage answered them
+    this.covSlots = 0;                     // chunk slots inside those tiles
     this.listeners = [];
   }
 
@@ -82,6 +91,12 @@ export class ChunkStore {
         const h = Math.min(this.tile, z1 - ty + 1);
         const id = `${tx},${ty},${w},${h}`;
         if (this.pending.has(id) || this.queued.has(id)) continue;
+        // Coverage before the need scan: over unwritten ground the scan itself is the whole cost, and
+        // its answer is already known. A tile that only touches covered ground still goes out.
+        if (this.coverage && !this.coverage.hasAny(tx, ty, w, h)) {
+          this.covSkipped++; this.covSlots += w * h;
+          continue;
+        }
         // Only queue tiles that still have something to fetch. Without this, an idle renderer
         // calling request() every frame would re-download the whole neighbourhood forever -
         // and a camera parked over ungenerated chunks would hammer the same 404 holes.

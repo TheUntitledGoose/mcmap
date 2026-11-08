@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { packChunk } from '../server/chunk-payload.mjs';
 import { packBatch } from '../server/world-service.mjs';
 import { ChunkStore } from '../web/js/store.js';
+import { makeReader, packCells } from '../shared/regionbits.mjs';
 
 const toAB = (buf) => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 
@@ -263,4 +264,54 @@ test('a held chunk outside the sharp ring is offered exactly once, so the ring n
   // stable forever, and `dirty 0` claimed the queue was calm (build/q_ringscan.js).
   store.center = [6, 6];
   assert.equal(store.dirty.size, 0, 'a centre change marks nothing by itself');
+});
+
+// ---- region coverage: stop asking for ground this save never wrote -----------
+// The same rule the server answers /voxels with: a save's bounding box is mostly unwritten, and a
+// tile inside a rectangle that was never written still costs a request, a round trip, a queue slot
+// and an all-empty frame. Absence here is an optimisation, never truth, so the tests also check the
+// two directions where skipping would be a bug: a tile that only touches covered ground, and a
+// store with no coverage answer at all.
+
+/** Coverage grid matching `present()`: the four region cells its chunks live in. */
+const presentRegions = () => makeReader(packCells(
+  [[-1, -1], [-1, 0], [0, -1], [0, 0]].map(([rx, rz]) => ({ rx, rz }))));
+
+test('a tile inside unwritten ground is answered locally, not fetched', async () => {
+  const calls = stubFetch();
+  const store = new ChunkStore('minecraft:overworld', { tile: 3, coverage: presentRegions() });
+  store.request(200, 200, 3);                  // far outside the save's own region cells
+  await drain(store);
+  assert.equal(calls.length, 0, 'nothing was asked for');
+  assert.equal(store.loaded, 0);
+  assert.equal(store.covSkipped, 9, 'a 7x7 box at tile 3 is nine tiles');
+  assert.equal(store.covSlots, 49, 'and every chunk slot in it is counted exactly once');
+  assert.equal(store.missing.size, 0, 'a known-absent region never enters the hole set');
+  // an idle renderer keeps asking: still nothing to fetch, and no new traffic
+  store.request(200, 200, 3);
+  await drain(store);
+  assert.equal(calls.length, 0, 'idle over void costs no requests');
+});
+
+test('coverage never hides ground: covered and straddling tiles still go out', async () => {
+  const calls = stubFetch();
+  const store = new ChunkStore('minecraft:overworld', { tile: 6, coverage: presentRegions() });
+  store.request(0, 0, 2);                      // wholly inside covered ground
+  await drain(store);
+  assert.ok(store.loaded > 0, 'covered ground is fetched as before');
+  const inside = calls.length;
+  // z 25..33: the tile at ty=31 covers chunk rows 31 (region rz=0, covered) and 32-33 (rz=1, not).
+  store.request(0, 29, 4);
+  await drain(store);
+  assert.ok(calls.length > inside, 'a tile that only touches covered ground is still fetched');
+  assert.ok(store.missing.has('0,32'), 'and its holes are learned from the empty frames');
+});
+
+test('no coverage answer means every tile is ground - the skip is the integration, not the store', async () => {
+  const calls = stubFetch();
+  const store = new ChunkStore('minecraft:overworld', { tile: 3 });
+  store.request(200, 200, 3);
+  await drain(store);
+  assert.ok(calls.length >= 4, `uninformed store asks anyway: ${calls.length}`);
+  assert.ok(store.missing.size > 0, 'and learns the holes the slow way');
 });

@@ -9,6 +9,7 @@ import { ShellStore } from '../web/js/shell-store.js';
 import { shellFrameCols } from '../server/shell.mjs';
 import { packBatch } from '../server/world-service.mjs';
 import { SHELL_COLS, HEIGHT_BIAS } from '../shared/chunk-format.mjs';
+import { makeReader, packCells } from '../shared/regionbits.mjs';
 
 const N = SHELL_COLS;
 // A plausible column set: rolling ground, grass paint, one block of skin thickness, day light.
@@ -99,4 +100,39 @@ test('confirmed holes expire with the box too', async () => {
     assert.ok(Math.abs(mx - 200) <= 6 && Math.abs(mz) <= 6, `hole ${k} expired with the box`);
   }
   assert.ok(urls.length >= 2, 'the fake server was actually asked twice');
+});
+
+test('the skin stops asking for region cells this save never wrote', async () => {
+  const { urls } = fakeServer();
+  // Only region cell (0,0) exists. A tile of 16x16 chunks sits entirely inside one region cell, so
+  // the answer is exact for the skin - and the skin is the layer that asks the most: one 8-hop pan
+  // asked for 943 shell tiles against 65 voxel tiles (build/q_covpan.js).
+  const cov = makeReader(packCells([{ rx: 0, rz: 0 }]));
+  const st = new ShellStore('minecraft:overworld', { tile: 16, keep: 2, maxConcurrent: 4, coverage: cov });
+  st.request(0, 0, 40, 0);                       // 81x81 chunks: five tiles per edge
+  await settle(st);
+  // The expectation is the same tile walk the store does, written out here so a wrong tile size or a
+  // wrong floor-division in the coverage answer shows up as a number instead of a shrug.
+  let tiles = 0, skip = 0, skipSlots = 0;
+  for (let ty = -40; ty <= 40; ty += 16) {
+    for (let tx = -40; tx <= 40; tx += 16) {
+      const w = Math.min(16, 41 - tx), h = Math.min(16, 41 - ty);
+      tiles++;
+      if (!cov.hasAny(tx, ty, w, h)) { skip++; skipSlots += w * h; }
+    }
+  }
+  assert.ok(skip > tiles / 2, `this skin square is mostly unwritten ground: ${skip}/${tiles} tiles`);
+  assert.equal(st.covSkipped, skip, 'skipped exactly the tiles the listing answered empty');
+  assert.equal(st.covSlots, skipSlots, 'and each chunk slot of a skipped tile exactly once');
+  assert.equal(urls.length, tiles - skip, 'the covered tiles were asked for, and nothing else');
+  const asked = urls.length;
+  st.request(0, 0, 40, 0);
+  await settle(st);
+  assert.equal(urls.length, asked, 'idle over void costs the skin no requests');
+  // Fail open: with no answer at all, everything is ground.
+  const blind = new ShellStore('minecraft:overworld', { tile: 16, keep: 2, maxConcurrent: 4 });
+  blind.request(0, 0, 40, 0);
+  await settle(blind);
+  assert.equal(blind.covSkipped, 0, 'no coverage, no skipping');
+  assert.ok(urls.length > asked, 'and the tiles go out anyway');
 });

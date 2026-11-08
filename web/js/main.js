@@ -31,6 +31,7 @@ import { EYE_DIST, PITCH_LIMIT, look as walkLook, wish as walkWish, rising as wa
 import { BODY, C_FULL, C_PASS, C_UNKNOWN, FALL_MAX, FLY_V, SPRINT, WALK, dropToClear, newPlayer, place as placePlayer,
   simulate as simulatePlayer, floorTop as playerFloorTop, hits as playerHits } from '../../shared/player.mjs';
 import { makeCellAt } from './collision.js';
+import { fromWire, makeReader } from '../../shared/regionbits.mjs';
 // M12: the block-history overlay - "who placed this, and can I find it". The log holds 424,599 rows
 // for a 3.6 GB world, and only 20,322 of the overworld's 284,239 chunks were ever touched, so the page
 // gets a sparse table (34 B per touched chunk, 691 KB for the whole overworld) and asks for one chunk's
@@ -266,6 +267,12 @@ const S = {
   // a whole worker round trip. ?keepmesh=0 restores that flicker for an A/B of the flicker, not of the
   // geometry: the triangles that land are the same either way.
   keepMesh: num('keepmesh', 1) ? 1 : 0,
+  // Which region files this save has, fetched once per dimension from /regions (637 bytes for the
+  // overworld), so the store never asks for a tile of ground this world never had. Over the bounding
+  // box that is 75 % of the map, and a camera parked over void used to spend its whole queue on it.
+  // ?nocov=1 turns the answer off again for an A/B of request volume.
+  groundCov: params.has('nocov') ? 0 : 1,
+  groundTtlMs: Math.max(5000, num('groundttl', 120000)),  // how long one "no ground here" is believed
   // A face pointing at a chunk whose voxels are not held, but whose ground the heightmap skin paints,
   // is behind that skin. Drawing it is the wall of dirt a hole grows when a neighbour never arrived.
   // ?cullcovered=0 puts the walls back to compare.
@@ -3250,6 +3257,9 @@ function frameBody(now) {
     requestAround();
   }
   lap('refill');
+  // The coverage listing ages on both ends: the server re-reads its directory after 30 s, and a
+  // region file that appears later has to stop being a hole in the page's answer too.
+  groundMaybeRefresh(now);
   // The baked far layer goes in before the live layers, and against a fresh clock instead of the
   // frame's own start. Its work is a fetch plus a buffer upload, and it is the one stage whose
   // output makes every other stage cheaper. Left at the end of the frame it starved: a frame that
@@ -5845,6 +5855,9 @@ window.__world = {
   switchDim,
   dims: () => (meta?.dims ?? []).map((d) => d.id),
   dim: () => currentDim(),
+  ground: groundDiag,
+  groundReload: () => groundLoad(currentDim()),
+  groundAsk: (cx, cz) => ({ has: GROUND.has(cx, cz), known: !!GROUND.reader }),
 };
 
 // ---- settings --------------------------------------------------------------
@@ -5980,6 +5993,78 @@ function fitWorld() {
   rig.dist = S.maxZoom;
 }
 
+// ---- region coverage -------------------------------------------------------
+// Which (rx,rz) region files this save actually has.
+//
+// A save's bounding box is not its coverage: the overworld spans 1,734 region cells and holds 437
+// files, so three quarters of the box is ground that was never written. The server already answers a
+// tile inside such a rectangle with an all-empty batch, but the page still pays the request, the
+// round trip and the queue slot - and for a camera parked over void that empty queue work is all it
+// ever has. One 637-byte fetch lets the store answer "nothing can be here" locally.
+//
+// The rule that keeps this safe, same as the server's: absence here is an optimisation, never truth.
+// While the listing is unknown - not fetched yet, a failed fetch, a dimension the server does not
+// know - the answer is "ground" and the request goes out. So the listing also has to age: see
+// groundMaybeRefresh, and note that a load clears the reader before it re-asks, because an answer
+// for the dimension we just left is not an answer about this one.
+const GROUND = {
+  reader: null,          // makeReader() over the packed grid, or null while unknown
+  dim: '', gen: 0, err: '', atMs: 0, ms: 0, cells: 0, w: 0, h: 0, x0: 0, z0: 0,
+  inflight: 0, loads: 0,
+  // The store asks through these two, so a dimension switch or a late answer needs no re-wiring.
+  hasAny: (cx0, cz0, cw, ch) => (GROUND.reader ? GROUND.reader.hasAny(cx0, cz0, cw, ch) : true),
+  has: (cx, cz) => (GROUND.reader ? GROUND.reader.has(cx, cz) : true),
+};
+
+async function groundLoad(id = currentDim()) {
+  const gen = ++GROUND.gen;
+  GROUND.reader = null;                    // fail open while asking, whatever it said before
+  GROUND.inflight++;
+  const t0 = performance.now();
+  try {
+    const r = await fetch(`/regions?dim=${encodeURIComponent(id)}`);
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const wire = await r.json();
+    if (gen !== GROUND.gen) return null;   // an answer about a dimension we already left
+    GROUND.reader = makeReader(fromWire(wire));
+    GROUND.dim = id;
+    GROUND.cells = wire.cells ?? 0;
+    GROUND.w = wire.w ?? 0; GROUND.h = wire.h ?? 0;
+    GROUND.x0 = wire.x0 ?? 0; GROUND.z0 = wire.z0 ?? 0;
+    GROUND.err = '';
+    GROUND.atMs = performance.now();
+    GROUND.ms = GROUND.atMs - t0;
+  } catch (e) {
+    // Fail open: the reader stays null, every tile is ground, and the diagnostic says why.
+    if (gen === GROUND.gen) { GROUND.reader = null; GROUND.err = String(e?.message ?? e); }
+  } finally {
+    GROUND.inflight--;
+    GROUND.loads++;
+  }
+  return groundDiag();
+}
+
+function groundDiag() {
+  return {
+    dim: GROUND.dim, known: !!GROUND.reader, cells: GROUND.cells,
+    grid: `${GROUND.w}x${GROUND.h}`, x0: GROUND.x0, z0: GROUND.z0,
+    err: GROUND.err, fetchMs: +GROUND.ms.toFixed(1), loads: GROUND.loads,
+    ageMs: GROUND.atMs ? Math.round(performance.now() - GROUND.atMs) : null,
+    inflight: GROUND.inflight, setting: !!S.groundCov, ttlMs: S.groundTtlMs,
+    // what the store did with the answer
+    skipped: store?.covSkipped ?? 0, slots: store?.covSlots ?? 0,
+    shellSkipped: shellStore?.covSkipped ?? 0, shellSlots: shellStore?.covSlots ?? 0,
+  };
+}
+
+/** True when this call started a fetch. Never more than one in flight, and never before the TTL. */
+function groundMaybeRefresh(now) {
+  if (!S.groundCov || GROUND.inflight) return false;
+  if (GROUND.atMs && now - GROUND.atMs < S.groundTtlMs) return false;
+  groundLoad(currentDim());
+  return true;
+}
+
 const storeOpts = () => ({
   tile: +(params.get('tile') ?? 6),
   // Evicting chunks the camera is about to look at again is how a view starts popping: keep
@@ -5988,6 +6073,7 @@ const storeOpts = () => ({
   // A dirty mark the store makes is a mesh job (tens of ms) waiting to happen, so the view box can
   // say which marks became work and which did not.
   onDirty: (k, why) => tagDirty(k, why),
+  coverage: S.groundCov ? GROUND : null,
 });
 
 function makeShellStore(dim) {
@@ -5996,6 +6082,10 @@ function makeShellStore(dim) {
     tile: +(params.get('shelltile') ?? 16),
     keep: +(params.get('shellkeep') ?? Math.max(4, S.skinCap + 2)),
     maxConcurrent: +(params.get('shellconc') ?? 3),
+    // The skin asks for a much wider square than the detail ring, so it is the layer that spends the
+    // most requests on ground this save never had: 943 shell tiles for one 8-hop pan, against 65
+    // voxel tiles. Same answer, same fail-open rule.
+    coverage: S.groundCov ? GROUND : null,
   });
   // The store tracks dirtiness per chunk (a new shell also changes its four neighbours' walls);
   // the renderer only cares about whole patches, so coarsen at the boundary.
@@ -6034,6 +6124,7 @@ function switchDim(id) {
     dropChunkMesh(cx, cz);
   }
   store = new ChunkStore(id, storeOpts());
+  groundLoad(id);                          // the old answer describes the dimension we just left
   applyDetailBudget();
 
   for (const e of [...shellMeshes.values()]) for (const m of [e.mesh, e.mesh2]) if (m) { shellGroup.remove(m); m.geometry.dispose(); }
@@ -6578,6 +6669,9 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     // dimension and it is what the screen shows while everything else streams in.
     if (S.overview) loadOverview(hud.dim.value);
     if (params.get('view') === 'flat') buildFlatView();
+    // Coverage before the first chunk request: over the overworld's bounding box, three quarters of
+    // the tiles a pan asks for were never written, and each one used to cost a round trip.
+    if (S.groundCov) await groundLoad(currentDim());
     store = new ChunkStore(currentDim(), storeOpts());
     applyDetailBudget();
     resize();
