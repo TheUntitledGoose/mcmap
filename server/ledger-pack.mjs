@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   CELL_BYTES, CELL_H_BYTES, CHUNK_BYTES, LEDPACK_HEADER, LEDPACK_MAGIC, LEDPACK_VERSION, MAX_PLAYERS_IN_MASK,
-  NCLASS, TL_HEADER, TL_MAGIC, TL_NO_PLAYER, TL_REC, TL_VERSION, tlPackCoord,
+  NCLASS, TL_HEADER, TL_MAGIC, TL_NO_PLAYER, TL_NO_SOURCE, TL_REC, TL_VERSION, tlPackCoord,
 } from '../shared/ledger-pack.mjs';
 import { HEIGHT_BIAS } from '../shared/chunk-format.mjs';
 
@@ -94,19 +94,42 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
   };
   const blockNameOf = (i) => intern(L.actionId(i) === 3 ? L.oldObjectId(i) : L.objectId(i));
   const wasNameOf = (i) => intern(L.oldObjectId(i));
+  // Source table: what CAUSED the row ('player', 'creeper', 'fluid', 'gravity', ...). This is here
+  // because a player's name on a row is not a body position: of this log's 123,232 player-attributed
+  // rows, 28,795 are a creeper blast, a wither skull, an end crystal or TNT that the player owns, and
+  // those sit a median 20 blocks (p90 166) from that player's nearest hand-attributed row. A timeline
+  // without the cause cannot tell the two apart, and a ghost would jump 166 blocks at p90.
+  const srcIdx = new Map();          // source string -> 0-based slot (255 is reserved for "none")
+  const srcList = [];
+  const internSrc = (key) => {
+    const s = key ? L.sources.get(key)?.id ?? '' : '';
+    if (!s) return TL_NO_SOURCE;
+    let n = srcIdx.get(s);
+    if (n === undefined) {
+      if (srcList.length >= TL_NO_SOURCE) throw new Error(`ledger pack ${dimKey}: source table overflow`);
+      n = srcList.push(s) - 1;
+      srcIdx.set(s, n);
+    }
+    return n;
+  };
   // Intern before allocating: the name table's byte size is part of the buffer size and of the header,
   // so it has to be finished before a single row is written.
   const tlName = new Uint16Array(tl.length);
   const tlWas = new Uint16Array(tl.length);
+  const tlSrc = new Uint8Array(tl.length).fill(TL_NO_SOURCE);
   for (let k = 0; k < tl.length; k++) {
     tlName[k] = blockNameOf(tl[k][2]);
     tlWas[k] = wasNameOf(tl[k][2]);
+    tlSrc[k] = internSrc(L.sourceId(tl[k][2]));
   }
   const nameBufs = nameList.map((s) => Buffer.from(s, 'utf8'));
   let namesBytes = 0;
   for (const b of nameBufs) namesBytes += b.length + 2;
+  const srcBufs = srcList.map((s) => Buffer.from(s, 'utf8'));
+  let srcBytes = 0;
+  for (const b of srcBufs) srcBytes += b.length + 2;
   const head = LEDPACK_HEADER + dimKeyBuf.length;
-  const tlSize = rows ? TL_HEADER + dimKeyBuf.length + namesBytes + rows * TL_REC : 0;
+  const tlSize = rows ? TL_HEADER + dimKeyBuf.length + namesBytes + srcBytes + rows * TL_REC : 0;
   const out = Buffer.alloc(head + list.length * (CELL_BYTES + CELL_H_BYTES)
     + list.length * CHUNK_BYTES + rows * 4 + tlSize);
   const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
@@ -169,9 +192,12 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
     dv.setUint32(p + 24, dimKeyBuf.length, true);
     dv.setUint32(p + 28, nameList.length, true);
     dv.setUint32(p + 32, namesBytes, true);
+    dv.setUint32(p + 36, srcList.length, true);
+    dv.setUint32(p + 40, srcBytes, true);
     dimKeyBuf.copy(out, p + TL_HEADER);
     p += TL_HEADER + dimKeyBuf.length;
     for (const b of nameBufs) { dv.setUint16(p, b.length, true); p += 2; b.copy(out, p); p += b.length; }
+    for (const b of srcBufs) { dv.setUint16(p, b.length, true); p += 2; b.copy(out, p); p += b.length; }
     for (let k = 0; k < tl.length; k++) {
       const [sec, ci, i] = tl[k];
       dv.setUint32(p, ci, true);
@@ -183,11 +209,12 @@ export function buildPack(L, worldId, dimKey, { heightOf = null } = {}) {
       dv.setUint32(p + 10, sec - (tMin === Infinity ? 0 : tMin), true);
       dv.setUint16(p + 14, tlName[k], true);
       dv.setUint16(p + 16, tlWas[k], true);
+      dv.setUint8(p + 18, tlSrc[k], true);
       p += TL_REC;
     }
   }
   return { buf: out, cellCount: list.length, rowCount: rows, tMin, tMax, tlBytes: tlSize,
-    nameCount: nameList.length };
+    nameCount: nameList.length, srcCount: srcList.length };
 }
 
 export const packPath = (dir, dimKey) => path.join(dir, `${dimKey}.ledpack`);

@@ -6,12 +6,13 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import test from 'node:test';
 import {
-  LEDPACK_MAGIC, LEDPACK_VERSION, NCLASS, TL_HEADER, TL_NO_PLAYER, TL_REC, TL_VERSION,
+  LEDPACK_MAGIC, LEDPACK_VERSION, NCLASS, TL_HEADER, TL_NO_PLAYER, TL_NO_SOURCE, TL_REC, TL_VERSION,
   decodeTimeline, readPack, tlSizes,
 } from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import { readLedger } from '../shared/ledger-format.mjs';
 import { fakeLog } from './fake-ledger.mjs';
+import { cutTimeline } from './tl-cut.mjs';
 
 // The log shape this file needs is the shared fake (tests/fake-ledger.mjs): the real reader's accessor
 // surface plus interned object ids, which is what the timeline's name column resolves through.
@@ -189,29 +190,85 @@ test('the timeline names the block each row is about, which is what lets terrain
   assert.throws(() => decodeTimeline(buf.subarray(P.tlBytes[0], P.tlBytes[0] + 60)), /bytes needed/);
 });
 
-test('an older pack still reads: v2 has no "was" column and v1 has no names at all', () => {
-  // Re-cut a baked v3 slice into v2 (16 B rows) and into v1 (28 B header, 14 B rows). A page that has
-  // not re-baked yet must keep working, with the missing columns answering empty rather than guessing.
-  const L = fakeLog([[1, 5, 64, 5, 2, 2, T(40), 'minecraft:stone', 'minecraft:dirt']]);
+test('an older pack still reads: v3 has no cause, v2 no "was", v1 no names at all', () => {
+  // Re-cut a built v4 slice into v3 (18 B rows, no source), v2 (16 B, no "was") and v1 (28 B header,
+  // 14 B rows, no names). A page that has not re-baked yet must keep working, with the missing columns
+  // answering unknown rather than guessing - and "unknown cause" must mean NO body may stand there.
+  const L = fakeLog([[1, 5, 64, 5, 2, 2, T(40), 'minecraft:stone', 'minecraft:dirt', 'player']]);
   const { buf } = buildPack(L, 1, 'region');
   const P = readPack(buf);
-  const src = new Uint8Array(buf.subarray(P.tlBytes[0], P.tlBytes[1]));
-  const dv = new DataView(src.buffer, src.byteOffset, src.byteLength);
-  const headEnd = TL_HEADER + dv.getUint32(24, true) + dv.getUint32(32, true);
+  const src = buf.subarray(P.tlBytes[0], P.tlBytes[1]);
 
-  const v2 = new Uint8Array(headEnd + 16);
-  v2.set(src.subarray(0, headEnd), 0);
-  v2.set(src.subarray(headEnd, headEnd + 16), headEnd);
-  new DataView(v2.buffer).setUint32(8, 2, true);
-  const t2 = decodeTimeline(v2);
-  assert.equal(t2.count, 1);
+  const t4 = decodeTimeline(src);
+  assert.deepEqual(tlSizes(4), { head: TL_HEADER, rec: TL_REC });
+  assert.equal(t4.srcOf(0), 'player');
+
+  const t3 = decodeTimeline(cutTo(src, 3));
+  assert.equal(t3.count, 1);
+  assert.equal(t3.nameOf(0), 'minecraft:stone');
+  assert.equal(t3.wasOf(0), 'minecraft:dirt');
+  assert.equal(t3.srcOf(0), '', 'a v3 pack cannot say what caused a row');
+  assert.equal(t3.byHand(0), false, 'so it must not be read as if it could');
+
+  const t2 = decodeTimeline(cutTo(src, 2));
   assert.equal(t2.nameOf(0), 'minecraft:stone');
   assert.equal(t2.wasOf(0), '', 'v2 knows nothing about what a place covered');
 
-  assert.throws(() => tlSizes(4), /timeline version 4/, 'a version nobody wrote is an error');
+  const t1 = decodeTimeline(cutTo(src, 1));
+  assert.equal(t1.count, 1);
+  assert.equal(t1.nameOf(0), '', 'v1 has no name table at all');
+
+  assert.throws(() => tlSizes(5), /timeline version 5/, 'a version nobody wrote is an error');
   assert.deepEqual(tlSizes(1), { head: 28, rec: 14 });
-  assert.deepEqual(tlSizes(2), { head: TL_HEADER, rec: 16 });
-  assert.deepEqual(tlSizes(TL_VERSION), { head: TL_HEADER, rec: TL_REC });
+  assert.deepEqual(tlSizes(2), { head: 36, rec: 16 });
+  assert.deepEqual(tlSizes(3), { head: 36, rec: 18 });
+});
+
+// Downgrading a built slice lives in one helper for the whole suite (tests/tl-cut.mjs): a second
+// hand-written copy of the header layout is how a back-compat test ends up reading a file that no
+// writer on this project would ever produce.
+const cutTo = (src, version) => cutTimeline(src, version);
+
+test('the timeline carries the CAUSE, because a player-attributed row is not a body position', () => {
+  // Measured over this save: 123,232 rows name a player, 94,437 of them were caused by that player's own
+  // hand, and the other 28,795 are a creeper blast / wither skull / end crystal / TNT they own - sitting a
+  // median 20 blocks, p90 166, from the nearest hand row. So the byte is what keeps a ghost honest.
+  const L = fakeLog([
+    [1, 5, 64, 5, 2, 2, T(10), 'minecraft:stone', 'minecraft:air', 'player'],
+    [1, 6, 64, 5, 3, 2, T(20), 'minecraft:air', 'minecraft:stone', 'creeper'],
+    [1, 7, 64, 5, 3, 2, T(30), 'minecraft:air', 'minecraft:stone', ''],
+    [1, 8, 64, 5, 3, 0, T(40), 'minecraft:air', 'minecraft:stone', 'fluid'],
+  ]);
+  const { buf } = buildPack(L, 1, 'region');
+  const P = readPack(buf);
+  const slice = buf.subarray(P.tlBytes[0], P.tlBytes[1]);
+  const TL = decodeTimeline(slice);
+  assert.equal(TL.version, TL_VERSION);
+  assert.deepEqual([...TL.srcNames].sort(), ['creeper', 'fluid', 'player']);
+  assert.equal(TL.srcOf(0), 'player');
+  assert.equal(TL.srcOf(1), 'creeper');
+  assert.equal(TL.srcOf(2), '', 'a row the log gives no cause for stays unknown');
+  assert.ok(TL.handSrc >= 0, "one table slot is 'player', found once at decode");
+  assert.deepEqual([0, 1, 2, 3].map((i) => TL.byHand(i)), [true, false, false, false],
+    'the creeper row names a player and is still not where that player stood');
+  assert.deepEqual([0, 1, 2, 3].map((i) => TL.src[i] === TL_NO_SOURCE), [false, false, true, false]);
+
+  // The cost, named: 8 header bytes, the source table, and one byte per row.
+  const v3 = cutTo(slice, 3);
+  let srcBytes = 0;
+  for (const s of TL.srcNames) srcBytes += 2 + Buffer.from(s, 'utf8').length;
+  assert.equal(slice.length - v3.length, 8 + srcBytes + TL.count, 'v4 = 8 header B + table + 1 B a row');
+  assert.equal(TL.names.length + TL.srcNames.length, 5, 'two block names, three causes');
+  assert.ok(v3.length > TL.count * 18);
+  assert.equal(srcBytes, 24, "'creeper' + 'fluid' + 'player', each with a u16 length");
+});
+
+test('a source table that will not fit the byte is a bake error, not a silently wrong name', () => {
+  const rows = [];
+  for (let i = 0; i < 256; i++) {
+    rows.push([1, i & 15, 64, 5, 2, 1, T(i), 'minecraft:stone', 'minecraft:air', `source_${i}`]);
+  }
+  assert.throws(() => buildPack(fakeLog(rows), 1, 'region'), /source table overflow/);
 });
 
 test('a timeline that stops short is refused, not read as a shorter history', () => {
@@ -283,7 +340,11 @@ test('the baked timeline is the same rows as the point query, reordered', (t) =>
   // Overworld that is 691 KB of heat versus 5.6 MB of playhead, so the heat layer must not carry it.
   let nameBytes = 0;
   for (const s of TL.names) nameBytes += 2 + Buffer.from(s, 'utf8').length;
-  assert.equal(P.tlBytes[1] - P.tlBytes[0], TL_HEADER + P.dimKey.length + nameBytes + TL.count * TL_REC);
+  let srcBytes = 0;
+  for (const s of TL.srcNames) srcBytes += 2 + Buffer.from(s, 'utf8').length;
+  assert.equal(P.tlBytes[1] - P.tlBytes[0],
+    TL_HEADER + P.dimKey.length + nameBytes + srcBytes + TL.count * TL_REC);
+  assert.ok(TL.srcNames.includes('player'), 'the overworld timeline can tell a hand from a blast');
   assert.ok(TL.names.length > 100, 'the overworld names a few hundred distinct blocks');
   assert.ok(P.tlBytes[1] - P.tlBytes[0] > 4.5e6, 'the overworld timeline is a few MB, not a rounding error');
 

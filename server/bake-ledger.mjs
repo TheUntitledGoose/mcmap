@@ -67,6 +67,29 @@ const svc = new WorldService(worldRoot, new Map(), '', {});
 const byId = new Map([...svc.dims].map(([id, d]) => [id, d]));
 
 const dims = [];
+
+// Presence facts, counted once here so the page can say what the log does NOT cover. A player's name
+// sits on rows a creeper caused as much as on rows their hand caused, and only the hand rows say where
+// that player stood - so "handRows" and their time range are what a scrubber needs before it draws a
+// body, and the difference between "nobody is here" and "the log says nothing about anybody here".
+const handSrc = [...L.sources].find(([, s]) => s.id === 'player')?.[0] ?? 0;
+const srcRows = new Map();          // source id -> rows over the whole log
+const presence = new Map();         // player id -> {rows, handRows, firstHandSec, lastHandSec}
+for (const [id] of L.players) presence.set(id, { rows: 0, handRows: 0, firstHandSec: null, lastHandSec: null });
+for (let i = 0; i < L.count; i++) {
+  const sid = L.sourceId(i);
+  srcRows.set(sid, (srcRows.get(sid) ?? 0) + 1);
+  const pid = L.playerId(i);
+  const h = pid ? presence.get(pid) : null;
+  if (!h) continue;
+  h.rows++;
+  if (sid === handSrc) {
+    h.handRows++;
+    const s = Math.floor(L.timeMs(i) / 1000);
+    if (h.firstHandSec === null || s < h.firstHandSec) h.firstHandSec = s;
+    if (h.lastHandSec === null || s > h.lastHandSec) h.lastHandSec = s;
+  }
+}
 const unmatched = [];
 for (const [worldId, w] of [...L.worlds].sort((a, b) => a[0] - b[0])) {
   const d = byId.get(w.id);
@@ -100,9 +123,15 @@ const meta = {
   players: [...L.players].map(([id, p]) => ({
     id, name: p.name,
     firstJoinMs: Number(p.firstJoinMs), lastJoinMs: Number(p.lastJoinMs),
+    ...(presence.get(id) ?? { rows: 0, handRows: 0, firstHandSec: null, lastHandSec: null }),
   })),
   actions: [...L.actions].map(([id, a]) => ({ id, name: a.id })),
-  sources: [...L.sources].length,
+  // Named, counted, biggest first: this is the list that says 130,347 rows are gravity and 36,661 are
+  // trample, i.e. why most of the log has nobody in it.
+  sources: [...L.sources]
+    .map(([id, s]) => ({ id, name: s.id, rows: srcRows.get(id) ?? 0 }))
+    .sort((a, b) => b.rows - a.rows),
+  handSource: handSrc ? L.sources.get(handSrc).id : null,
   objects: [...L.objects].length,
   totalRows: L.count,
   dims, unmatched,
@@ -114,3 +143,5 @@ fs.renameSync(`${path.join(outDir, 'meta.json')}.tmp`, path.join(outDir, 'meta.j
 for (const u of unmatched) console.log(`  (no pack) ${u.dimId}: ${u.reason}`);
 console.log(`ledger bake: ${L.count} rows, ${dims.length} packs in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
 console.log(`  wrote ${meta.dims.map((d) => `${d.pack} ${(d.bytes / 1024) | 0} KiB`).join(', ')}`);
+console.log(`  hand rows (source ${JSON.stringify(meta.handSource)}): ` +
+  meta.players.map((p) => `${p.name} ${p.handRows}`).join(', '));

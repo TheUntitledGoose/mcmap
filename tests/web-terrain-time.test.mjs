@@ -19,6 +19,7 @@ import zlib from 'node:zlib';
 import { readPack } from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import { fakeLog } from './fake-ledger.mjs';
+import { cutTimeline } from './tl-cut.mjs';
 
 const T = (s) => 1717174690000 + s * 1000;
 const AIR = 1, STONE = 2, DIRT = 3;
@@ -150,7 +151,7 @@ test('taking back a place uncovers what it covered, because the log recorded tha
   // not a hole. The ledger knows what a place covered - old_object_id is filled for all 90,045 overworld
   // place rows - and timeline v3 carries it as a second name column.
   const { tl, ph } = timeline([[1, 4, 70, 4, 2, 1, T(200), 'minecraft:dirt', 'minecraft:stone']]);
-  assert.equal(tl.version, 3, 'the bake writes v3 rows');
+  assert.ok(tl.version >= 3, `the bake writes rows that carry the covered block (v${tl.version})`);
   assert.equal(tl.nameOf(0), 'minecraft:dirt', 'what arrived');
   assert.equal(tl.wasOf(0), 'minecraft:stone', 'what it covered');
   const vox = new Uint16Array(4096).fill(1);
@@ -162,20 +163,9 @@ test('taking back a place uncovers what it covered, because the log recorded tha
   assert.equal(out.stateAt(5, 70, 4), STONE, 'and the block next to it untouched');
 });
 
-// Rebuild a v3 slice as a v2 one (16 B rows, no "was" column) to check the page still reads an old pack.
-const asV2 = (src) => {
-  const u = new Uint8Array(src);
-  const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
-  const count = dv.getUint32(12, true);
-  const headEnd = 36 + dv.getUint32(24, true) + dv.getUint32(32, true);
-  const out = new Uint8Array(headEnd + count * 16);
-  out.set(u.subarray(0, headEnd), 0);
-  for (let i = 0; i < count; i++) {
-    out.set(u.subarray(headEnd + i * 18, headEnd + i * 18 + 16), headEnd + i * 16);
-  }
-  new DataView(out.buffer).setUint32(8, 2, true);
-  return out;
-};
+// An un-rebaked pack still has to read: cut this v4 slice down to a v2 one (16 B rows, no "was",
+// no source) with the shared cutter rather than a second hand-written header layout.
+const asV2 = (src) => cutTimeline(src, 2);
 
 test('a pre-v3 timeline has no "was" column, so an un-arrived place still becomes air', () => {
   const { tlBuf, ph } = timeline([[1, 4, 70, 4, 2, 1, T(200), 'minecraft:dirt', 'minecraft:stone']]);

@@ -21,16 +21,19 @@
 //                                 frame (worldY + HEIGHT_BIAS); 0 = no baked height for it
 //     chunks: chunkCount x 16 B  (i32 cx, i32 cz, u32 rowStart, u32 rowCount), sorted by (cz, cx)
 //     rows:   rowCount x u32     indices into the exported log, in time order within a chunk
-//     timeline (version 3): its own magic + dim key copy, so a slice of it is self-describing:
+//     timeline (version 4): its own magic + dim key copy, so a slice of it is self-describing:
 //       8 magic 'LEDTL1  ', u32 version, u32 count, u32 timeBaseSec, u32 spanSec, u32 dimKeyLen,
-//       u32 nameCount, u32 namesBytes, dimKey bytes, nameCount x (u16 len + utf8 bytes),
-//       then count x 16 B in ascending second:
+//       u32 nameCount, u32 namesBytes, u32 srcCount, u32 srcBytes,
+//       dimKey bytes, nameCount x (u16 len + utf8 bytes), srcCount x (u16 len + utf8 bytes),
+//       then count x 19 B in ascending second:
 //         u32 cell index (the same index cells/chunks/heights use), u32 packed local coord
 //         (x 4b, z 4b, y+4096 in 13 bits), u8 action class 0..5 (6 = an action id outside the six),
 //         u8 player index (255 = none), u32 second since timeBaseSec,
-//         u16 name index (1-based into this section's name table; 0 = the row names no block)
+//         u16 name index (1-based into this section's name table; 0 = the row names no block),
+//         u16 "was" index, u8 source index (255 = none, 1-based-free index into the source table)
 //
-// The timeline is version 3 and it exists for the time machine (PLAN M12b): everything else in this
+// The timeline is version 4 and it exists for the time machine (PLAN M12b) and for the players
+// standing in it (PLAN M15): everything else in this
 // pack answers "how much happened in this chunk", which cannot replay anything. Rows are ordered by
 // time, not by chunk, because the playhead moves in time. It is a separate section with its own magic
 // so /ledger/cells can keep serving 674 KB while /ledger/timeline serves the 4.9 MB of rows only for a
@@ -42,6 +45,14 @@
 // per-dimension name table, because "what was this block" is the difference between decal dots and a
 // terrain time machine: to put a broken block back you have to know its name. Point queries still go
 // to /ledger/rows, which carries properties too.
+//
+// What version 4 adds is the CAUSE as a u8 into a per-dimension source table, because a player name on
+// a row does not mean the player stood there: of this log's 123,232 player-attributed rows, 28,795 name
+// a creeper blast, a wither skull, an end crystal, TNT (85 sources in all). Distance measured to that
+// player's nearest hand-attributed row: hand rows median 1 block, non-hand rows median 20 and p90 166.
+// So a body may only be stood where the source is the player's own hand, and that cannot be asked
+// without the byte. It costs 1 B per row - 343 KB on the overworld's 351,531 rows - and 85 sources fit
+// a byte with 255 held back for "none".
 //
 // The height plane is version 2 and it is there so the overlay can be drawn without the browser
 // owning a second whole-dimension height source. The world layer (/overview) is off by default here
@@ -62,9 +73,9 @@ export const MAX_PLAYERS_IN_MASK = 32;
 
 // --- the timeline section (version 3) -------------------------------------------------------------
 export const TL_MAGIC = 'LEDTL1  ';
-export const TL_VERSION = 3;
-export const TL_HEADER = 36;         // magic, version, count, timeBase, span, dimKeyLen, nameCount, namesBytes
-export const TL_REC = 18;            // + u16 name index, + u16 "was" index (1-based into the same table)
+export const TL_VERSION = 4;
+export const TL_HEADER = 44;         // ... nameCount, namesBytes, srcCount, srcBytes
+export const TL_REC = 19;            // + u16 name index, + u16 "was" index, + u8 source index
 // A row names TWO blocks, because that is all the ledger ever says about a voxel: the block the action
 // is ABOUT, and the block that stood there BEFORE it (old_object_id). For a break both are the block
 // that left; for a place, "about" is what arrived and "was" is what it covered - and the log carries
@@ -73,6 +84,9 @@ export const TL_REC = 18;            // + u16 name index, + u16 "was" index (1-b
 //
 // Version 2 (16 B rows, name but no "was") and version 1 (14 B, no names at all, so no answer to
 // "what block was here") are still readable; their missing columns decode as zeros.
+export const TL_VERSION_3 = 3;
+export const TL_HEADER_3 = 36;       // no source columns in the header
+export const TL_REC_3 = 18;
 export const TL_VERSION_2 = 2;
 export const TL_REC_2 = 16;
 export const TL_VERSION_1 = 1;
@@ -81,13 +95,14 @@ export const TL_REC_1 = 14;
 
 /** Header size and row size of a timeline version. An unknown version is an error, not a guess. */
 export function tlSizes(version) {
-  if (version === TL_VERSION || version === TL_VERSION_2) {
-    return { head: TL_HEADER, rec: version === TL_VERSION ? TL_REC : TL_REC_2 };
-  }
+  if (version === TL_VERSION) return { head: TL_HEADER, rec: TL_REC };
+  if (version === TL_VERSION_3) return { head: TL_HEADER_3, rec: TL_REC_3 };
+  if (version === TL_VERSION_2) return { head: TL_HEADER_3, rec: TL_REC_2 };
   if (version === TL_VERSION_1) return { head: TL_HEADER_1, rec: TL_REC_1 };
   throw new Error(`timeline version ${version}`);
 }
 export const TL_NO_PLAYER = 255;
+export const TL_NO_SOURCE = 255;     // pre-v4 rows answer this: the pack cannot say what caused them
 export const Y_BIAS = 4096;          // packed y covers -4096..4095; this log spans -512..299
 
 export const tlPackCoord = (x, y, z) => {
@@ -119,11 +134,13 @@ export function decodeTimeline(buf) {
   const dimKeyLen = dv.getUint32(24, true);
   const nameCount = recSize >= 16 ? dv.getUint32(28, true) : 0;
   const namesBytes = recSize >= 16 ? dv.getUint32(32, true) : 0;
+  const srcCount = version >= TL_VERSION ? dv.getUint32(36, true) : 0;
+  const srcBytes = version >= TL_VERSION ? dv.getUint32(40, true) : 0;
   const dimKey = new TextDecoder('utf-8').decode(
     new Uint8Array(view.buffer, view.byteOffset + headSize, dimKeyLen));
   const at = headSize + dimKeyLen;
-  if (view.byteLength < at + namesBytes + count * recSize) {
-    throw new Error(`timeline ${dimKey}: ${at + namesBytes + count * recSize} bytes needed, got ${view.byteLength}`);
+  if (view.byteLength < at + namesBytes + srcBytes + count * recSize) {
+    throw new Error(`timeline ${dimKey}: ${at + namesBytes + srcBytes + count * recSize} bytes needed, got ${view.byteLength}`);
   }
   // The name table is per dimension, not global: 22,341 object ids exist across the log, but a
   // dimension touches a few thousand of them, and a u16 column is what keeps a row at 16 B.
@@ -137,11 +154,28 @@ export function decodeTimeline(buf) {
       names.push(dec.decode(new Uint8Array(view.buffer, view.byteOffset + q, l))); q += l;
     }
   }
-  const recAt = at + namesBytes;
+  // The source table is per dimension for the same reason the name table is, and it is read once: a
+  // player's body may only stand where the cause was that player's own hand (gotcha: a creeper blast is
+  // a player-attributed row 166 blocks away at p90), so the byte has to name something.
+  const srcNames = [];
+  {
+    const dec = new TextDecoder('utf-8');
+    let q = at + namesBytes;
+    for (let i = 0; i < srcCount; i++) {
+      const l = dv.getUint16(q, true); q += 2;
+      if (q + l > view.byteLength) throw new Error(`timeline ${dimKey}: source ${i} runs past the slice`);
+      srcNames.push(dec.decode(new Uint8Array(view.buffer, view.byteOffset + q, l))); q += l;
+    }
+  }
+  const recAt = at + namesBytes + srcBytes;
+  // 'player' is the one source a body may stand on, so find its slot once instead of comparing strings
+  // per row. -1 when the table has no such source: no row can then match, including an unknown one.
+  const handSrc = srcNames.indexOf('player');
   const cell = new Uint32Array(count), coord = new Uint32Array(count);
   const action = new Uint8Array(count), player = new Uint8Array(count), sec = new Uint32Array(count);
   const name = new Uint16Array(count);
   const was = new Uint16Array(count);        // zeros on a pre-v3 timeline
+  const src = new Uint8Array(count).fill(TL_NO_SOURCE);   // 255 on a pre-v4 timeline: the pack cannot say
   for (let i = 0; i < count; i++) {
     const p = recAt + i * recSize;
     cell[i] = dv.getUint32(p, true);
@@ -151,6 +185,7 @@ export function decodeTimeline(buf) {
     sec[i] = dv.getUint32(p + 10, true);
     name[i] = recSize >= 16 ? dv.getUint16(p + 14, true) : 0;
     was[i] = recSize >= 18 ? dv.getUint16(p + 16, true) : 0;
+    src[i] = recSize >= 19 ? dv.getUint8(p + 18, true) : TL_NO_SOURCE;
   }
   // The rows are the playhead, so "ascending second" is not a detail of the writer, it is the thing
   // the page depends on. Say so in code that runs in the browser, not only in the bake.
@@ -167,7 +202,8 @@ export function decodeTimeline(buf) {
     return [lower(fromSec), lower(toSec + 1)];
   };
   return {
-    version, dimKey, count, timeBaseSec, spanSec, cell, coord, action, player, sec, name, was, names, range,
+    version, dimKey, count, timeBaseSec, spanSec, cell, coord, action, player, sec, name, was, src, names,
+    srcNames, handSrc, range,
     x: (i) => tlX(coord[i]), y: (i) => tlY(coord[i]), z: (i) => tlZ(coord[i]),
     second: (i) => timeBaseSec + sec[i],
     cellOf: (i) => cell[i],
@@ -175,6 +211,10 @@ export function decodeTimeline(buf) {
     nameOf: (i) => (name[i] ? names[name[i] - 1] ?? '' : ''),
     /** what stood in that voxel BEFORE this row; '' on a pre-v3 timeline */
     wasOf: (i) => (was[i] ? names[was[i] - 1] ?? '' : ''),
+    /** what caused this row ('player', 'creeper', 'fluid', ...); '' on a pre-v4 timeline */
+    srcOf: (i) => (src[i] === TL_NO_SOURCE ? '' : srcNames[src[i]] ?? ''),
+    /** a v4 row caused by the named player's own hand - the only rows a body may stand on */
+    byHand: (i) => player[i] !== TL_NO_PLAYER && handSrc >= 0 && src[i] === handSrc,
   };
 }
 
@@ -257,7 +297,8 @@ export function readPack(buf) {
     const { head: tlHead, rec: tlRec } = tlSizes(tlVer);
     const tlDimKeyLen = dv.getUint32(tlAt + 24, true);
     const tlNameBytes = tlRec >= 16 ? dv.getUint32(tlAt + 32, true) : 0;
-    const need = tlAt + tlHead + tlDimKeyLen + tlNameBytes + tlCount * tlRec;
+    const tlSrcBytes = tlVer >= TL_VERSION ? dv.getUint32(tlAt + 40, true) : 0;
+    const need = tlAt + tlHead + tlDimKeyLen + tlNameBytes + tlSrcBytes + tlCount * tlRec;
     if (view.byteLength < need) where('timeline');
     tlBytes = [tlAt, need];
   }
