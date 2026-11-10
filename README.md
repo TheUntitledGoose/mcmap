@@ -232,13 +232,21 @@ row also has a URL parameter, so a view is a link:
 The full list is the first ~200 lines of `web/js/main.js`, and the collapsed groups carry
 the knobs that are only interesting while measuring.
 
+The panel also remembers what you moved, per browser (`localStorage`), and re-applies that at boot
+whenever the URL names nothing - which is why a link with any parameter always shows what it
+claims. Cost ceilings are deliberately left out of that memory: a ceiling is a measurement of this
+data and this machine, and a remembered one outlives the measurement (a viewer holding the old 128
+MB kept getting flat tiles after the replay was repriced as blocks). The panel button
+**forget view** drops the whole snapshot and boots on what the page ships with.
+
 ---
 
 ## Tests and measurement
 
 ```bash
-npm test                # 393 tests: formats, codecs, stores, mesher, lighting, collision,
-                        # pool split, ledger, time machine, region coverage, HTTP endpoints
+npm test                # 395 tests: formats, codecs, stores, mesher, lighting, collision,
+                        # pool split, ledger, time machine, region coverage, remembered settings,
+                        # HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds
 npm run browser:probe   # headless Chromium against a live server: eval, framebuffer, shot
 node tools/mprobe.mjs --shot N url          # A/B two URLs by pixel band difference

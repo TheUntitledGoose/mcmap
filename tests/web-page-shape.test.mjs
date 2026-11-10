@@ -128,3 +128,36 @@ test('the marker checkbox says it hides the whole overlay, not only flat tiles',
   assert.match(row, /'off - nothing is drawn'/, 'the row promises something the mesh does not do');
   assert.match(row, /TLAYER\.look \|\| 'tiles'/, 'the value sentence no longer names what is drawn');
 });
+
+// A remembered panel is a second, invisible copy of the settings that wins over what the page ships
+// with on a bare URL. When the overlay ceiling's DEFAULT changed (128 -> 384, after the replay was
+// priced as blocks) every viewer holding an older snapshot kept the old ceiling - and so kept the flat
+// plates the repricing was meant to end. Measured both ways in build/q_m12b7_seed.js +
+// build/q_m12b7_check.js against one seeded snapshot {timeGeomMb: 128, timeLook: 'blocks'}:
+//   old page (key v1):  ceiling at boot 128, look 'plates', marker geometry 75.5 MB
+//   this page (key v2): ceiling at boot 384, look 'blocks', marker geometry 134.4 MB
+test('a remembered view cannot pin a cost ceiling, and is one button from gone', () => {
+  assert.match(src, /const STORE_KEY = 'darkrpg\.viewer\.settings\.v2';/,
+    'the snapshot key was not versioned up, so an older snapshot still decides the picture');
+  assert.doesNotMatch(src, /'darkrpg\.viewer\.settings\.v1'/,
+    'the retired key is being read again: bump it instead');
+  assert.match(src, /&& !it\.nostore\);/,
+    'storedKeys collects every control again, cost ceilings included');
+  assert.match(src, /\{ key: 'timeGeomMb', label: 'overlay memory',[^\n]*nostore: 1,/,
+    'the overlay ceiling is a remembered value again, so a stale one can pin the replay to plates');
+  assert.match(src, /const forgetStore = \(\) => \{[\s\S]{0,200}localStorage\.removeItem\(STORE_KEY\)/,
+    'there is no way to drop a remembered view');
+  assert.match(src, /\{ label: 'forget view', run: \(\) => \{ forgetStore\(\); location\.reload\(\); \},/,
+    'the panel does not offer the button, or it forgets without going back to the shipped values');
+  assert.match(src, /Object\.assign\(window\.__world, \{ settingsStore, forgetStore \}\);/,
+    'a probe cannot ask which rows the view remembers');
+});
+
+// A patch that spliced sentences into single-quoted hints once left "M. URL: ?time=1" and
+// "M still brings the layer back": the subject had been eaten, and that text is what a viewer reads to
+// understand a control. Shape is the only place this can be caught.
+test('a panel hint keeps its subject', () => {
+  assert.doesNotMatch(src, /\.\s?M\. URL: /, 'a hint lost a word before its URL name');
+  assert.doesNotMatch(src, /\nM still brings /, 'a hint lost its subject before "still brings"');
+  assert.doesNotMatch(src, /\nM\./, 'a hint has a bare M where a sentence should be');
+});

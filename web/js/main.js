@@ -6444,21 +6444,21 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
       { key: 'time', label: 'time machine', kind: 'check',
         fmt: () => (S.time ? `on - ${(TLAYER.drawn ?? 0).toLocaleString()} / ${(TLAYER.quads || 0).toLocaleString()}` : 'off'),
         get: () => !!S.time, set: (v) => setTime(v),
-        hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one marker per\nlogged change that has happened by the playhead. Costs one 6.4 MB request for this dimension\n(/ledger/timeline, 351,531 rows) and one mesh; moving the playhead is a draw range, not a rebuild, so two\nyears of history play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole\ndimension, 35 ms for one player. Ticking this also arms "undo the log in the blocks too" unless you have\ntoggled that yourself, and it starts PLAYING at the first logged change: second 0 of this log is the oldest\ncalendar instant, and the server logged nothing for its first 8.5 hours, so an empty map at second 0 is\nwhat a tick used to look like. Ask for paused (?timeplay=0) and it starts at the end instead, with every\nchange the filter holds drawn, and you scrub back. M. URL: ?time=1' },
+        hint: 'The other ledger layer: this one is sorted by TIME, not by chunk, and it draws one marker per\nlogged change that has happened by the playhead. Costs one 6.4 MB request for this dimension\n(/ledger/timeline, 351,531 rows) and one mesh; moving the playhead is a draw range, not a rebuild, so two\nyears of history play at frame rate. A FILTER change is the only rebuild: about 100 ms for a whole\ndimension, 35 ms for one player. Ticking this also arms "undo the log in the blocks too" unless you have\ntoggled that yourself, and it starts PLAYING at the first logged change: second 0 of this log is the oldest\ncalendar instant, and the server logged nothing for its first 8.5 hours, so an empty map at second 0 is\nwhat a tick used to look like. Ask for paused (?timeplay=0) and it starts at the end instead, with every\nchange the filter holds drawn, and you scrub back from a finished world.\nM arms it too; URL: ?time=1' },
       { key: 'timeLook', label: 'a change looks like', kind: 'select',
         options: [{ value: 'blocks', label: 'the block itself, tinted' },
           { value: 'plates', label: 'the top face of the block, tinted' },
           { value: 'tiles', label: 'a flat coloured tile' }],
         get: () => S.timeLook, set: (v) => setTimeLook(v),
         hint: 'The baked model of the block itself, tinted green for a place or red for a break, is what\nmakes a marker readable close in: a green square on a roof does not say deepslate brick. It is also\nfour times the geometry. Measured in the page over the 89,613-marker place filter: blocks 2.21 M verts /\n38 MB on the GPU / 0.24 s to build, plates 0.47 M verts / 8 MB / 0.05 s, flat tiles 0.36 M verts / 6 MB /\n0.01 s. Over the whole 331,040-row any-change filter: blocks 11.74 M verts / 202 MB / 0.9 s, and 64 fps\nsettled with ALL of them drawn versus 236 fps with 27,644 of them (8.35 %) behind the playhead, because a draw range only ever shows\nthe part behind the playhead. Past "overlay memory" below, the look steps down on its own and the\nsentence under the playhead quotes both numbers and the row that moves them. URL: ?timelook=plates' },
-      { key: 'timeGeomMb', label: 'overlay memory', min: 4, max: 1024, step: 4,
+      { key: 'timeGeomMb', label: 'overlay memory', min: 4, max: 1024, step: 4, nostore: 1,
         fmt: (v) => `${Math.round(v)} MB max`, get: () => S.timeGeomMb,
         set: (v) => { S.timeGeomMb = Math.max(2, Math.min(2048, +v || 4)); if (S.time) timeRebuild(); },
-        hint: 'The ceiling a block-shaped replay may reach, in the MB the marker builder counts (MiB). The\n384 default is sized off the biggest filter this dimension has, measured in the page: 331,040\nany-change rows drawn as their own blocks = 336 MB here, 202 MB of it positions plus indices on the GPU,\n0.9 s to build, 64 fps settled with every marker on screen and 236 fps with 27,644 of them (8.35 %) behind the playhead. At the old\n128 that filter could not afford blocks and stepped to flat plates - which is exactly why the replay\nlooked like 2D tiles with no blocks in it. The 89,613-row place filter is cheaper either way: 63 MB here,\n38 MB on the GPU. The page held 1.9 GB of JS heap with all 331k markers up, blocks or plates; set this to\nwhat your machine will hold, and the sentence under the playhead names the number a filter needed.\nURL: ?timegeommb=' },
+        hint: 'The ceiling a block-shaped replay may reach, in the MB the marker builder counts (MiB). The\n384 default is sized off the biggest filter this dimension has, measured in the page: 331,040\nany-change rows drawn as their own blocks = 336 MB here, 202 MB of it positions plus indices on the GPU,\n0.9 s to build, 64 fps settled with every marker on screen and 236 fps with 27,644 of them (8.35 %) behind the playhead. At the old\n128 that filter could not afford blocks and stepped to flat plates - which is exactly why the replay\nlooked like 2D tiles with no blocks in it. The 89,613-row place filter is cheaper either way: 63 MB here,\n38 MB on the GPU. The page held 1.9 GB of JS heap with all 331k markers up, blocks or plates; set this to\nwhat your machine will hold, and the sentence under the playhead names the number a filter needed.\nThis row is deliberately NOT part of the view the panel remembers between visits: a ceiling is a\nmeasurement about this data and your machine, and a remembered one outlives the measurement -\nthe viewer holding the old 128 kept getting flat plates after the repricing, with nothing on\nscreen saying that a stored number, and not their taste, was deciding the shape (M12b.7).\nURL: ?timegeommb=' },
       { key: 'timeTiles', label: 'draw the change markers', kind: 'check',
         fmt: () => (S.timeTiles ? `${(TLAYER.drawn ?? 0).toLocaleString()} ${TLAYER.look || 'tiles'}` : 'off - nothing is drawn'),
         get: () => !!S.timeTiles, set: (v) => setTiles(v),
-        hint: 'The time machine has two halves: the change overlay drawn over the map, and the blocks\nthemselves corrected back to the playhead ("undo the log in the blocks too", below). The overlay is the\ncheap half - one mesh, a draw range per frame, 90,045 items for this dimension\'s places - but an item per\nlogged change over a canopy hides the very world it is describing. Off hides the WHOLE overlay: at the\nblock look that means the block shapes go too, not only flat tiles. The playhead, the date and the\nterrain undo all keep working, which is the "watch the house get built" view with nothing in the way.\nM still brings the layer back. URL: ?timetiles=0' },
+        hint: 'The time machine has two halves: the change overlay drawn over the map, and the blocks\nthemselves corrected back to the playhead ("undo the log in the blocks too", below). The overlay is the\ncheap half - one mesh, a draw range per frame, 90,045 items for this dimension\'s places - but an item per\nlogged change over a canopy hides the very world it is describing. Off hides the WHOLE overlay: at the\nblock look that means the block shapes go too, not only flat tiles. The playhead, the date and the\nterrain undo all keep working, which is the "watch the house get built" view with nothing in the way, and the time machine itself (M, or ?time=1) brings the markers back.\nURL: ?timetiles=0' },
       { key: 'decalop', label: 'overlay strength', stops: [0.15, 0.3, 0.45, 0.6, 0.8, 1],
         fmt: (v) => `${Math.round(100 * v)}% solid`, get: () => S.decalOp, set: (v) => setDecalOp(v),
         hint: 'How solid both ledger overlays are - the per-chunk heat tiles and the per-change time tiles. They\nsit a fraction of a block above the ground, so at full strength they are a floor of paint over whatever\nthey describe; 45% is where 90,045 place tiles over a canopy still read as canopy. URL: ?decalop=' },
@@ -6655,6 +6655,14 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         hint: 'the same ranking as cages over the ground, without the heat layer: 12 markers over the\nchunks where the log is loudest.' },
       { label: 'undo', run: undoPreset, hint: 'back to what the panel said before the last preset' },
       { label: 'fit world', run: () => fitWorld(), hint: 'zoom out to the whole loaded extent (f)' },
+      { label: 'forget view', run: () => { forgetStore(); location.reload(); },
+        hint: 'Drop the settings this panel has remembered, and go back to what the page ships with.\n'
+          + 'Anything you moved here is kept for the next visit, which is what you want for zoom,\n'
+          + 'lighting and the overlay looks - but a stored number also outlives the measurement behind\n'
+          + 'it, and a preset button stores whatever it set. If the page draws something differently\n'
+          + 'from the way it did in a screenshot, this is the button. The page reloads, because the\n'
+          + 'values it ships with only exist at boot. Opening the page with ANY URL parameter also\n'
+          + 'ignores the remembered view, which is why a shared link always shows what it claims.' },
       { label: 'spawn', run: () => { rig.target.set(SPAWN[0], SPAWN[1], SPAWN[2]); rig.dist = 40; },
         hint: 'back to the world spawn (r)' },
     ],
@@ -6709,9 +6717,17 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
   // disagree with the display units the panel uses (shadow depth is 1 - aoMin, cap cells are an
   // index). A URL that names anything at all wins outright: a probe link, a copied link or a
   // ?debug=1 measurement must land on the settings it asks for, not on whatever was last stored.
-  const STORE_KEY = 'darkrpg.viewer.settings.v1';
+  // The key is versioned, on purpose. A snapshot holds EVERY control, so when a control's DEFAULT
+  // changes - the overlay-memory ceiling went 128 -> 384 once the replay was priced as blocks - an old
+  // snapshot pins the old number, and with it the old PICTURE: that viewer keeps getting flat plates
+  // while a fresh page draws block shapes, and nothing on screen says a stored number decided it.
+  // A bump retires the stale snapshot instead of inheriting it (M12b.7).
+  const STORE_KEY = 'darkrpg.viewer.settings.v2';
   const storedUrl = [...params.keys()].some((k) => k !== 'dim');
-  const storedKeys = items.filter((it) => it.key && it.get && it.set && !it.key.startsWith('sec_'));
+  // 'nostore' rows are cost ceilings, not taste: never collected, never restored, even inside a
+  // snapshot written after the bump.
+  const storedKeys = items.filter((it) => it.key && it.get && it.set
+    && !it.key.startsWith('sec_') && !it.nostore);
   function remember() {
     if (storedUrl) return;
     try {
@@ -6736,6 +6752,20 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     }
     return n;
   }
+  // Getting out of a remembered view has to be one control, not a hunt through settings: a stored
+  // number that no longer matches the page's own measurement is invisible from the canvas.
+  const forgetStore = () => {
+    try { localStorage.removeItem(STORE_KEY); } catch { /* blocked, private, gone: nothing to forget */ }
+    return 1;
+  };
+  // What the remembered view is made of, by control name, so a probe can ask "is this row remembered?"
+  // instead of reading this file.
+  const settingsStore = () => ({
+    // 'willRestore' is a fact about this URL, not about what already happened: a probe asks whether a
+    // stored value could win over what the page ships with.
+    key: STORE_KEY, willRestore: !storedUrl, storable: storedKeys.map((it) => it.key),
+  });
+  Object.assign(window.__world, { settingsStore, forgetStore });
   for (const it of items) if (it.set) { const inner = it.set; it.set = (v) => { inner(v); remember(); }; }
   if (restoreStored()) panel.refresh();
 }
