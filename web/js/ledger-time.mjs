@@ -237,3 +237,148 @@ export function rowForBlock(groups, quadSec, cell, coord, sec = null) {
   const q = list[at];
   return { quad: q, sec: quadSec[q], n: list.length, before, later: list.length - 1 - at };
 }
+
+/**
+ * Whether each kind of logged action leaves a BLOCK standing in the voxel it touched, indexed by the
+ * timeline's 0-based action byte (0 change, 1 place, 2 break, 3 container insert, 4 container remove,
+ * 5 kill, 6 an action id outside those six).
+ *
+ * `null` is not "the code does not know": it is "this action makes no claim about a block". An entity
+ * dying in a doorway, or an item put into a chest, says nothing about whether the wall beside it stands,
+ * so the viewer has to fall back to what the chunks say rather than invent an answer. `change` counts as
+ * standing because it is a state swap of a block that is there - a lever flipped, a slab re-oriented.
+ */
+export const CLAIMS_STAND = [1, 1, 0, null, null, null, null];
+
+/** The action byte as a person would read it. Byte 6 is deliberately vague, because it is vague. */
+export const claimName = (byte) => (byte >= 0 && byte < CLAIMS_STAND.length - 1
+  ? actionName(byte + 1)
+  : 'some other logged action');
+
+/**
+ * What stood in a voxel when the log's EARLIEST word about it comes after the moment being asked about.
+ * The row cannot be read directly then - it has not happened yet - so it is read backwards, and only two
+ * of the six claims support a backwards reading: a block that the log later changed or broke was standing
+ * beforehand, and a placement says nothing about what it landed on unless the ledger also named the block
+ * that was there before (its `was`), in which case the honest answer is "unknown".
+ */
+export const beforeClaim = (tl, row) => {
+  const cls = tl.action[row] ?? CLAIMS_STAND.length - 1;
+  if (cls === 0 || cls === 2) return 1;                 // changed or broken later: it was standing
+  if (cls === 1) return tl.was?.[row] ? null : 0;       // placed later: empty under it, unless named otherwise
+  return null;                                          // containers, kills, anything else
+};
+
+/**
+ * A chunk's state key and the log's block name for the same block, made comparable.
+ *
+ * The payload names a state `minecraft:oak_stairs|facing=north` (the census key), and the ledger names an
+ * object `minecraft:oak_stairs`: same block, different spelling. Properties are not part of the question
+ * "does this block stand here", so they come off before comparing.
+ */
+export const plainName = (k) => (k ? String(k).split('|')[0] : null);
+
+/**
+ * The first row strictly after `sec` that PLACES this named block in this voxel.
+ *
+ * Only a placement proves an arrival: a `change` row is a state swap of a block that was already standing,
+ * and a break names the block that left. So this asks one question - does the log say the very block you
+ * are pointing at appears later than the moment? - and answers it by walking that voxel's rows, which is
+ * short (measured: 292 rows on the busiest voxel in this save, 2 rows median).
+ */
+export function arrivalOfBlock(tl, groups, quadRow, quadSec, cell, coord, sec, name) {
+  const nm = plainName(name);
+  if (!nm) return null;
+  const list = groups.get(voxelKey(cell, coord));
+  if (!list || !list.length) return null;
+  let lo = 0, hi = list.length - 1, first = list.length;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (quadSec[list[mid]] > sec) { first = mid; hi = mid - 1; } else lo = mid + 1;
+  }
+  for (let k = first; k < list.length; k++) {
+    const row = quadRow[list[k]];
+    if ((tl.action[row] ?? CLAIMS_STAND.length - 1) === 1 && tl.nameOf?.(row) === nm) {
+      return { row, cls: 1, sec: quadSec[list[k]] };
+    }
+  }
+  return null;
+}
+
+/**
+ * Does a block stand in this voxel at this moment, as far as the log knows?
+ *
+ * The pick question this exists for: the mesh under a cursor is today's world (and, within the replay
+ * square, the playhead's), so the outline used to land on a block that only appears three weeks after the
+ * playhead. The row that decides the answer is the last one at or before the moment - and when the block's
+ * history starts LATER than the moment, the same table still answers, read the other way: the first claim
+ * being a place means the block was not there yet, and the first claim being a break means it was there
+ * until then.
+ *
+ * `stands` is 1, 0, or null for "the log has nothing to say about this voxel" - which is also the answer
+ * when the time machine is off or the filter names nobody who touched it. `row`/`cls`/`sec` say which row
+ * decided it and `n`/`later` how much more history that voxel has, so a caller can print a reason instead
+ * of silently refusing the pixel. `cls` is the timeline's 0-based action byte; `claimName(cls)` is the word
+ * to show a person. When the answer is "not there", `starts` names the first claim after the moment.
+ */
+export function standsAt(tl, groups, quadRow, quadSec, cell, coord, sec, name = null) {
+  const other = CLAIMS_STAND.length - 1;
+  const r = rowForBlock(groups, quadSec, cell, coord, sec);
+  if (!r) return null;
+  const row = quadRow[r.quad];
+  const cls = tl.action[row] ?? other;
+  const out = { stands: 1, row, cls, sec: r.sec, before: r.before, n: r.n, later: r.later };
+  // Two readings, and which one applies is the whole subtlety: a row at or behind the moment is read
+  // forwards (what that kind of action leaves behind), a moment older than the voxel's whole history is
+  // read backwards off the oldest row.
+  out.stands = r.before ? (CLAIMS_STAND[cls] ?? null) : beforeClaim(tl, row);
+  // "Not there" is only useful if it says when the voxel becomes something: the first claim AFTER this
+  // moment is the moment it stops being empty, and the hover/card can name the date.
+  if (!r.before || !out.stands) {
+    const nxt = nextRowForBlock(groups, quadSec, cell, coord, sec + 1);
+    if (nxt) {
+      const nrow = quadRow[nxt.quad];
+      const ncls = tl.action[nrow] ?? other;
+      out.starts = { row: nrow, cls: ncls, sec: nxt.sec };
+    }
+  }
+  // The third reading, and the one that answers what a cursor is actually pointing at. The rules above
+  // speak about the VOXEL; a pick wants to know about the BLOCK it hit, which the mesh drew from today's
+  // chunks. If the log names that block's own placement after this moment, then it does not stand at this
+  // moment - which is the case the outline kept getting wrong, because a shell layer cannot be re-cut by
+  // the replay and keeps painting a wall the playhead has not built yet.
+  //
+  // A name that merely DIFFERS is not evidence of absence (an unlogged plugin edit would look identical),
+  // so this only ever adds a refusal when the log says the block itself arrives.
+  if (name) {
+    const nm = plainName(name);
+    const decided = out.stands === 1 && tl.nameOf?.(out.row) === nm;
+    if (!decided) {
+      const arr = arrivalOfBlock(tl, groups, quadRow, quadSec, cell, coord, sec, nm);
+      if (arr) {
+        out.stands = 0;
+        out.arrival = arr;
+        out.starts = out.starts ?? { row: arr.row, cls: arr.cls, sec: arr.sec };
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The first row at or after `sec` for this voxel. Rows in `groups` are in filter time order and `quadSec`
+ * is non-decreasing along them, so this is the mirror-image binary search of `rowForBlock`: where
+ * `rowForBlock` answers "what had happened by then", this answers "what happens next".
+ */
+export function nextRowForBlock(groups, quadSec, cell, coord, sec) {
+  const list = groups.get(voxelKey(cell, coord));
+  if (!list || !list.length) return null;
+  let lo = 0, hi = list.length - 1, best = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (quadSec[list[mid]] >= sec) { best = mid; hi = mid - 1; } else lo = mid + 1;
+  }
+  if (best < 0) return null;
+  const q = list[best];
+  return { quad: q, sec: quadSec[q], n: list.length, after: list.length - 1 - best };
+}

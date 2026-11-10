@@ -223,7 +223,8 @@ row also has a URL parameter, so a view is a link:
                       blocks, and below that it steps down to flat plates), ?timegrow=0 (put the
                       markers flush with their voxel), ?timetiles=0,
                       ?timeterrain=0 (undo the log in the voxels), ?timesharp=12 (replay in a wider
-                      square than the view draws sharp), ?hover=0
+                      square than the view draws sharp), ?timestack=0 (older claims at one voxel stop
+                      owning it), ?hover=0, ?timepick=0 (let the outline answer today's mesh again)
 ?nocov=1              stop using the region listing: ask for every tile again (the pan A/B)
 ?groundttl=120000     how long the page believes that listing, ms
 ?debug=1              instrument panel and HUD
@@ -244,9 +245,9 @@ MB kept getting flat tiles after the replay was repriced as blocks). The panel b
 ## Tests and measurement
 
 ```bash
-npm test                # 395 tests: formats, codecs, stores, mesher, lighting, collision,
-                        # pool split, ledger, time machine, region coverage, remembered settings,
-                        # HTTP endpoints
+npm test                # 411 tests: formats, codecs, stores, mesher, lighting, collision,
+                        # pool split, ledger, time machine (incl. what a pick may answer), region
+                        # coverage, remembered settings, HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds
 npm run browser:probe   # headless Chromium against a live server: eval, framebuffer, shot
 node tools/mprobe.mjs --shot N url          # A/B two URLs by pixel band difference

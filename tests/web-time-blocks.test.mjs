@@ -264,6 +264,69 @@ test('a marker is bigger than its block by the grow factor, and grow=1 is flush 
   assert.ok(grown.lo[1] < flush.lo[1] && grown.hi[1] > flush.hi[1], 'grow must be about the block centre in y too');
 });
 
+// Why this exists: a block placed and later broken drew two markers the same size, so they fought for the
+// same pixels. A raycast measured who won - the OLDER placement - which means a click answered a block that
+// had already left, and a person saw green and red occupying one block. The newest claim must own the block.
+test('a later claim at one voxel encloses the claim it supersedes, instead of overlapping it', () => {
+  const boxOf = (b, item) => {
+    const from = item ? b.markerEnd[item - 1] : 0;
+    const to = b.markerEnd[item];
+    const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (let k = from; k < to; k++) {
+      const v = b.idx[k] * 3;
+      for (let c = 0; c < 3; c++) { lo[c] = Math.min(lo[c], b.pos[v + c]); hi[c] = Math.max(hi[c], b.pos[v + c]); }
+    }
+    return { lo, hi };
+  };
+  const rows = [
+    [2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],     // place
+    [2, 64, 3, 3, 'minecraft:air', 'minecraft:stone', 30],     // break, same voxel, later
+  ];
+  const stacked = build(rows, { grow: 1.18, stackGrow: 0.36 });
+  assert.equal(stacked.stats.markers, 2, 'both claims are drawn');
+  assert.equal(stacked.stats.stacked, 1, 'one of them knows a claim came before it here');
+  assert.equal(stacked.stats.maxStack, 2, 'two claims share this voxel');
+
+  const a = boxOf(stacked, 0), b = boxOf(stacked, 1);
+  for (const c of [0, 2]) {
+    assert.ok(b.lo[c] < a.lo[c] - 0.01 && b.hi[c] > a.hi[c] + 0.01,
+      `the break must stand outside the place on axis ${c}: place ${a.lo[c]}..${a.hi[c]} break ${b.lo[c]}..${b.hi[c]}`);
+  }
+  assert.ok(b.lo[1] < a.lo[1] && b.hi[1] > a.hi[1], 'and in height too');
+
+  // The visible shell is the newer claim, so its colour is what a person sees: red, not green.
+  const redOuter = (x) => x[0] > x[1];
+  const ch = (x, item) => { const from = (item ? x.markerEnd[item - 1] : 0); let r = 0, g = 0, n = 0;
+    for (let k = from; k < x.markerEnd[item]; k++) { const v = x.idx[k] * 4; r += x.col[v]; g += x.col[v + 1]; n++; }
+    return [r / n, g / n]; };
+  assert.ok(redOuter(ch(stacked, 1)), 'the outer marker is the break, and it is washed red');
+  assert.ok(!redOuter(ch(stacked, 0)), 'the enclosed marker is the place, washed green');
+
+  // The A/B: no ramp means the old same-size overlap.
+  const flat = build(rows, { grow: 1.18, stackGrow: 0 });
+  const fa = boxOf(flat, 0), fb = boxOf(flat, 1);
+  assert.ok(Math.abs(fa.lo[0] - fb.lo[0]) < 1e-6 && Math.abs(fa.hi[0] - fb.hi[0]) < 1e-6,
+    'stackGrow 0 must put both markers on exactly the same shell');
+
+  // Bound: this save has one voxel logged 292 times. A linear ramp would draw a 30 m tower for it.
+  const many = [];
+  // A break names the block that LEFT, and the timeline reads that out of the old object id, so the block
+  // goes in the old slot for break rows and the new slot for place rows.
+  for (let i = 0; i < 40; i++) many.push([7, 64, 7, i % 2 ? 2 : 3, i % 2 ? 'minecraft:stone' : 'minecraft:air',
+    i % 2 ? 'minecraft:air' : 'minecraft:stone', 100 + i]);
+  const deep = build(many, { grow: 1.18, stackGrow: 0.36 });
+  assert.equal(deep.stats.markers, 40);
+  const first = boxOf(deep, 0), last = boxOf(deep, 39);
+  const half = (first.hi[0] - first.lo[0]) / 2 + 2 * 0.36 + 1e-6;
+  const mid = (first.lo[0] + first.hi[0]) / 2;
+  assert.ok(Math.abs(last.hi[0] - mid) < half && Math.abs(last.lo[0] - mid) < half,
+    `a 40-deep stack stays inside the saturated reach: ${(last.hi[0] - mid).toFixed(3)} > ${(half - 0.5).toFixed(3)}`);
+  for (let i = 1; i < 40; i++) {
+    const p = boxOf(deep, i - 1), q = boxOf(deep, i);
+    assert.ok(q.hi[0] >= p.hi[0], `depth ${i}: the ramp must never shrink`);
+  }
+});
+
 test('the builder says which chunk each marker stands in, which is how far the replay reaches', () => {
   const a = build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10]]);
   assert.deepEqual([a.markerCx[0], a.markerCz[0]], [0, 0], 'a block at 2,3 sits in chunk 0,0');

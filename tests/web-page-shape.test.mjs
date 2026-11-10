@@ -161,3 +161,56 @@ test('a panel hint keeps its subject', () => {
   assert.doesNotMatch(src, /\nM still brings /, 'a hint lost its subject before "still brings"');
   assert.doesNotMatch(src, /\nM\./, 'a hint has a bare M where a sentence should be');
 });
+
+// The pixel question. The mesh under a cursor is the world as it is today, so with the time machine on the
+// wire box used to sit on a wall that is placed three weeks after the playhead and a click asked about it as
+// if it stood. Measured in build/q_t5pick.js: scrubbed to the earliest moment of this save's log, the hover
+// answer named blocks whose oldest logged claim is later than the playhead, and `T` asked the server about
+// them. What is guarded here is that BOTH the outline and the click go through the one playhead-aware pick,
+// and that a voxel the log never mentions still gets picked (silence is not evidence of absence).
+test('the hover and the click both go through the playhead-aware pick', () => {
+  const hv = statements(bodyOf('hoverVoxel'));
+  assert.ok(hv.includes('const p = pickWorld(x, y);'),
+    'the hover picks the raw scene again, so it answers for today instead of the playhead');
+  assert.ok(!hv.includes('const p = pickState(x, y);'), 'hoverVoxel re-tuned itself to pickState');
+  const ask = bodyOf('askAt');
+  assert.match(ask, /const p = pickWorld\(x, y\);/,
+    'the click picks the raw scene again, so it can ask about a block that is not there at the playhead');
+  assert.match(ask, /if \(p\.stand && p\.stand\.stands === 0\) \{/,
+    'the click no longer refuses a voxel the log says is empty at this moment');
+  assert.match(ask, /p\.stand\.starts \? `\$\{claimName\(p\.stand\.starts\.cls\)} at \$\{tlStamp\(p\.stand\.starts\.sec\)\}\.`/,
+    'the refusal stopped naming the moment the block arrives: that is the part a person can act on');
+  assert.match(ask, /showLedgerRefusal\(p\.block, why\);/,
+    'a refusal is only in the one-line status, where a person who just clicked will not look');
+  assert.match(src, /function showLedgerRefusal\(block, sentence\) \{/,
+    'the refusal card builder is gone, so the answer has nowhere to go');
+  assert.doesNotMatch(ask, /is not standing: the log puts[^`]*tlDate/, 
+    'a refusal quotes a date without the year, and this log spans 27 months: 05-31 and 06-03 are two years apart');
+});
+
+test('a refused hover hides the box, counts itself, and explains itself', () => {
+  const hp = bodyOf('hoverPass');
+  assert.match(hp, /if \(h\.stand && h\.stand\.stands === 0\) \{[\s\S]{0,160}g\.visible = false;[\s\S]{0,80}HOVER\.refused\+\+/,
+    'the outline still draws around a block the log says is not there');
+  assert.match(hp, /HOVER\.why = h\.standWhy \|\| 'not there at the playhead';/,
+    'a refusal arrives with no reason, which is the report "the highlight vanished for nothing"');
+  assert.match(src, /stand: null, standWhy: '', refused: 0 \};/,
+    'the refusal count is gone from HOVER, so the instrument cannot see it');
+  assert.match(src, /playheadPick: !!S\.timePick,/, 'the hover readout does not report the switch state');
+});
+
+test('the playhead pick asks the log, never the mesh, and answers nothing rather than guessing', () => {
+  const f = bodyOf('timeStandAt');
+  assert.match(f, /if \(!S\.time \|\| !S\.timePick \|\| !TLAYER\.tl \|\| !TLAYER\.quadRow\) return null;/,
+    'the switch does not gate the pick, so ?timepick=0 stops being an A/B switch');
+  assert.match(f, /if \(cell === undefined\) return null;/,
+    'a chunk the log never touched is about to be answered as empty: it must be answered as unknown');
+  assert.match(f, /return standsAt\(TLAYER\.tl, timeVoxelIndex\(\)/,
+    'the verdict no longer comes from the timeline rows');
+  assert.match(bodyOf('pickWorld'), /stand: timeStandAt\(p\.block\[0\], p\.block\[1\], p\.block\[2\], p\.state \?\? p\.shellState\)/,
+    'pickWorld no longer attaches a verdict, or attaches one that does not know which BLOCK the cursor is on');
+  assert.match(bodyOf('askAt'), /p\.stand\.arrival\s*\?\s*`at \$\{tlStamp\(Math\.round\(S\.timeAt\)\)}/,
+    'the click stopped naming the block the log says arrives later, which is the block the cursor was on');
+  assert.match(src, /\{ key: 'timePick', label: 'the outline only stands where the playhead says', kind: 'check',/,
+    'the switch has no panel row, which leaves the behaviour undiscoverable and unauditable');
+});

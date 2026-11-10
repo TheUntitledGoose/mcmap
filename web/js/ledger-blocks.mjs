@@ -21,6 +21,16 @@
 // about the block centre by a fraction of a block puts every face outside the real one, and the same claim
 // reads as a block.
 //
+// Why a later claim at one voxel is drawn OUTSIDE the earlier ones (the `stackGrow` option): a voxel that was
+// placed and later broken has two markers, and both used to be the same size, so they fought for the same
+// pixels. One raycast measured who won - the older placement, meaning the page answered a click about a block
+// that had already left, and a person saw green and red occupying one block. Markers at a voxel are now scaled
+// about the block centre by how many claims came before them at that voxel, so the newest claim is always the
+// outermost shell: it encloses the claims it supersedes, wins the pixel, and answers the click. The ramp
+// saturates (a voxel here is logged 292 times, and a linear rule would build a 30-metre tower out of it), and
+// it moves almost nothing else: measured over the baked overworld timeline (build/dbg-voxelstack.mjs), 6.8% of
+// its 313,884 claimed voxels hold more than one claim at all, and p99 holds one.
+//
 // Two honest limits:
 //   A row whose block name the atlas does not know (entity kills, item actions, mod objects that were never
 //   baked) has no shape to draw. They are counted in `stats.unknown` and, when the atlas has a placeholder
@@ -75,7 +85,14 @@ const FAKE_CHUNK = { cx: 0, cz: 0 };
  */
 export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   // `grow` is a scale about the block centre: 1 is exactly the block, 1.18 sticks out 0.09 blocks a side.
-  const { plates = false, maxQuads = 0, lift = 0.004, maxLift = 0.08, grow = 1 } = opts;
+  // `stackGrow` is the outward reach, in blocks, that the saturated stack ramp adds on top of `grow`;
+  // 0 restores same-size markers, which is the A/B. `stackTau` is how many claims at one voxel it takes to
+  // get most of the way there.
+  const { plates = false, maxQuads = 0, lift = 0.004, maxLift = 0.08, grow = 1,
+    stackGrow = 0, stackTau = 3 } = opts;
+  // Strictly increasing in the number of claims already drawn at this voxel, and bounded: the newest claim at
+  // a voxel is always the outermost shell, and even a voxel logged 292 times stays inside grow + 2*stackGrow.
+  const sizeOf = (depth) => grow + 2 * (stackGrow > 0 ? stackGrow * (1 - Math.exp(-depth / stackTau)) : 0);
   const cellAt = typeof cells?.cell === 'function' ? (i) => cells.cell(i) : (i) => cells?.[i];
   const stream = new VertexStream(4096, { indexed: true });
   // emitQuad picks a pass out of an array by sprite kind (opaque / cutout / translucent). A marker wants
@@ -87,6 +104,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   const stats = {
     rows: order.length, markers: 0, cubes: 0, plates: 0, models: 0, unknown: 0, air: 0,
     noCell: 0, noModel: 0, faces: 0, quads: 0, verts: 0, tris: 0, stopped: false, bytes: 0,
+    stacked: 0, maxStack: 0,
   };
   const mSec = new Uint32Array(order.length);
   const mEnd = new Uint32Array(order.length);
@@ -138,20 +156,25 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     // with each other; the page's material polygon-offsets the whole layer against the world's own faces,
     // which is what stops a marker z-fighting with the block it is standing on.
     const wash = ACTION_WASH[tl.action[i]] ?? ACTION_WASH[6];
-    const liftY = Math.min(maxLift, ((seen0(bx, y, wz) ?? 0) * lift));
+    // One counter answers both questions about this voxel: how many claims were drawn here before (which
+    // sets the lift) and therefore whose turn it is in the stack (which sets how far out it reaches).
+    const depth = seen0(bx, y, wz) ?? 0;
+    const liftY = Math.min(maxLift, depth * lift);
+    const g = depth && stackGrow ? sizeOf(depth) : grow;
     const mx = bx + 0.5, my = y + 0.5, mz = wz + 0.5;
     for (let v = v0; v < stream.n; v++) {
       stream.col[v * 4] = (stream.col[v * 4] * wash[0]) | 0;
       stream.col[v * 4 + 1] = (stream.col[v * 4 + 1] * wash[1]) | 0;
       stream.col[v * 4 + 2] = (stream.col[v * 4 + 2] * wash[2]) | 0;
-      if (grow !== 1) {
+      if (g !== 1) {
         const p = v * 3;
-        stream.pos[p] = mx + (stream.pos[p] - mx) * grow;
-        stream.pos[p + 1] = my + (stream.pos[p + 1] - my) * grow;
-        stream.pos[p + 2] = mz + (stream.pos[p + 2] - mz) * grow;
+        stream.pos[p] = mx + (stream.pos[p] - mx) * g;
+        stream.pos[p + 1] = my + (stream.pos[p + 1] - my) * g;
+        stream.pos[p + 2] = mz + (stream.pos[p + 2] - mz) * g;
       }
       if (liftY) stream.pos[v * 3 + 1] += liftY;
     }
+    if (depth) { stats.stacked++; if (depth + 1 > stats.maxStack) stats.maxStack = depth + 1; }
     stats.quads += emitted / 6;
     mSec[m] = tl.sec[i]; mEnd[m] = stream.i; mRow[m] = i; mCx[m] = c.cx; mCz[m] = c.cz; m++;
     stats.markers = m;

@@ -8,8 +8,9 @@ import test from 'node:test';
 import { TL_NO_PLAYER, decodeTimeline, readPack, tlPackCoord } from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import {
-  ACTION_COLOUR, actionLinear, actionName, buildTimeQuads, filterRows, playhead, quadAt,
-  rowForBlock, voxelKey, voxelRows,
+  ACTION_COLOUR, actionLinear, actionName, beforeClaim, buildTimeQuads, CLAIMS_STAND, claimName,
+  filterRows,
+  arrivalOfBlock, nextRowForBlock, plainName, playhead, quadAt, rowForBlock, standsAt, voxelKey, voxelRows,
 } from '../web/js/ledger-time.mjs';
 
 const T = (s) => 1717174690000 + s * 1000;
@@ -351,4 +352,189 @@ test('a skipped row cannot shift which quad a block points at', () => {
     'the surviving row is the last QUAD, not the last row');
   const kill = rowForBlock(groups, g.quadSec, c00, tlPackCoord(4, 64, 4), 0);
   assert.equal(kill, null, 'the dropped chunk\'s blocks are not in the replay, so a click says nothing');
+});
+
+/**
+ * The pick question. Hovering or clicking has to answer for the moment being watched, and the only evidence
+ * for that moment is the log's own rows for that voxel: the mesh under a cursor is the world as it is today
+ * (or, inside the replay square, the playhead's), and outside that square a block placed three weeks after
+ * the playhead is standing in front of the user while the panel says it is June.
+ */
+const pickFx = () => {
+  const { pack, tl } = fixture();
+  const all = filterRows(tl);
+  const g = buildTimeQuads(tl, pack, all.order);
+  const groups = voxelRows(tl, g.quadRow);
+  let c00 = -1;
+  for (let i = 0; i < pack.cellCount; i++) {
+    const c = pack.cell(i);
+    if (c.cx === 0 && c.cz === 0) c00 = i;
+  }
+  const at = (x, y, z, sec) => standsAt(tl, groups, g.quadRow, g.quadSec, c00, tlPackCoord(x, y, z), sec);
+  return { pack, tl, g, groups, c00, at };
+};
+
+test('a voxel the filter has no rows for makes no claim, and the pick falls back', () => {
+  const { at } = pickFx();
+  assert.equal(at(9, 64, 9, 35), null, 'no row, no answer - not "air"');
+});
+
+test('a block placed after the moment is not standing at the moment', () => {
+  // 1,64,0 in the fixture: place at 10, break at 20, place again at 30.
+  const { at } = pickFx();
+  const early = at(1, 64, 0, 5);
+  assert.equal(early.stands, 0, 'before its only placements: nothing stands there');
+  assert.deepEqual([early.starts.sec, early.starts.cls], [10, 1], 'and the reason names the first claim');
+  assert.equal(claimName(early.starts.cls), 'place');
+  assert.equal(at(1, 64, 0, 10).stands, 1, 'at the placement it stands');
+  assert.equal(at(1, 64, 0, 15).stands, 1, 'and after it');
+});
+
+test('a block broken before the moment is not standing either, and says what comes next', () => {
+  const { at } = pickFx();
+  const gone = at(1, 64, 0, 25);
+  assert.equal(gone.stands, 0, 'the deciding row is the break at 20');
+  assert.equal(gone.sec, 20, 'the row that decided it');
+  assert.deepEqual([gone.starts.sec, gone.starts.cls], [30, 1], 'the next claim is the place at 30');
+  assert.equal(at(1, 64, 0, 35).stands, 1, 'placed again, so it stands again');
+  assert.equal(at(1, 64, 0, 35).later, 0, 'and nothing is left ahead of the moment');
+});
+
+test('a change or a later break proves the block stood before the log first spoke of it', () => {
+  const { at, tl, g } = pickFx();
+  // 3,66,3 has one `change` row at sec 50: a state swap is a block that is there, so the block stood even
+  // at a moment the log has never looked at. A place (1,64,0 at sec 10) is the opposite case: what stood
+  // under a placement is only knowable when the log named the block it replaced.
+  const chg = at(3, 66, 3, 5);
+  assert.equal(chg.stands, 1, 'older than its only row, but that row changed a standing block');
+  assert.deepEqual([chg.starts?.sec, chg.starts?.cls], [50, 0], 'and it still says when the log noticed it');
+  const oldest = g.quadRow[0];
+  assert.equal(tl.action[oldest], 1, 'the oldest row in the fixture is a placement');
+  assert.equal(tl.was?.[oldest] ?? 0, 0, 'and it names no block underneath');
+  assert.equal(beforeClaim(tl, oldest), 0, 'so a moment before a placement reads as nothing standing');
+});
+
+test('an action that says nothing about the voxel says nothing, rather than guessing air', () => {
+  const { at } = pickFx();
+  // 4,64,4 is a kill (byte 5) at sec 60: an entity dying in a doorway is not a claim about the doorway.
+  assert.equal(at(4, 64, 4, 65).stands, null, 'a kill leaves the block question to the chunks');
+  assert.equal(at(4, 64, 4, 65).cls, 5, 'but it still names the row that answers nothing');
+  assert.deepEqual(CLAIMS_STAND, [1, 1, 0, null, null, null, null],
+    'change/place stand, break does not, containers and kills make no claim');
+});
+
+test('the next claim search is the mirror of the deciding-row search', () => {
+  const { groups, g, c00 } = pickFx();
+  const key = tlPackCoord(1, 64, 0);
+  assert.deepEqual([nextRowForBlock(groups, g.quadSec, c00, key, 0)?.sec,
+    nextRowForBlock(groups, g.quadSec, c00, key, 11)?.sec,
+    nextRowForBlock(groups, g.quadSec, c00, key, 31)], [10, 20, null],
+  'at or after: the first one, the one after 11, and nothing after the last');
+  assert.equal(nextRowForBlock(groups, g.quadSec, c00, tlPackCoord(9, 64, 9), 0), null,
+    'a voxel with no rows still answers nothing');
+});
+
+/**
+ * The name-aware pick. "Does a block stand in this voxel" is the voxel's question; a cursor is pointing at
+ * one particular block, and the log can name that block's own arrival. This is the case that kept reading
+ * as a bug: the shell/LOD layers cannot be re-cut by the replay, so a wall the playhead has not built yet
+ * is painted on screen, and the pick agreed with the picture.
+ */
+const namedFx = () => {
+  const rows = [
+    [1, 9, 64, 9, 2, 1, T(0), 'minecraft:grass_block', ''],          // rel 0: older ground, nobody's house
+    [1, 5, 64, 5, 2, 1, T(100), 'minecraft:deepslate_bricks', 'minecraft:deepslate'], // rel 100: wall over ground
+    [1, 6, 64, 6, 3, 1, T(200), 'minecraft:air', 'minecraft:stone'],  // rel 200: a break names what left
+    [1, 7, 64, 7, 2, 1, T(300), 'minecraft:oak_stairs', ''],          // rel 300: stairs, nothing recorded under
+    [1, 8, 64, 8, 1, 1, T(400), 'minecraft:lever', 'minecraft:lever'],// rel 400: a state swap of a standing block
+  ];
+  const { buf } = buildPack(fakeLog(rows), 1, 'region', { heightOf: () => 64 });
+  const pack = readPack(buf);
+  const tl = decodeTimeline(buf.subarray(pack.tlBytes[0], pack.tlBytes[1]));
+  const all = filterRows(tl);
+  const g = buildTimeQuads(tl, pack, all.order);
+  const groups = voxelRows(tl, g.quadRow);
+  let c00 = -1;
+  for (let i = 0; i < pack.cellCount; i++) { const c = pack.cell(i); if (c.cx === 0 && c.cz === 0) c00 = i; }
+  const at = (x, y, z, sec, name) => standsAt(tl, groups, g.quadRow, g.quadSec, c00,
+    tlPackCoord(x, y, z), sec, name);
+  return { pack, tl, g, groups, c00, at };
+};
+
+test('the block a cursor is on is refused when the log says it arrives later', () => {
+  const { at, tl } = namedFx();
+  const early = at(5, 64, 5, 50, 'minecraft:deepslate_bricks');
+  assert.equal(early.stands, 0, 'the wall is placed at second 100, so it does not stand at 50');
+  assert.equal(early.arrival.sec, 100, 'and the refusal names the placement of THAT block, not just any row');
+  assert.equal(early.arrival.cls, 1, 'a placement is the arrival: a change swaps a block that already stood');
+  assert.equal(tl.nameOf(early.arrival.row), 'minecraft:deepslate_bricks', 'the row it quotes is the block itself');
+  assert.deepEqual([early.starts.sec, early.starts.cls], [100, 1], 'and the hover sentence can use the same row');
+  assert.equal(at(5, 64, 5, 100, 'minecraft:deepslate_bricks').stands, 1,
+    'at the placement second it stands: the row is at or before the moment, exactly as the decals draw it');
+  assert.equal(at(5, 64, 5, 150, 'minecraft:deepslate_bricks').stands, 1, 'and after it');
+  assert.equal(at(5, 64, 5, 150, 'minecraft:deepslate_bricks').arrival, undefined,
+    'a standing answer carries no arrival, so a card cannot print a contradiction');
+});
+
+test('a name that merely differs is not evidence of absence', () => {
+  const { at } = namedFx();
+  // The place at second 100 replaced deepslate. Ask about the deepslate, or about a block the voxel's rows
+  // never name: neither has an arrival row, so the verdict stays what the name-blind rules say (unknown -
+  // the log recorded a block underneath but not when IT arrived). Inventing a refusal here would hide a
+  // floor that really stands, and would look identical to an unlogged plugin edit.
+  assert.equal(at(5, 64, 5, 50, 'minecraft:deepslate').stands, null, 'the block under the wall: unknown');
+  assert.equal(at(5, 64, 5, 50, 'minecraft:dirt').stands, null, 'a block nobody logged here: unknown');
+  assert.equal(at(5, 64, 5, 50, 'minecraft:dirt').arrival, undefined, 'and no arrival is quoted for it');
+  assert.equal(at(5, 64, 5, 50).stands, null, 'with no name in the question, the old answer stands');
+});
+
+test('a properties-suffixed payload key matches the log\'s plain block name', () => {
+  const { at } = namedFx();
+  // The chunks spell a state `minecraft:oak_stairs|facing=north`, the ledger spells it `minecraft:oak_stairs`.
+  // Compare the strings as they arrive and every pick becomes "that block is not here", i.e. an outline
+  // that never shows.
+  assert.equal(plainName('minecraft:oak_stairs|facing=north'), 'minecraft:oak_stairs');
+  assert.equal(plainName('minecraft:stone'), 'minecraft:stone', 'no property, nothing to strip');
+  assert.equal(plainName(null), null, 'no name is still no name');
+  const p = at(7, 64, 7, 150, 'minecraft:oak_stairs|facing=north');
+  assert.equal(p.stands, 0, 'the stairs arrive at second 300, props or no props');
+  assert.equal(p.arrival.sec, 300);
+});
+
+test('a later break is not an arrival, and still proves the block stood', () => {
+  const { at } = namedFx();
+  // 6,64,6 has one break at second 200 (the log names the block that LEFT, `minecraft:stone`). At second 50
+  // the honest answer for stone is that it stood there until someone took it, and no placement contradicts
+  // that, so the name-aware rule must not turn the break into a refusal.
+  const s = at(6, 64, 6, 50, 'minecraft:stone');
+  assert.equal(s.stands, 1, 'the log\'s first word is that this block left: it was standing');
+  assert.equal(s.arrival, undefined, 'a break is not a placement');
+  assert.equal(at(8, 64, 8, 150, 'minecraft:lever').stands, 1,
+    'a change at second 400 is a state swap of a block that already stood');
+});
+
+test('the arrival search starts strictly after the moment it was asked about', () => {
+  const { at, tl, g, groups, c00 } = namedFx();
+  const key = tlPackCoord(5, 64, 5);
+  assert.equal(arrivalOfBlock(tl, groups, g.quadRow, g.quadSec, c00, key, 0, 'minecraft:deepslate_bricks').sec, 100,
+    'the wall arrives at second 100');
+  assert.equal(arrivalOfBlock(tl, groups, g.quadRow, g.quadSec, c00, key, 100, 'minecraft:deepslate_bricks'), null,
+    'a placement AT the playhead second is already drawn, so it is not "comes later"');
+  assert.equal(arrivalOfBlock(tl, groups, g.quadRow, g.quadSec, c00, key, 0, null), null,
+    'no name in the question asks nothing');
+  assert.equal(arrivalOfBlock(tl, groups, g.quadRow, g.quadSec, c00, tlPackCoord(9, 64, 9), 0, 'minecraft:grass_block'),
+    null, 'the grass_block placement at second 0 is not after second 0');
+  assert.equal(at(5, 64, 5, 100, 'minecraft:deepslate_bricks').stands, 1, 'same fact through the pick');
+});
+
+test('a refusal quotes the placement of the block it is refusing', () => {
+  // "Not there at the playhead" is only useful if it says when the block you pointed at arrives, and the
+  // row it quotes has to be that block's own placement, not the voxel's first row of any kind.
+  const { at } = namedFx();
+  const early = at(5, 64, 5, 50, 'minecraft:deepslate_bricks');
+  assert.deepEqual([early.arrival.sec, early.starts.sec, early.starts.cls], [100, 100, 1],
+    'the refusal and the "when does it start" line quote the same placement');
+  const gone = at(5, 64, 5, 150, 'minecraft:deepslate_bricks');
+  assert.equal(gone.stands, 1, 'at second 150 the wall stands: its placement at 100 is behind the moment');
+  assert.equal(gone.arrival, undefined, 'and a standing answer carries no arrival to contradict it');
 });

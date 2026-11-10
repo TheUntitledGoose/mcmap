@@ -46,7 +46,7 @@ import { decodeTimeline, readPack, tlPackCoord } from '../../shared/ledger-pack.
 // M12b: the time machine's data half - filters, decal geometry and the playhead index, all of it
 // testable without a browser (tests/web-timemachine.test.mjs). This page owns the mesh and the
 // scrubber; the numbers in the readouts come from the tested functions.
-import { actionName, buildTimeQuads, filterRows, playhead, quadAt, rowForBlock, voxelKey, voxelRows } from './ledger-time.mjs';
+import { actionName, buildTimeQuads, claimName, filterRows, playhead, plainName, quadAt, rowForBlock, standsAt, voxelKey, voxelRows } from './ledger-time.mjs';
 import { buildTimeBlocks, markerOfIndex, resetMarkerLift } from './ledger-blocks.mjs';
 
 
@@ -255,6 +255,13 @@ const S = {
   // its six faces are coplanar with the block's own and the claim reads as a tinted square painted on the
   // ground ("I see the 2D tile but no block"). 0.09 puts every face outside the real block. URL: ?timegrow=0
   timeGrow: Math.max(0, Math.min(0.5, num('timegrow', 0.09))),
+  // The newest claim at a voxel gets the block: a marker is scaled about its block centre by how many claims
+  // this filter already drew at that voxel, so a placement a break supersedes is ENCLOSED by the break instead
+  // of fighting it for the same pixels, and the break is what the outline and the click answer. 0.36 blocks is
+  // where that ramp saturates (measured over the baked overworld timeline with build/dbg-voxelstack.mjs: 6.8%
+  // of its 313,884 claimed voxels hold more than one claim, p99 holds one, and the worst holds 292, which is
+  // why the ramp saturates instead of growing a tower). URL: ?timestack=0
+  timeStack: num('timestack', 1) ? 1 : 0,
   // The detail ring's ceiling while the replay runs, in chunks, 0 = leave the radius alone. Asked for and
   // measured, then set down to 0 because it does not pay: at a 140 m pull-back with the 8-chunk default the
   // page held 361 detail meshes / 12.40 M verts / 92.5 fps settled, and 5,709 of the 27,790 changes drawn
@@ -263,6 +270,13 @@ const S = {
   // 24 chunks cost 2,601 meshes, 42.35 M verts and 24.5 fps for 117. The log spans a whole dimension, so a
   // wider sharp square is not how the rest of it becomes blocks - zooming in is. URL: ?timesharp=12
   timeSharp: Math.max(0, num('timesharp', 0)),
+  // Refuse a hover or a click on a block the log says did not stand at the playhead. The mesh under a
+  // cursor is today's world, so scrubbed back to 06-01 22:57 the outline used to land on a wall that is
+  // placed three weeks later, and "T" asked about it as if it were there. The answer comes from the log's
+  // own rows for that voxel (web/js/ledger-time.mjs:standsAt), so it is a claim against evidence and not a
+  // guess read off the mesh: a voxel the filtered log never touches is picked normally, because silence
+  // from the log is not evidence of absence. URL: ?timepick=0
+  timePick: num('timepick', 1) ? 1 : 0,
   // A line around the voxel under the cursor. Cheap by policy, not by luck: one reusable 24-vertex box
   // and one raycast at `hoverMs` intervals, because a highlight that allocates a mesh per hover is a
   // hitch per hover. URL: ?nohover, ?hoverms=60
@@ -3989,8 +4003,21 @@ async function askAt(x, y) {
   }
   const t = timeHitAt(x, y);
   if (t) { LEDGER.askWhy = `the ${TLAYER.look} marker for row ${t.row}`; return ledgerAsk(t.voxel[0], t.voxel[1], t.voxel[2]); }
-  const p = pickState(x, y);
+  const p = pickWorld(x, y);
   if (!p || !p.block) { LEDGER.askWhy = 'the pixel hit no drawn block'; closeLedgerCard(); return null; }
+  // A block the log says is not there at this moment is still worth asking about - its history answers
+  // "when did this appear" - but the answer has to lead with the fact that it is not standing now.
+  if (p.stand && p.stand.stands === 0) {
+    LEDGER.askWhy = `${p.drawn ?? 'detail'} block ${p.block.join(', ')} (not there at the playhead)`;
+    const why = p.stand.arrival
+      ? `at ${tlStamp(Math.round(S.timeAt))} ${p.block.join(', ')} is not standing: the log puts `
+        + `${plainName(p.state ?? p.shellState)} here only at ${tlStamp(p.stand.arrival.sec)}.`
+      : `at ${tlStamp(Math.round(S.timeAt))} ${p.block.join(', ')} is not standing: the log draws it `
+        + (p.stand.starts ? `${claimName(p.stand.starts.cls)} at ${tlStamp(p.stand.starts.sec)}.` : 'only later.');
+    showLedger(why);
+    showLedgerRefusal(p.block, why);
+    return null;
+  }
   LEDGER.askWhy = `${p.drawn ?? 'detail'} block ${p.block.join(', ')}`;
   return ledgerAsk(p.block[0], p.block[1], p.block[2]);
 }
@@ -4062,7 +4089,8 @@ function timeHitProbe(limit = 600) {
 // deepslate. One geometry, two LineSegments, reused every pass: a highlight that allocates per hover is
 // a hitch per hover, and this viewer has already been told about those.
 let hoverBox = null;
-const HOVER = { at: null, from: '', changes: 0, why: '', ms: 0, last: 0, passes: 0, skips: 0, boxMs: 0 };
+const HOVER = { at: null, from: '', changes: 0, why: '', ms: 0, last: 0, passes: 0, skips: 0, boxMs: 0,
+  stand: null, standWhy: '', refused: 0 };
 let pointerXY = null, pointerOut = false, pointerDown = false;
 let hoverSig = '', hoverDirty = true;
 canvas.addEventListener('pointermove', (e) => { pointerXY = [e.clientX, e.clientY]; pointerOut = false; hoverDirty = true; });
@@ -4130,10 +4158,23 @@ function timeDrawnAt(x, y, z) {
  * still asks the marker buffer, because one 42 ms click is nothing next to an answer the user asked for.
  */
 function hoverVoxel(x, y) {
-  const p = pickState(x, y);
+  const p = pickWorld(x, y);
   if (!p || !p.block) return null;
   const t = S.time ? timeDrawnAt(p.block[0], p.block[1], p.block[2]) : null;
-  return { voxel: p.block, from: p.drawn ?? 'detail', changes: t ? t.n : 0, row: t ? t.row : -1 };
+  const st = p.stand;
+  // A reason a person can act on, not a code: which moment decided, and what happened there.
+  let standWhy = '';
+  if (st && st.stands === 0) {
+    const seen = plainName(p.state ?? p.shellState);
+    standWhy = `${p.block.join(', ')} is not there at ${tlStamp(Math.round(S.timeAt))}`
+      + (st.arrival ? ` - the log puts ${seen} here only at ${tlStamp(st.arrival.sec)}`
+        : st.starts ? ` - the log's first claim for that voxel is ${claimName(st.starts.cls)} at ${tlStamp(st.starts.sec)}` : '')
+      + (st.n > 1 ? ` (${st.n} rows for this voxel)` : '');
+  }
+  return {
+    voxel: p.block, from: p.drawn ?? 'detail', changes: t ? t.n : 0, row: t ? t.row : -1,
+    stand: st, standWhy, p,
+  };
 }
 
 /** One pass per `hoverMs`, from the frame loop. Cheap when the cursor has not moved and nothing moved. */
@@ -4148,7 +4189,7 @@ function hoverPass(now) {
   // geometry under the ray. Running that every 90 ms while nobody and nothing moved is how a highlight
   // turns into the stutter this viewer exists to avoid, and during an orbit drag the cursor is not
   // pointing at anything. So re-pick on movement only - cursor, camera, or the playhead.
-  if (pointerDown) { HOVER.skips++; HOVER.why = 'dragging'; return; }
+  if (pointerDown) { HOVER.skips++; HOVER.stand = null; HOVER.standWhy = ''; HOVER.why = 'dragging'; return; }
   const sig = camSig();
   // A skip is a decision, so it gets a reason: a stale 'off' left over from the last time the highlight
   // was switched off reads as a setting the viewer never made.
@@ -4159,10 +4200,18 @@ function hoverPass(now) {
   const t0 = performance.now();
   const h = hoverVoxel(xy[0], xy[1]);
   HOVER.ms = performance.now() - t0;
-  if (!h) { g.visible = false; HOVER.at = null; HOVER.why = 'nothing under the cursor'; return; }
+  if (!h) { g.visible = false; HOVER.at = null; HOVER.stand = null; HOVER.why = 'nothing under the cursor'; return; }
   HOVER.at = h.voxel;
   HOVER.from = h.from;
   HOVER.changes = h.changes || 0;
+  HOVER.stand = h.stand ? h.stand.stands : null;
+  HOVER.standWhy = h.standWhy ?? '';
+  // The block is drawn, but the log says it does not stand at this moment: no outline. Highlighting it
+  // would invite a click on a wall that has not been placed yet.
+  if (h.stand && h.stand.stands === 0) {
+    g.visible = false; HOVER.at = null; HOVER.refused++;
+    HOVER.why = h.standWhy || 'not there at the playhead'; return;
+  }
   HOVER.why = '';
   g.visible = true;
   g.position.set(h.voxel[0] + 0.5, h.voxel[1] + 0.5, h.voxel[2] + 0.5);
@@ -4221,6 +4270,25 @@ function closeLedgerCard() {
 function showLedger(text) {
   hud.msg.textContent = text;
   hud.msg.classList.remove('err');
+}
+
+/**
+ * A refusal in the place a person looks after a click. The one-line message under the fps pill is where a
+ * status goes; "this block is not there yet, and here is when it arrives" is an answer, so it gets the card,
+ * with the reason as its headline and no row list that could be misread as a history of a standing block.
+ */
+function showLedgerRefusal(block, sentence) {
+  const el = ledgerCardEl();
+  el.textContent = '';
+  LEDGER.cardRows = 0; LEDGER.cardTotal = 0;
+  const head = document.createElement('div');
+  head.className = 'lcard-head';
+  head.append(document.createTextNode(sentence));
+  const x = document.createElement('button');
+  x.className = 'lcard-x'; x.textContent = '\u00d7'; x.title = 'close (Esc)';
+  x.addEventListener('click', closeLedgerCard);
+  head.append(x);
+  el.append(head);
 }
 
 function showLedgerCard({ block, rows, out }) {
@@ -4367,8 +4435,10 @@ const TLAYER = {
   // itemEnd is the cumulative INDEX count per drawn item, which is what a draw range becomes then;
   // look says what was actually built, and lookWhy says why a requested look was refused.
   itemEnd: null, look: '', lookWhy: '', lookBytes: null, markerEnd: null,
+  stacked: 0, maxStack: 0,      // claims sharing a voxel with an earlier one, and the deepest stack
   mCx: null, mCz: null, // which chunk each drawn marker stands in, for the replay-reach note
   voxel: null,           // Map block -> its quads, built on the first click on a block card
+  cells: null,           // Map "cx,cz" -> pack cell index, for a pick that starts from world blocks
   hitMs: 0,              // one raycast of the marker buffer, which is why a hover does not do it
   voxelFrom: null, voxelMs: 0, jumpMs: 0,
   cellsAt: null, cellsPack: null,   // "cx,cz" -> cell index, for a card that names a chunk
@@ -4538,7 +4608,8 @@ function timeRebuild() {
     for (const lk of tries) {
       resetMarkerLift();
       const b = buildTimeBlocks(TLAYER.tl, LEDGER.pack, got.order, assets, blockNameIds(),
-        { plates: lk === 'plates', grow: 1 + 2 * S.timeGrow });
+        { plates: lk === 'plates', grow: 1 + 2 * S.timeGrow,
+          stackGrow: S.timeStack ? 0.36 : 0 });
       lookMb[lk] = Math.round(b.stats.bytes / 1048576);
       const lastTried = lk === tries[tries.length - 1];
       if (b.stats.bytes <= budget || lastTried) {
@@ -4572,6 +4643,7 @@ function timeRebuild() {
     TLAYER.itemEnd = TLAYER.markerEnd = built.markerEnd;
     TLAYER.mCx = built.markerCx; TLAYER.mCz = built.markerCz;
     TLAYER.quads = built.stats.markers; TLAYER.verts = built.stats.verts;
+    TLAYER.stacked = built.stats.stacked; TLAYER.maxStack = built.stats.maxStack;
     if (built.stats.unknown) TLAYER.err = `${built.stats.unknown.toLocaleString()} changes name something this atlas has no model for`;
     geo.setAttribute('position', new THREE.BufferAttribute(built.pos, 3));
     geo.setAttribute('uv', new THREE.BufferAttribute(built.uv, 2));
@@ -5276,6 +5348,18 @@ function timeStamp(ms) {
     + ` ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
+/**
+ * The same clock with the year, for sentences that compare two moments the log can be 27 months apart in.
+ * "not there at 05-31 ... it arrives at 06-03" reads as three days when it is two years, and a refusal is
+ * exactly the sentence a person uses to decide where to scrub next.
+ */
+function timeStampFull(ms) {
+  const d = new Date(ms);
+  const p = (v, n = 2) => String(v).padStart(n, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`
+    + ` ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
 const ledgerClassOptions = () => [
   { value: '0', label: 'any kind of action' },
   ...LEDGER_CLASSES.map((c) => ({ value: String(c.id), label: c.name })),
@@ -5324,6 +5408,52 @@ function pickState(x, y) {
     shellColumn: shellColKey,
     quads: cell && cell.map((q) => ({ tex: q.tex, dir: q.dir, id: assets.textures[q.tex]?.id ?? null })),
   };
+}
+
+/** The wall-clock date of a timeline second, in the form the panel prints. */
+const tlDate = (sec) => timeStamp((TLAYER.tl.timeBaseSec + sec) * 1000);
+// A sentence that names two moments uses the year; a panel value does not.
+const tlStamp = (sec) => timeStampFull((TLAYER.tl.timeBaseSec + sec) * 1000);
+
+/**
+ * Does the log say a block stands in this voxel at the playhead? 1 yes, 0 no, null when the filtered log
+ * says nothing about this voxel - which is NOT the same as "no".
+ *
+ * This exists because the geometry under a cursor is not the world at the moment being looked at. Inside
+ * the replay square the terrain agrees with the playhead; everywhere else it is today, and every block
+ * placed after the playhead is standing there in front of the user while the panel says it is June.
+ */
+function timeStandAt(x, y, z, name = null) {
+  if (!S.time || !S.timePick || !TLAYER.tl || !TLAYER.quadRow) return null;
+  const cell = timeCellIndex()?.get(`${x >> 4},${z >> 4}`);
+  if (cell === undefined) return null;      // the log never touched this chunk: it makes no claim
+  return standsAt(TLAYER.tl, timeVoxelIndex(), TLAYER.quadRow, TLAYER.quadSec, cell,
+    (x & 15) | ((z & 15) << 4) | ((y + 4096) << 8), Math.round(S.timeAt), name);
+}
+
+/**
+ * Pack chunk-index -> cell index, memoised on the pack. The timeline speaks in cell indices, and the pick
+ * path starts from a world coordinate, so it needs this table once. `HIST.cellsAt` holds the same thing,
+ * but only while the voxel undo is running; a pick must answer with the undo switched off too, so the
+ * time layer owns its own copy.
+ */
+function timeCellIndex() {
+  const p = LEDGER.pack;
+  if (!p) return null;
+  if (TLAYER.cells && TLAYER.cellsFrom === p) return TLAYER.cells;
+  const m = new Map();
+  for (let i = 0; i < p.cellCount; i++) { const c = p.cell(i); m.set(`${c.cx},${c.cz}`, i); }
+  TLAYER.cells = m;
+  TLAYER.cellsFrom = p;
+  return m;
+}
+
+/** What the world layers draw under a pixel, plus whether that voxel stands at the playhead. */
+function pickWorld(x, y) {
+  const p = pickState(x, y);
+  // The block's own name travels with the question: "does a block stand here" and "does THE block the
+  // cursor is on stand here" are different questions, and the second is the one a person is asking.
+  return p ? { ...p, stand: timeStandAt(p.block[0], p.block[1], p.block[2], p.state ?? p.shellState) } : null;
 }
 
 // One bulk read of the drawing buffer. Per-pixel readPixels forces a full render each time, which
@@ -5718,6 +5848,9 @@ window.__world = {
     filterMs: +TLAYER.filterMs.toFixed(1), buildMs: +TLAYER.buildMs.toFixed(1),
     drawRange: TLAYER.mesh ? [TLAYER.mesh.geometry.drawRange.start, TLAYER.mesh.geometry.drawRange.count] : null,
     look: TLAYER.look, lookWhy: TLAYER.lookWhy, lookWant: S.timeLook, lookBytes: TLAYER.lookBytes,
+    // the gap between claims and voxels, which is what a person means by "overlapping": how many claims
+    // share a voxel with an earlier one, and how deep the deepest such stack goes
+    stacked: TLAYER.stacked ?? 0, maxStack: TLAYER.maxStack ?? 0, stackRamp: !!S.timeStack,
     geomMbCap: S.timeGeomMb,
     markerGeoMb: TLAYER.mesh ? +(TLAYER.mesh.geometry.attributes.position.array.byteLength
       / 1048576).toFixed(1) : 0,
@@ -5731,7 +5864,10 @@ window.__world = {
   }),
   timeLoad, timeRebuild, timeApply, timeGoto, timePermille, timeSeekRow, timeRowAt, setTime, setTimePlay, timeNote,
   setTimeLook, blockNameIds, askAt, timeHitAt, timeHitProbe, timeRowWorld, timeDrawnAt,
-  hover: () => ({ ...HOVER, setting: !!S.hover, everyMs: S.hoverMs, clickRayMs: TLAYER.hitMs }),
+  hover: () => ({ ...HOVER, setting: !!S.hover, playheadPick: !!S.timePick,
+    everyMs: S.hoverMs, clickRayMs: TLAYER.hitMs }),
+  pickWorld: (x = innerWidth / 2, y = innerHeight / 2) => pickWorld(x, y),
+  timeStandAt,
   // Counters are lifetime unless a probe zeroes them: "passes 1, skips 394" is only an IDLE measurement if
   // the window being measured starts at zero.
   hoverReset: () => { HOVER.passes = 0; HOVER.skips = 0; HOVER.ms = 0; HOVER.why = ''; return { ...HOVER }; },
@@ -6437,6 +6573,18 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
           if (ledgerHeatMat) ledgerHeatMat.depthTest = !S.ledgerXray;
           if (timeDecalMat) timeDecalMat.depthTest = !S.ledgerXray; },
         hint: 'an overlay that sits on the ground is honest and unreadable at whole-world scale: the hill\nin front of the valley hides the valley. Painting through the terrain turns it into a map of the\nlog; turn it off to ask whether the activity is visible from where you are. This switch only moves\nthe FLAT layers (heat tiles, and change tiles if a change looks like a tile): a change drawn as its\nown block always obeys walls, because a block seen through a house is a lie. URL: ?noledgerxray' },
+      { key: 'timePick', label: 'the outline only stands where the playhead says', kind: 'check',
+        fmt: () => (S.timePick ? (HOVER.refused ? `${HOVER.refused.toLocaleString()} refused` : 'on') : 'off'),
+        get: () => !!S.timePick, set: (v) => { S.timePick = v ? 1 : 0; hoverDirty = true; HOVER.refused = 0; },
+        hint: 'The mesh under a cursor is the world as it is today, so scrubbed back the wire box used to sit on a\n'
+          + 'wall that is placed three weeks after the playhead, and a click asked about it as if it stood there.\n'
+          + 'Now the log decides: the rows for that voxel say whether a block stood at this moment, and a block the\n'
+          + 'log names as placed after the moment is not outlined and not clickable, with the arrival date spelled\n'
+          + 'out: "-52, 76, -133 is not there at 2024-05-31 16:58:10 - the log puts minecraft:deepslate_bricks here\n'
+          + 'only at 2024-06-03 16:53:29". A name the log never mentions is not refused, and a voxel the filter\n'
+          + 'never mentions is picked normally: silence is not evidence of absence, and 77% of this dimension\'s\n'
+          + 'rows name no player at all. Cost: 0.0005 ms per hover answer, against 38-220 ms for a marker ray.\n'
+          + 'URL: ?timepick=0' },
       { key: 'hoverOn', label: 'outline under the cursor', kind: 'check', live: false,
         fmt: () => (HOVER.at ? `${HOVER.at.join(', ')} - ${HOVER.from}` : (HOVER.why || 'off')),
         hint: 'A wire box around the one block the cursor is on, so "what did I just point at" has an\nanswer without clicking. It turns the change-layer green when the playhead has a logged change drawn on\nthat voxel, which is a Map lookup (0.0005 ms) rather than a ray against the marker buffer (42 ms).\nThe pick itself is 17.5 ms at the house framing, so it only runs when the cursor, the camera or the\nplayhead moved, and never during an orbit drag. Two colours (pale outside, dark inside) because a\nsingle-colour outline vanishes on either grass or deepslate. One box, reused.\nURL: ?nohover, ?hoverms=',
