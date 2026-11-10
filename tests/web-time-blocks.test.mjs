@@ -238,3 +238,38 @@ test('the real overworld place filter fits under the default ceiling, as blocks'
   assert.ok(b.stats.verts < 4_000_000);
   assert.ok(b.stats.markers > 80000);
 });
+
+// Why this exists: a viewer saw green squares over ground and no blocks, and asked if only the first N
+// ledger rows are replayed. Half the answer is reach (the voxel replay only runs where a full-resolution
+// chunk mesh paints the ground), and the half these lines can pin is that the marker itself was flush with
+// the block it describes - six faces coplanar with the real block's own, which reads as a painted tile.
+test('a marker is bigger than its block by the grow factor, and grow=1 is flush again', () => {
+  const boxOf = (b) => {
+    let lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (let i = 0; i < b.pos.length; i += 3) {
+      for (let k = 0; k < 3; k++) {
+        lo[k] = Math.min(lo[k], b.pos[i + k]); hi[k] = Math.max(hi[k], b.pos[i + k]);
+      }
+    }
+    return { lo, hi };
+  };
+  const flush = boxOf(build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10]], { grow: 1 }));
+  assert.deepEqual(flush.lo, [2, 64, 3], 'one unit of grow is the block itself, in world blocks');
+  assert.deepEqual(flush.hi, [3, 65, 4]);
+
+  const grown = boxOf(build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10]], { grow: 1.18 }));
+  const out = 0.09;
+  assert.ok(flush.lo[0] - grown.lo[0] > out - 1e-4 && grown.hi[0] - flush.hi[0] > out - 1e-4,
+    `a 0.09 grow must stand outside the block on both sides, got ${flush.lo[0] - grown.lo[0]} / ${grown.hi[0] - flush.hi[0]}`);
+  assert.ok(grown.lo[1] < flush.lo[1] && grown.hi[1] > flush.hi[1], 'grow must be about the block centre in y too');
+});
+
+test('the builder says which chunk each marker stands in, which is how far the replay reaches', () => {
+  const a = build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10]]);
+  assert.deepEqual([a.markerCx[0], a.markerCz[0]], [0, 0], 'a block at 2,3 sits in chunk 0,0');
+  const b = build([[2, 64, 3, 3, 'minecraft:air', 'minecraft:stone', 10],
+    [18, 64, 3, 2, 'minecraft:oak_planks', 'minecraft:air', 20]]);
+  assert.equal(b.stats.markers, 2);
+  assert.deepEqual(Array.from(b.markerCx), [0, 1], 'the second row stands in the next chunk over');
+  assert.deepEqual(Array.from(b.markerCz), [0, 0]);
+});

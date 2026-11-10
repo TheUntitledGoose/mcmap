@@ -14,6 +14,13 @@
 // filter's time order, so `markerEnd[m]` (how many INDICES exist up to and including marker m) is ascending
 // and a playhead is one binary search plus one number, exactly as `quadSec` works for the tile layer.
 //
+// Why the cube is a hair bigger than the block (the `grow` option): a drawn placement marker whose chunk
+// the terrain replay has already corrected stands in the SAME voxel as the block it describes, so all six
+// of its faces are coplanar with that block's faces. Coplanar plus one polygon-offset is a tinted square
+// painted on the roof, which is what a person reads as "a flat 2D tile, and no block". Scaling the marker
+// about the block centre by a fraction of a block puts every face outside the real one, and the same claim
+// reads as a block.
+//
 // Two honest limits:
 //   A row whose block name the atlas does not know (entity kills, item actions, mod objects that were never
 //   baked) has no shape to draw. They are counted in `stats.unknown` and, when the atlas has a placeholder
@@ -63,9 +70,12 @@ const FAKE_CHUNK = { cx: 0, cz: 0 };
  *   markerSec  the row's second, ascending - binary search it with `quadAt`
  *   markerEnd  cumulative INDEX count through this marker - the draw range is `markerEnd[n-1]`
  *   markerRow  the timeline row, so a click on a face answers with the right row
+ *   markerCx/markerCz the CHUNK each marker stands in, so the page can say how many of the changes it
+ *              draws fall inside the square where the blocks themselves replay (a note, not a guess)
  */
 export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
-  const { plates = false, maxQuads = 0, lift = 0.004, maxLift = 0.08 } = opts;
+  // `grow` is a scale about the block centre: 1 is exactly the block, 1.18 sticks out 0.09 blocks a side.
+  const { plates = false, maxQuads = 0, lift = 0.004, maxLift = 0.08, grow = 1 } = opts;
   const cellAt = typeof cells?.cell === 'function' ? (i) => cells.cell(i) : (i) => cells?.[i];
   const stream = new VertexStream(4096, { indexed: true });
   // emitQuad picks a pass out of an array by sprite kind (opaque / cutout / translucent). A marker wants
@@ -81,6 +91,8 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   const mSec = new Uint32Array(order.length);
   const mEnd = new Uint32Array(order.length);
   const mRow = new Int32Array(order.length);
+  const mCx = new Int32Array(order.length);
+  const mCz = new Int32Array(order.length);
   let m = 0;
 
   for (let k = 0; k < order.length; k++) {
@@ -127,14 +139,21 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     // which is what stops a marker z-fighting with the block it is standing on.
     const wash = ACTION_WASH[tl.action[i]] ?? ACTION_WASH[6];
     const liftY = Math.min(maxLift, ((seen0(bx, y, wz) ?? 0) * lift));
+    const mx = bx + 0.5, my = y + 0.5, mz = wz + 0.5;
     for (let v = v0; v < stream.n; v++) {
       stream.col[v * 4] = (stream.col[v * 4] * wash[0]) | 0;
       stream.col[v * 4 + 1] = (stream.col[v * 4 + 1] * wash[1]) | 0;
       stream.col[v * 4 + 2] = (stream.col[v * 4 + 2] * wash[2]) | 0;
+      if (grow !== 1) {
+        const p = v * 3;
+        stream.pos[p] = mx + (stream.pos[p] - mx) * grow;
+        stream.pos[p + 1] = my + (stream.pos[p + 1] - my) * grow;
+        stream.pos[p + 2] = mz + (stream.pos[p + 2] - mz) * grow;
+      }
       if (liftY) stream.pos[v * 3 + 1] += liftY;
     }
     stats.quads += emitted / 6;
-    mSec[m] = tl.sec[i]; mEnd[m] = stream.i; mRow[m] = i; m++;
+    mSec[m] = tl.sec[i]; mEnd[m] = stream.i; mRow[m] = i; mCx[m] = c.cx; mCz[m] = c.cz; m++;
     stats.markers = m;
   }
 
@@ -148,6 +167,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   return {
     pos: done.position, uv: done.uv, col: done.color, idx: done.index,
     markerSec: mSec.subarray(0, m), markerEnd: mEnd.subarray(0, m), markerRow: mRow.subarray(0, m),
+    markerCx: mCx.subarray(0, m), markerCz: mCz.subarray(0, m),
     stats,
   };
 }

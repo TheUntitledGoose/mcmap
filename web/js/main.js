@@ -238,14 +238,31 @@ const S = {
   timeTerrainMax: Math.max(1, num('timeterrainmax', 192)),          // chunks re-cut per playhead sync
   timeTiles: num('timetiles', 1) ? 1 : 0,                           // the per-change markers; the playhead works without them
   // M12b tier 3: what a logged change LOOKS like, and the ceiling that decides whether it can afford to.
-  // Measured over the whole overworld filter (build/dbg-ghostcost.mjs, real atlas, real timeline):
-  //   90,045 place rows  = 553,726 quads / 66 MB as the block's own model, 117,651 quads / 14 MB as a
-  //                        textured top face, 90,045 quads / 11 MB as a flat coloured tile
-  //   351,531 any-change = 2.94M quads / 352 MB as blocks, 1.65M quads / 198 MB as plates
-  // so blocks are tried first and the look steps DOWN when it would not fit timeGeomMb, in the panel's
-  // line of sight rather than silently. URL: ?timelook=plates, ?timegeommb=256
+  // Measured in the page at the house framing (?goto=-46,75,-135&dist=140, build/q_t4looks.js) over this
+  // dimension's real timeline and real atlas, as MB the builder counts / positions+indices on the GPU:
+  //   89,613 place rows   = 63 MB / 38 MB, 2.21 M verts, 0.24 s to build
+  //   331,040 any-change  = 336 MB / 202 MB, 11.74 M verts, 0.92 s to build, 64 fps with every one of
+  //                        them drawn and 236 fps with 27,644 of them (8.35 %) behind the playhead;
+  //                        as plates 189 MB / 113 MB, 233 fps with all of them drawn
+  // so blocks are tried first and the look steps DOWN when it would not fit timeGeomMb - and the panel
+  // sentence then names both numbers and the row that moves them. The 384 default is sized so the biggest
+  // filter this save has can still draw blocks: at 128 that filter stepped to flat plates, which is what
+  // made the replay read as "2D tiles with no blocks in them". URL: ?timelook=plates, ?timegeommb=128
   timeLook: word('timelook', 'blocks', ['blocks', 'plates', 'tiles']),
-  timeGeomMb: Math.max(2, Math.min(2048, num('timegeommb', 128))),
+  timeGeomMb: Math.max(2, Math.min(2048, num('timegeommb', 384))),
+  // How far a block marker stands out past the block it describes, in blocks per side. A marker for a
+  // change the terrain replay has already corrected sits in the same voxel as that block, so without this
+  // its six faces are coplanar with the block's own and the claim reads as a tinted square painted on the
+  // ground ("I see the 2D tile but no block"). 0.09 puts every face outside the real block. URL: ?timegrow=0
+  timeGrow: Math.max(0, Math.min(0.5, num('timegrow', 0.09))),
+  // The detail ring's ceiling while the replay runs, in chunks, 0 = leave the radius alone. Asked for and
+  // measured, then set down to 0 because it does not pay: at a 140 m pull-back with the 8-chunk default the
+  // page held 361 detail meshes / 12.40 M verts / 92.5 fps settled, and 5,709 of the 27,790 changes drawn
+  // in view stood inside the square where a block can change. Raising the ceiling to 12 chunks doubled the
+  // meshes (729) and verts (17.44 M) and cost a third of the frames (56.5 fps) to cover 61 more changes;
+  // 24 chunks cost 2,601 meshes, 42.35 M verts and 24.5 fps for 117. The log spans a whole dimension, so a
+  // wider sharp square is not how the rest of it becomes blocks - zooming in is. URL: ?timesharp=12
+  timeSharp: Math.max(0, num('timesharp', 0)),
   // A line around the voxel under the cursor. Cheap by policy, not by luck: one reusable 24-vertex box
   // and one raycast at `hoverMs` intervals, because a highlight that allocates a mesh per hover is a
   // hitch per hover. URL: ?nohover, ?hoverms=60
@@ -701,8 +718,13 @@ function updateView() {
   // Under centre anchoring the ring does not collapse either: the point of the anchor is that the
   // sharp ground sits in the middle of the frame at any zoom, and a ring that shrinks on a wheel
   // gesture is exactly the unload/reload churn that made the view feel broken.
+  // The replay can only move a block where a full-resolution chunk mesh paints the ground. Raising that
+  // square for the replay was tried and measured (see "timeSharp"): the log spans a whole dimension, so the
+  // extra meshes covered ~1 % more of the drawn changes and cost a third of the frames. The ceiling stays
+  // where the user put it, and the panel note says what fraction of the drawn changes blocks can reach.
+  const capD = (S.time && S.timeTerrain && S.timeSharp > S.radius) ? S.timeSharp : S.radius;
   const wantD = (S.shellOn && S.detailLod && (S.lodAnchor !== 'center' || S.detailPixels))
-    ? detailRadius(rig.dist, pxPerRad(), S.detailPx, S.radius) : S.radius;
+    ? detailRadius(rig.dist, pxPerRad(), S.detailPx, capD) : capD;
   // Grow at once - detail that arrives late is a visible hole. Shrink only once it is clearly more
   // than needed, so a wheel drag does not thrash 300 chunks between mesh and demote every frame.
   detailR = wantD >= detailR ? wantD : (wantD <= detailR - 2 ? wantD : detailR);
@@ -4344,7 +4366,8 @@ const TLAYER = {
   // Block-shaped markers (M12b tier 3) are not quads: a cube is 36 indices, a plant model 12 or 24.
   // itemEnd is the cumulative INDEX count per drawn item, which is what a draw range becomes then;
   // look says what was actually built, and lookWhy says why a requested look was refused.
-  itemEnd: null, look: '', lookWhy: '', markerEnd: null,
+  itemEnd: null, look: '', lookWhy: '', lookBytes: null, markerEnd: null,
+  mCx: null, mCz: null, // which chunk each drawn marker stands in, for the replay-reach note
   voxel: null,           // Map block -> its quads, built on the first click on a block card
   hitMs: 0,              // one raycast of the marker buffer, which is why a hover does not do it
   voxelFrom: null, voxelMs: 0, jumpMs: 0,
@@ -4483,8 +4506,14 @@ function timeRebuild() {
   // decoder guarantees ascending time) is what lets editsForCell walk a chunk's rows newest-first.
   HIST.byCell = rowsByCell(TLAYER.tl, got.order);
   // A filter change is a different set of rows, so no held mark means anything any more - not even one
-  // whose suffix count happens to match. The marks go with it.
-  HIST.marks.clear();
+  // whose suffix count happens to match, so the marks go with it. A LOOK or ceiling change is not a filter
+  // change, and clearing there used to throw away the only evidence the page held of what it had already
+  // undone: measured at the house framing, the first arm marked 316 chunks / 33,764 voxel writes, then
+  // moving "overlay memory" cleared the marks, the mesh keys did not change (same playhead, same suffixes)
+  // so nothing re-cut, and the note said 0 chunks / 0 blocks undone over terrain visibly still undone.
+  // The signature below is the row set, so the marks survive a look change and die with a filter change.
+  const fsig = `${TLAYER.tl.dimKey}|${TLAYER.gen}|${S.ledgerWho}|${S.timeCls}|${S.timeLimit}|${got.n}`;
+  if (HIST.filterSig !== fsig) { HIST.marks.clear(); HIST.filterSig = fsig; }
   TLAYER.filterMs = performance.now() - t0;
   TLAYER.rows = got.n; TLAYER.other = got.other; TLAYER.truncated = got.truncated;
   if (!got.n) {
@@ -4502,18 +4531,30 @@ function timeRebuild() {
   const t1 = performance.now();
   const budget = S.timeGeomMb * 1024 * 1024;
   let built = null, look = 'tiles', why = '';
+  const lookMb = {};
+  TLAYER.lookBytes = lookMb;
   if (S.timeLook !== 'tiles' && assets) {
     const tries = S.timeLook === 'plates' ? ['plates'] : ['blocks', 'plates'];
     for (const lk of tries) {
       resetMarkerLift();
       const b = buildTimeBlocks(TLAYER.tl, LEDGER.pack, got.order, assets, blockNameIds(),
-        { plates: lk === 'plates' });
+        { plates: lk === 'plates', grow: 1 + 2 * S.timeGrow });
+      lookMb[lk] = Math.round(b.stats.bytes / 1048576);
       const lastTried = lk === tries[tries.length - 1];
       if (b.stats.bytes <= budget || lastTried) {
         built = b; look = lk;
+        // Two refusals, and the sentence has to tell them apart. "Drawing it anyway because you asked
+        // for it" is true only when the look on screen IS the look that was asked for. Stepping from
+        // blocks to flat plates is a ceiling decision, and a viewer who asked for blocks and got plates
+        // needs the two numbers and the row that moves them - that is the difference between "the time
+        // machine draws 2D tiles, no blocks" reading as broken and reading as a price.
         if (b.stats.bytes > budget) {
-          why = `${lk} at this filter is ${Math.round(b.stats.bytes / 1048576)} MB, over the`
-            + ` ?timegeommb= ${S.timeGeomMb} MB ceiling - drawing it anyway because you asked for it`;
+          why = look !== S.timeLook
+            ? `this filter would be ${lookMb.blocks} MB as the block itself and ${lookMb[lk]} MB as a flat plate,`
+              + ` and "overlay memory" says ${S.timeGeomMb} MB - so it is drawn as plates:`
+              + ` set "overlay memory" to ${lookMb.blocks} MB to see the blocks themselves`
+            : `${lk} at this filter is ${lookMb[lk]} MB, over the ${S.timeGeomMb} MB ceiling`
+              + ' - drawing it anyway because you asked for it';
         }
         break;
       }
@@ -4529,6 +4570,7 @@ function timeRebuild() {
     TLAYER.quadSec = built.markerSec;
     TLAYER.quadRow = built.markerRow;
     TLAYER.itemEnd = TLAYER.markerEnd = built.markerEnd;
+    TLAYER.mCx = built.markerCx; TLAYER.mCz = built.markerCz;
     TLAYER.quads = built.stats.markers; TLAYER.verts = built.stats.verts;
     if (built.stats.unknown) TLAYER.err = `${built.stats.unknown.toLocaleString()} changes name something this atlas has no model for`;
     geo.setAttribute('position', new THREE.BufferAttribute(built.pos, 3));
@@ -4539,6 +4581,7 @@ function timeRebuild() {
   } else {
     const g = buildTimeQuads(TLAYER.tl, LEDGER.pack, got.order, { shrink: S.decalShrink });
     TLAYER.itemEnd = null; TLAYER.markerEnd = null;
+    TLAYER.mCx = null; TLAYER.mCz = null;
     TLAYER.quadSec = g.quadSec;
     TLAYER.quadRow = g.quadRow;
     TLAYER.quads = g.quads; TLAYER.verts = g.verts;
@@ -4595,8 +4638,10 @@ function timeApply() {
   // cross-model plant is 12, so the prefix comes out of the build as a per-item cumulative count.
   TLAYER.mesh.geometry.setDrawRange(0, TLAYER.itemEnd ? (n ? TLAYER.itemEnd[n - 1] : 0) : n * 6);
   // Tiles off is a real mode, not a cosmetic one: with the terrain undo on, the blocks themselves show
-  // the playhead, and a tile per logged change over a canopy only hides that. The playhead, the date and
-  // the voxel undo all keep working; only the decal mesh stops being drawn.
+  // the playhead, and a marker per logged change over a canopy only hides that. It hides THIS mesh,
+  // whatever the look made it: at the block look the mesh is the block shapes, so off means the overlay
+  // is gone entirely (the panel says so) - not just the flat tiles. The playhead, the date and the voxel
+  // undo all keep working; only the drawn overlay stops.
   TLAYER.mesh.visible = !!S.timeTiles && n > 0;
   TLAYER.drawn = n;
   TLAYER.sec = ph.sec;
@@ -4676,6 +4721,7 @@ const HIST = {
   on: 0, gen: 0, sec: -1, cur: -1,
   packFrom: null, cellsAt: null,   // "cx,cz" -> cell index, rebuilt when the cell table changes
   byCell: null,                    // cell index -> this filter's rows, ascending in time
+  filterSig: '',                   // the row set those marks were cut from; a new set invalidates them
   marks: new Map(),                // "cx,cz" -> {gen, edits, unknown, truncated}, one per (chunk, playhead)
   stamps: new Map(),               // "cx,cz" -> history stamp, valid for HIST.gen
   ids: null, airId: 0,
@@ -4921,6 +4967,57 @@ const histStats = () => ({
   step: S.timeTerrainStep, cap: S.timeTerrainMax, limit: S.timeTerrainLimit, err: HIST.err,
 });
 
+/**
+ * Where each half of the time machine actually reaches. The markers cover the whole dimension; the
+ * blocks only change where a full-resolution chunk mesh paints the ground, which is a square of `detailR`
+ * chunks around the middle of the view. Without this number a viewer says "the replay is broken" when
+ * what happened is that the change stands on ground this view paints from a heightfield.
+ */
+let splitCache = { at: -1, sec: -1, marks: -1, builds: -1, gen: -1, v: null };
+function timeSplit() {
+  const drawn = TLAYER.drawn ?? 0;
+  const c = splitCache;
+  // `HIST.marked` is a per-sync count, not a lifetime one, so it repeats while the mark set keeps growing
+  // (the ring widens, more chunks get edits at the same playhead). The map size and the install count are
+  // what actually move when the answer moves.
+  if (c.v && c.at === drawn && c.sec === HIST.sec && c.marks === HIST.marks.size
+    && c.builds === HIST.buildTotal && c.gen === HIST.gen) {
+    return c.v;
+  }
+  const pack = (cx, cz) => (cx + 32768) * 65536 + (cz + 32768);
+  const cut = new Set();
+  for (const [k, e] of HIST.marks) {
+    if (!e.edits.length) continue;
+    const i = k.indexOf(',');
+    cut.add(pack(+k.slice(0, i), +k.slice(i + 1)));
+  }
+  let inRing = 0, inCut = 0, outside = 0;
+  const [mcx, mcz] = centerChunk();
+  const n = Math.min(drawn, TLAYER.mCx ? TLAYER.mCx.length : 0);
+  for (let i = 0; i < n; i++) {
+    const cx = TLAYER.mCx[i], cz = TLAYER.mCz[i];
+    if (Math.max(Math.abs(cx - mcx), Math.abs(cz - mcz)) > detailR) { outside++; continue; }
+    inRing++;
+    if (cut.has(pack(cx, cz))) inCut++;
+  }
+  const v = { drawn, inRing, inCut, outside, radius: detailR, squareM: (2 * detailR + 1) * CH,
+    chunksCut: cut.size, ceiling: S.radius, replayCeiling: S.timeSharp ? Math.max(S.radius, S.timeSharp) : S.radius };
+  splitCache = { at: drawn, sec: HIST.sec, marks: HIST.marks.size, builds: HIST.buildTotal,
+    gen: HIST.gen, v };
+  return v;
+}
+
+const timeSplitNote = () => {
+  if (!S.timeTerrain || !TLAYER.mCx) return '';
+  const s = timeSplit();
+  if (!s.drawn) return '';
+  return `\nthe blocks themselves only replay inside the ${s.squareM} m square in the middle of the view`
+    + ` (${s.radius} chunks): ${s.inRing.toLocaleString()} of the changes drawn here stand in that square,`
+    + ` and ${s.chunksCut} chunks of it are re-cut; the other ${s.outside.toLocaleString()} stand on ground`
+    + ` this view paints from a heightfield, where no block can change - zoom in, or widen the square with`
+    + ` "detail" (the log spans a whole dimension, and a wider sharp square costs frames faster than` + ` it buys changes: 8 to 12 chunks doubled the meshes for 1 % of the changes)`;
+};
+
 function histNote() {
   if (!S.time) return '';
   if (!S.timeTerrain) return 'the blocks themselves still show today - tick "undo the log in the blocks too" to put them back';
@@ -4935,7 +5032,8 @@ function histNote() {
       + ` chunk${t.truncChunks === 1 ? '' : 's'} still showing today, past the per-chunk cap)` : '')
     + ` - ${HIST.marked.toLocaleString()} chunk${HIST.marked === 1 ? '' : 's'} marked, `
     + `${HIST.syncMs.toFixed(1)} ms to mark, ${HIST.patchMs.toFixed(1)} ms patched on this thread`
-    + (HIST.workerPatches ? `, ${HIST.workerPatches} patched in workers` : '');
+    + (HIST.workerPatches ? `, ${HIST.workerPatches} patched in workers` : '')
+    + timeSplitNote();
 }
 
 /**
@@ -5619,7 +5717,8 @@ window.__world = {
     kb: (TLAYER.bytes / 1024) | 0, fetchMs: +TLAYER.fetchMs.toFixed(1),
     filterMs: +TLAYER.filterMs.toFixed(1), buildMs: +TLAYER.buildMs.toFixed(1),
     drawRange: TLAYER.mesh ? [TLAYER.mesh.geometry.drawRange.start, TLAYER.mesh.geometry.drawRange.count] : null,
-    look: TLAYER.look, lookWhy: TLAYER.lookWhy, lookWant: S.timeLook, geomMbCap: S.timeGeomMb,
+    look: TLAYER.look, lookWhy: TLAYER.lookWhy, lookWant: S.timeLook, lookBytes: TLAYER.lookBytes,
+    geomMbCap: S.timeGeomMb,
     markerGeoMb: TLAYER.mesh ? +(TLAYER.mesh.geometry.attributes.position.array.byteLength
       / 1048576).toFixed(1) : 0,
     // The ACTIVE material, not whichever one happens to exist: with look=blocks the tile material may
@@ -5643,7 +5742,7 @@ window.__world = {
   // The card and the playhead: a probe has to be able to ask about a block and rewind to one of its rows
   // without owning the scene graph.
   ledgerAsk, ledgerAskCentre, ledgerRewind, rewindNote,
-  histSync, histStats, histEditsOf, histNote, histTotals, histStampOf, histWanted, HIST,
+  histSync, histStats, histEditsOf, histNote, histTotals, histStampOf, histWanted, timeSplit, HIST,
   TLAYER,
   ledgerLoad, ledgerFind, ledgerJump, ledgerAsk, ledgerAskCentre, setLedger, clearLedgerPins,
   ledgerRewind, timeVoxelIndex, ledgerCellAt,
@@ -6351,15 +6450,15 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
           { value: 'plates', label: 'the top face of the block, tinted' },
           { value: 'tiles', label: 'a flat coloured tile' }],
         get: () => S.timeLook, set: (v) => setTimeLook(v),
-        hint: 'The baked model of the block itself, tinted green for a place or red for a break, is what\nmakes a marker readable close in: a green square on a roof does not say deepslate brick. It is also\nfour times the geometry, and it costs frames. Measured in the page over the 89,613-marker place\nfilter of this dimension: blocks 2.21 M verts / 38 MB / 0.2 s to build / 74 fps, plates 0.47 M verts / 8.1 MB /\n0.05 s / 179 fps, flat tiles 0.36 M verts / 6.2 MB / 0.01 s / 216 fps. Past "overlay memory" below the\nlook steps down on its own, and the sentence under the playhead says which it chose and why.\nURL: ?timelook=plates' },
-      { key: 'timeGeomMb', label: 'overlay memory', min: 4, max: 512, step: 4,
+        hint: 'The baked model of the block itself, tinted green for a place or red for a break, is what\nmakes a marker readable close in: a green square on a roof does not say deepslate brick. It is also\nfour times the geometry. Measured in the page over the 89,613-marker place filter: blocks 2.21 M verts /\n38 MB on the GPU / 0.24 s to build, plates 0.47 M verts / 8 MB / 0.05 s, flat tiles 0.36 M verts / 6 MB /\n0.01 s. Over the whole 331,040-row any-change filter: blocks 11.74 M verts / 202 MB / 0.9 s, and 64 fps\nsettled with ALL of them drawn versus 236 fps with 27,644 of them (8.35 %) behind the playhead, because a draw range only ever shows\nthe part behind the playhead. Past "overlay memory" below, the look steps down on its own and the\nsentence under the playhead quotes both numbers and the row that moves them. URL: ?timelook=plates' },
+      { key: 'timeGeomMb', label: 'overlay memory', min: 4, max: 1024, step: 4,
         fmt: (v) => `${Math.round(v)} MB max`, get: () => S.timeGeomMb,
         set: (v) => { S.timeGeomMb = Math.max(2, Math.min(2048, +v || 4)); if (S.time) timeRebuild(); },
-        hint: 'The ceiling a block-shaped replay may reach, in the MB the marker builder counts (MiB). The\nplace filter fits at the 128 default: 66 MB allocated, 38 MB of it positions plus indices on the GPU,\n0.2 s to build, 74 fps over this 12.6 M-vert scene. The break filter does not fit either way (245 MB as\nblocks, 170 MB as plates), so it steps to plates, says so under the playhead, and draws anyway because\nthat is what was asked - 37 fps with all 202,376 of them up. Set it to what your machine will hold.\nURL: ?timegeommb=' },
+        hint: 'The ceiling a block-shaped replay may reach, in the MB the marker builder counts (MiB). The\n384 default is sized off the biggest filter this dimension has, measured in the page: 331,040\nany-change rows drawn as their own blocks = 336 MB here, 202 MB of it positions plus indices on the GPU,\n0.9 s to build, 64 fps settled with every marker on screen and 236 fps with 27,644 of them (8.35 %) behind the playhead. At the old\n128 that filter could not afford blocks and stepped to flat plates - which is exactly why the replay\nlooked like 2D tiles with no blocks in it. The 89,613-row place filter is cheaper either way: 63 MB here,\n38 MB on the GPU. The page held 1.9 GB of JS heap with all 331k markers up, blocks or plates; set this to\nwhat your machine will hold, and the sentence under the playhead names the number a filter needed.\nURL: ?timegeommb=' },
       { key: 'timeTiles', label: 'draw the change markers', kind: 'check',
-        fmt: () => (S.timeTiles ? `${(TLAYER.drawn ?? 0).toLocaleString()} tiles` : 'off - the blocks speak'),
+        fmt: () => (S.timeTiles ? `${(TLAYER.drawn ?? 0).toLocaleString()} ${TLAYER.look || 'tiles'}` : 'off - nothing is drawn'),
         get: () => !!S.timeTiles, set: (v) => setTiles(v),
-        hint: 'The time machine has two halves: flat tiles over every block the log touched, and the blocks\nthemselves corrected back to the playhead ("undo the log in the blocks too", below). Tiles are the cheap\nhalf - one mesh, a draw range per frame, 90,045 quads for this dimension\'s places - but a tile per\nlogged change over a canopy hides the very world it is describing. Off leaves the playhead, the date\nand the terrain undo working, which is the "watch the house get built" view with nothing in the way.\nM still brings the layer back. URL: ?timetiles=0' },
+        hint: 'The time machine has two halves: the change overlay drawn over the map, and the blocks\nthemselves corrected back to the playhead ("undo the log in the blocks too", below). The overlay is the\ncheap half - one mesh, a draw range per frame, 90,045 items for this dimension\'s places - but an item per\nlogged change over a canopy hides the very world it is describing. Off hides the WHOLE overlay: at the\nblock look that means the block shapes go too, not only flat tiles. The playhead, the date and the\nterrain undo all keep working, which is the "watch the house get built" view with nothing in the way.\nM still brings the layer back. URL: ?timetiles=0' },
       { key: 'decalop', label: 'overlay strength', stops: [0.15, 0.3, 0.45, 0.6, 0.8, 1],
         fmt: (v) => `${Math.round(100 * v)}% solid`, get: () => S.decalOp, set: (v) => setDecalOp(v),
         hint: 'How solid both ledger overlays are - the per-chunk heat tiles and the per-change time tiles. They\nsit a fraction of a block above the ground, so at full strength they are a floor of paint over whatever\nthey describe; 45% is where 90,045 place tiles over a canopy still read as canopy. URL: ?decalop=' },

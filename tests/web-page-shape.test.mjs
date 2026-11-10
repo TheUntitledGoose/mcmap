@@ -86,3 +86,45 @@ test('a click loads the ledger itself instead of requiring an overlay first', ()
   assert.ok(!/if \(!LEDGER\.meta\?\.available\)/.test(click),
     'the click handler re-added the "turn an overlay on first" gate: ' + click.slice(0, 160));
 });
+
+// The "no blocks, only 2D tiles" report had two causes behind it, and neither is visible to a counter:
+// a ceiling that quietly stepped the look down, and a rebuild that threw away the marks of terrain the
+// page had already undone. Both live in main.js, so they are guarded here.
+test('a look the ceiling refuses says which look it substituted, and the default fits the biggest filter', () => {
+  // 331,040 any-change rows cost 336 MB as blocks; at the old 128 default that filter could only ever be
+  // plates, which is the 2D-sheet picture the viewer reported.
+  assert.match(src, /num\('timegeommb', 384\)/,
+    'the overlay-memory default dropped below the one filter this dimension provably needs (336 MB as blocks)');
+  assert.match(src, /key: 'timeGeomMb', label: 'overlay memory', min: 4, max: 1024/,
+    'the panel row cannot be pulled up to the measured 336 MB');
+  const rb = bodyOf('timeRebuild');
+  // Two refusals: stepped down, and asked-for-but-over. A sentence that says "drawing it anyway because
+  // you asked for it" while showing plates instead of blocks is a lie about the setting.
+  assert.match(rb, /if \(b\.stats\.bytes > budget\)/, 'an over-ceiling build is no longer reported at all');
+  assert.match(rb, /look !== S\.timeLook/, 'the step-down case and the asked-for case share one sentence');
+  assert.match(rb, /set "overlay memory" to \$\{lookMb\.blocks\} MB to see the blocks themselves/,
+    'the step-down sentence lost the number that would fix it');
+  assert.match(rb, /drawing it anyway because you asked for it'/,
+    'the asked-for case lost its sentence');
+  // and the number behind the sentence must survive the rebuild, or the hint is folklore
+  assert.match(rb, /TLAYER\.lookBytes = lookMb;/, 'a look attempt no longer records what it cost');
+});
+
+test('the marks of undone terrain belong to the filter row set, not to a marker rebuild', () => {
+  const rb = bodyOf('timeRebuild');
+  assert.match(rb, /const fsig = `\$\{TLAYER\.tl\.dimKey\}\|\$\{TLAYER\.gen\}\|\$\{S\.ledgerWho\}\|\$\{S\.timeCls\}\|\$\{S\.timeLimit\}\|\$\{got\.n\}`;/,
+    'the row-set signature is gone, so any rebuild is about to clear the marks again');
+  assert.match(rb, /if \(HIST\.filterSig !== fsig\) \{ HIST\.marks\.clear\(\); HIST\.filterSig = fsig; \}/,
+    'the marks are cleared unconditionally again: overlay memory is not a filter change');
+  assert.match(src, /^  filterSig: '',/m, 'HIST has no signature field to compare against');
+});
+
+test('the marker checkbox says it hides the whole overlay, not only flat tiles', () => {
+  // One mesh carries every look, so "tiles off" at the block look erases the block shapes too. The old
+  // value sentence promised "the blocks speak" at exactly the moment nothing is drawn.
+  assert.match(bodyOf('timeApply'), /TLAYER\.mesh\.visible = !!S\.timeTiles && n > 0;/,
+    'the overlay visibility moved without this test moving');
+  const row = src.slice(src.indexOf("{ key: 'timeTiles'"), src.indexOf("{ key: 'decalop'"));
+  assert.match(row, /'off - nothing is drawn'/, 'the row promises something the mesh does not do');
+  assert.match(row, /TLAYER\.look \|\| 'tiles'/, 'the value sentence no longer names what is drawn');
+});

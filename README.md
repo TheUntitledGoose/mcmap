@@ -218,8 +218,12 @@ row also has a URL parameter, so a view is a link:
 ?res=1.5              draw resolution (supersampling above 1)
 ?ledger=1             block-history overlay; ?ledgerwho=, ?ledgercls=, ?ledgermin=
 ?time=1               the time machine; ?timecls=2 (kind), ?timeplay=0 (paused),
-                      ?timelook=blocks|plates|tiles, ?timegeommb=128, ?timetiles=0,
-                      ?timeterrain=0 (undo the log in the voxels), ?hover=0
+                      ?timelook=blocks|plates|tiles, ?timegeommb=384 (the ceiling a block-shaped
+                      replay may reach; 336 MB is what this dimension's any-change filter costs as
+                      blocks, and below that it steps down to flat plates), ?timegrow=0 (put the
+                      markers flush with their voxel), ?timetiles=0,
+                      ?timeterrain=0 (undo the log in the voxels), ?timesharp=12 (replay in a wider
+                      square than the view draws sharp), ?hover=0
 ?nocov=1              stop using the region listing: ask for every tile again (the pan A/B)
 ?groundttl=120000     how long the page believes that listing, ms
 ?debug=1              instrument panel and HUD
@@ -233,8 +237,8 @@ the knobs that are only interesting while measuring.
 ## Tests and measurement
 
 ```bash
-npm test                # 388 tests: formats, codecs, stores, mesher, lighting, collision,
-                        # pool split, ledger, region coverage, HTTP endpoints
+npm test                # 393 tests: formats, codecs, stores, mesher, lighting, collision,
+                        # pool split, ledger, time machine, region coverage, HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds
 npm run browser:probe   # headless Chromium against a live server: eval, framebuffer, shot
 node tools/mprobe.mjs --shot N url          # A/B two URLs by pixel band difference

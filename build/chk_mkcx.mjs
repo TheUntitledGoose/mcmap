@@ -1,0 +1,25 @@
+import fs from 'node:fs';
+import { Assets } from '../web/js/assets.js';
+import { readPack, decodeTimeline } from '../shared/ledger-pack.mjs';
+import { buildPack } from '../server/ledger-pack.mjs';
+import { stateIdsByName } from '../web/js/ledger-terrain.mjs';
+import { buildTimeBlocks, resetMarkerLift } from '../web/js/ledger-blocks.mjs';
+import { fakeLog } from '../tests/fake-ledger.mjs';
+const T = (s) => 1717174690000 + s * 1000;
+const json = JSON.parse(fs.readFileSync('build/assets/atlas.json', 'utf8'));
+const g = fs.readFileSync('build/assets/geometry.bin');
+const assets = new Assets(json, g.buffer.slice(g.byteOffset, g.byteOffset + g.byteLength));
+const rows = [[2,64,3,2,'minecraft:stone','minecraft:air',10],[18,64,3,2,'minecraft:oak_planks','minecraft:air',20]];
+const L = fakeLog(rows.map(([x,y,z,aid,name,old,sec]) => [1,x,y,z,aid,1,T(sec),name,old]));
+const { buf } = buildPack(L, 1, 'region', { heightOf: () => 64 });
+const P = readPack(buf);
+const tl = decodeTimeline(buf.subarray(P.tlBytes[0], P.tlBytes[1]));
+console.log('tl rows', tl.count, 'cells', P.cells, 'cell0', P.cell?.(0), 'cell1', P.cell?.(1));
+for (let i = 0; i < tl.count; i++) console.log('row', i, 'cell', tl.cellOf(i), 'sec', tl.sec[i]);
+resetMarkerLift();
+const b = buildTimeBlocks(tl, P, [0,1], assets, stateIdsByName(assets.states), {});
+console.log('stats', b.stats, 'cx', Array.from(b.markerCx), 'cz', Array.from(b.markerCz));
+const box = (() => { let lo=[1e9,1e9,1e9],hi=[-1e9,-1e9,-1e9];
+  for (let i=0;i<b.pos.length;i+=3) for (let k=0;k<3;k++){lo[k]=Math.min(lo[k],b.pos[i+k]);hi[k]=Math.max(hi[k],b.pos[i+k]);}
+  return {lo,hi}; })();
+console.log('box', box);
