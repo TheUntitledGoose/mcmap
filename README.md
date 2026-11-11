@@ -202,7 +202,10 @@ distinction has already cost two debugging sessions to learn the hard way.
 Orbit: drag to rotate, wheel to zoom, right-drag to pan. `V` switches to walk mode
 (real body: gravity, collision, jumping — WASD, Space, Shift, Ctrl), `F` free-flight.
 `H` instruments, `?` help, `T` ask about the block under the crosshair, click a block in
-orbit mode for its block history card.
+orbit mode for its block history card. With the time machine on, a stand-in figure stands
+where each player's hand acted: click the figure, or the name tag over it, for what the log
+actually says about that person (the tag is the part that stays reachable when rock is in
+front of them, and "only this player's edits" is a button inside that card, not a click away).
 
 Everyday settings live in the panel (nine rows plus three collapsed groups). Every panel
 row also has a URL parameter, so a view is a link:
@@ -225,6 +228,17 @@ row also has a URL parameter, so a view is a link:
                       ?timeterrain=0 (undo the log in the voxels), ?timesharp=12 (replay in a wider
                       square than the view draws sharp), ?timestack=0 (older claims at one voxel stop
                       owning it), ?hover=0, ?timepick=0 (let the outline answer today's mesh again)
+?bodies=0             stop standing the players back in (it comes on with the time machine)
+?bodygap=300          the silence, in seconds, that ends a body. Measured on this save: one
+                      player's hand actions sit 1 s apart at p50, but across a silence over
+                      300 s the hand has already moved a median 52-155 blocks - so five minutes
+                      of nothing is not the same person still standing there
+?bodytracks=0         stop drawing the route walked inside the visit a body stands in
+?bodytags=0           stop the name + hedge label over each body
+?bodythrough=1        draw and pick bodies through the world (a whole-world finder; by default a
+                      body obeys walls, because a person inside a house is inside it)
+?bodypick=0           put nearest-wins back for a pixel: today a person answers a click before a
+                      change marker does, and the floor under their feet never counts as occlusion
 ?nocov=1              stop using the region listing: ask for every tile again (the pan A/B)
 ?groundttl=120000     how long the page believes that listing, ms
 ?debug=1              instrument panel and HUD
@@ -271,6 +285,11 @@ not an attribute, empty batch frames are meaningful, byte figures must name thei
 * **M9** portability: `--world` end to end, per-save cache and pack tags, a second save as
   a CI fixture. Started; `tools/portcheck.mjs` reports the hard requirements.
 * **M12b** per-voxel block history: which blocks a chosen player placed, filtered in time.
+* **M15.4** the people layer's remaining half: player chips, a per-player coordinate history
+  *panel* (the body card already lists their nearby actions; the panel does not), skins from an
+  operator-supplied `web/skins/<name>.png`, and mob ghosts (36,661 `trample` rows are positional
+  but name nobody). What M15 already ships: timeline v4 `source`, `shared/ghosts.mjs`, and bodies /
+  routes / name tags / evidence cards in the page.
 * Performance is at: whole-world orbit 240–400 fps settled, a 60-centre pan settles in
   3.1 s, far grid re-cut is 100 % on worker threads, unwritten ground costs 1 ms instead
   of 23,000. The far bill is now dominated by coarse patch re-cut, not the server.

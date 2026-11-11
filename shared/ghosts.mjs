@@ -18,7 +18,7 @@
 //      last known body, forever".
 //
 // What this can never give you is the exact cell a body occupied: a crosshair hits a block at your feet,
-// chest or head height, one to five blocks in front of you. `seatOf` reports which of its three answers
+// chest or head height, one to five blocks in front of you. `seatOf` reports which of its four answers
 // it had to fall back to, and the page repeats that hedge wherever it draws a person.
 //
 // Coordinate note, because it is the easy mistake: `tl.x(i)`/`tl.z(i)` are LOCAL to the chunk (0..15)
@@ -29,8 +29,15 @@ import { TL_NO_PLAYER } from './ledger-pack.mjs';
 
 /** Silence that ends a visit. Measured: see the header and build/dbg-gaps.mjs. */
 export const RUN_GAP_SEC = 300;
-/** How far below the acted-on block to look for the floor a body would be standing on. */
-export const SEAT_LOOK = 4;
+/**
+ * How far below the acted-on block to look for the floor a body would be standing on.
+ * Measured on this save with build/dbg-seat.mjs (1,800 sampled hand rows, real region data, the real
+ * collision table): a 4 block look finds a floor for 88% of actions, 8 blocks for 95%, 12 blocks for 97%.
+ * Eight is where the curve flattens. The acted block sits ON its own floor at p50 and one above at p90,
+ * and between two neighbouring actions of the same player the floor Y does not move at all (p50/p90/p99
+ * = 0 blocks), so this does not make a body jitter while the playhead scrubs.
+ */
+export const SEAT_LOOK = 8;
 
 /** The row a body may stand on: a named player AND that player's own hand caused it. */
 export const handRowAt = (tl, i) => tl.player[i] !== TL_NO_PLAYER && tl.byHand(i);
@@ -157,29 +164,38 @@ export function visitOfK(p, k) {
 /**
  * The floor a body would be standing on, under the block its hand acted on.
  *
- * `solid(wx, wy, wz)` is the caller's voxel truth (the page's chunk payload), in WORLD blocks. Without
- * it the answer is a guess, and `seat` names which of the three:
- *   'ground'  a floor within `look` blocks below, feet on top of it
- *   'near'    no voxel data here, so only the action itself is a clue (a placed block supports)
- *   'float'   nothing supports the body: draw it at the acted block and say so
+ * `solid(wx, wy, wz)` is the caller's voxel truth (the page's chunk payload), in WORLD blocks, and it
+ * answers three ways because the browser only ever holds some of the world:
+ *   true   a block stands there        -> 'ground', feet on top of it
+ *   false  air, water, a plant, ...    -> keep walking down
+ *   null   no voxels for that cell     -> 'unknown' if no floor turns up
+ * Without any `solid`: 'near', one block above the acted block.
+ *
+ * The four answers are the honest set: 'ground' (a floor within `SEAT_LOOK`), 'float' (every cell below
+ * is known and none of it is solid - a body over a ravine), 'unknown' (the voxels below are not held,
+ * so the floor is not knowable from here), 'near' (no voxel data supplied at all).
  *
  * A place leaves a solid block at the acted voxel, so it supports the body. A break usually takes the
  * block a body was standing on, so the payload there reads air and the search finds the floor one lower.
  * One rule covers both: walk DOWN from the acted block, inclusive, and stand on the first solid thing.
- * Without voxel data the fallback is one block above the acted block - the common case of mining the
- * block you are standing on - and `seat: 'near'` says it is a guess.
+ * Measured on this save (build/dbg-seat.mjs): 95% of hand rows find a floor within 8 blocks, and the
+ * floor Y never moves between a player's neighbouring actions, so a scrubbing playhead does not make a
+ * body hop up and down.
  */
 export function seatOf(tl, row, { solid = null, look = SEAT_LOOK, worldOf = localXY } = {}) {
   const c = worldOf(tl.cell[row]);
   const wx = c.cx * 16 + tl.x(row), wz = c.cz * 16 + tl.z(row), wy = tl.y(row);
   if (solid) {
+    let holes = false;
     for (let d = 0; d <= look; d++) {
       const fy = wy - d;
-      if (solid(wx, fy, wz)) return { x: wx, y: fy + 1, z: wz, floor: fy, seat: 'ground' };
+      const s = solid(wx, fy, wz);
+      if (s === true) return { x: wx, y: fy + 1, z: wz, floor: fy, seat: 'ground', above: d };
+      if (s === null || s === undefined) holes = true;
     }
-    return { x: wx, y: wy + 1, z: wz, floor: null, seat: 'float' };
+    return { x: wx, y: wy + 1, z: wz, floor: null, seat: holes ? 'unknown' : 'float', above: null };
   }
-  return { x: wx, y: wy + 1, z: wz, floor: null, seat: 'near' };
+  return { x: wx, y: wy + 1, z: wz, floor: null, seat: 'near', above: null };
 }
 
 /**

@@ -127,6 +127,19 @@
     background: rgba(255, 255, 255, .05); }
   .lcard-note { color: #8fe3a8; margin: 6px 0 0; }
   .lcard-note.bad { color: #ff8f7a; }
+
+  /* The people in the log (M15): a name over a stand-in body, and under it the hedge - "placed oak_stairs,
+     4 s ago - no floor found under it". DOM rather than a texture atlas, because six crisp labels cost
+     less than one atlas and the hedge has to stay legible. The container takes no pointer events, so the
+     world still gets every pixel BETWEEN the labels; the label itself is a button, because clicking a
+     person to ask what they did is the shortest path to it. */
+  #gtags { position: fixed; left: 0; top: 0; width: 0; height: 0; z-index: 3; pointer-events: none; }
+  .gtag { position: absolute; left: 0; top: 0; pointer-events: auto; cursor: pointer;
+    background: rgba(9, 12, 17, .72); border: 1px solid rgba(255, 255, 255, .16); border-radius: 6px;
+    padding: 2px 6px 3px; color: #eaf1f8; font: 600 11px/1.25 system-ui, sans-serif; white-space: nowrap;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, .8); }
+  .gtag span { display: block; font: 400 10px/1.3 system-ui, sans-serif; color: #9fb0c2; }
+  .gtag:hover { border-color: #ffb454; }
 </style>
 </head>
 <body>

@@ -75,7 +75,8 @@ test('a time-layer hit maps a TRIANGLE index to an item, and the hover path neve
 test('a click loads the ledger itself instead of requiring an overlay first', () => {
   const ask = bodyOf('askAt');
   assert.match(ask, /await ledgerMetaLoad\(\)/, 'askAt no longer fetches /ledger/meta on demand');
-  assert.match(ask, /timeHitAt\(x, y\)/, 'a click on a drawn marker no longer answers with its own row');
+  assert.match(ask, /pixelHits\(x, y\)/,
+    'a click on a drawn marker no longer answers with its own row (all three rays come from one pass)');
   // There are two click listeners on the same canvas: walk mode wants the pointer, orbit mode asks the
   // question. Start from the call and walk back to the listener that owns it.
   const atCall = src.indexOf('askAt(e.clientX, e.clientY)');
@@ -174,8 +175,8 @@ test('the hover and the click both go through the playhead-aware pick', () => {
     'the hover picks the raw scene again, so it answers for today instead of the playhead');
   assert.ok(!hv.includes('const p = pickState(x, y);'), 'hoverVoxel re-tuned itself to pickState');
   const ask = bodyOf('askAt');
-  assert.match(ask, /const p = pickWorld\(x, y\);/,
-    'the click picks the raw scene again, so it can ask about a block that is not there at the playhead');
+  assert.match(ask, /const \{ body, marker: t, world: p \} = pixelHits\(x, y\);/,
+    'the click raycasts its own three rays, so what a probe measures is not what a click does');
   assert.match(ask, /if \(p\.stand && p\.stand\.stands === 0\) \{/,
     'the click no longer refuses a voxel the log says is empty at this moment');
   assert.match(ask, /p\.stand\.starts \? `\$\{claimName\(p\.stand\.starts\.cls\)} at \$\{tlStamp\(p\.stand\.starts\.sec\)\}\.`/,
@@ -194,7 +195,7 @@ test('a refused hover hides the box, counts itself, and explains itself', () => 
     'the outline still draws around a block the log says is not there');
   assert.match(hp, /HOVER\.why = h\.standWhy \|\| 'not there at the playhead';/,
     'a refusal arrives with no reason, which is the report "the highlight vanished for nothing"');
-  assert.match(src, /stand: null, standWhy: '', refused: 0 \};/,
+  assert.match(src, /stand: null, standWhy: '', refused: 0, body: null \};/,
     'the refusal count is gone from HOVER, so the instrument cannot see it');
   assert.match(src, /playheadPick: !!S\.timePick,/, 'the hover readout does not report the switch state');
 });
@@ -213,4 +214,78 @@ test('the playhead pick asks the log, never the mesh, and answers nothing rather
     'the click stopped naming the block the log says arrives later, which is the block the cursor was on');
   assert.match(src, /\{ key: 'timePick', label: 'the outline only stands where the playhead says', kind: 'check',/,
     'the switch has no panel row, which leaves the behaviour undiscoverable and unauditable');
+});
+
+// A body you can see but cannot click is a bug you only find by clicking. The first exception ("a marker
+// in the body's own column loses") left 41 of 48 candidate framings around 5 standing bodies answering a
+// marker instead of the person, because a marker is grown OUTWARD from its block and a replayed build site
+// is full of them. The rule is therefore about KINDS, not distances: an annotation does not hide a person,
+// rock does.
+test('a person answers a click before a change marker does, but rock in front of them still does', () => {
+  const g = bodyOf('ghostTakesPixel');
+  assert.match(g, /if \(S\.bodyThrough\) return true;/, 'the whole-world finder no longer answers outright');
+  assert.match(g, /const dm = S\.bodyPick \? Infinity : \(marker\?\.dist \?\? Infinity\);/,
+    'a marker is back in the distance race, which is the unclickable-person bug again');
+  assert.match(g, /return GHOST\.hitDist <= dm && GHOST\.hitDist <= dw;/,
+    'a body no longer has to be in front of the world surface, so it answers through walls');
+  // Measured at a real party on a hillside: the body lost its own pixel to ground 13 blocks in front of
+  // it, 3.5 blocks nearer than the body. That ground is the floor they stand on. A face pointing up at or
+  // below their feet hides nobody, so it must not count as "rock in front of them".
+  assert.match(g, /world\.nrm\[1\] > 0\.9 && world\.point\[1\] <= body\.y \+ 0\.25/,
+    'the floor under a body became an occluder, so a person on a slope can never be clicked');
+  assert.match(g, /GHOST\.hitFloor = true;/,
+    'nothing records that the floor exempted the body, so the number cannot be checked');
+  assert.match(g, /if \(!S\.bodyPick\) \{/, '?bodypick=0 no longer restores plain nearest-wins');
+  assert.match(src, /bodyPick: num\('bodypick', 1\) \? 1 : 0,/, 'the A/B switch is gone');
+  assert.match(bodyOf('pixelHits'), /marker: timeHitAt\(x, y\), world: pickWorld\(x, y\)/,
+    'the one pass that answers a pixel no longer asks the world, so a wall in front of a body loses');
+  assert.match(bodyOf('askAt'), /const \{ body, marker: t, world: p \} = pixelHits\(x, y\);/,
+    'the click raycasts separately again, so the probe and the click answer different questions');
+  assert.match(src, /ownerAt: \(x = innerWidth \/ 2, y = innerHeight \/ 2\) => pixelOwner\(x, y\),/,
+    'no probe can ask who would answer this pixel, so the rule can only be argued about');
+  assert.match(bodyOf('peopleNote'), /a person answers a click before a change marker does/,
+    'the sentence next to the bodies stopped saying who answers a click');
+});
+
+// A person answers a click before a marker does, so the outline has to answer the same way or the page
+// highlights a marker cube and then opens a card about somebody standing behind it. Hover pays 0.1 ms for
+// the body ray, next to the 17.5 ms world pick it already pays, so agreement is affordable.
+test('the outline answers the same body the click answers, and hands its box back afterwards', () => {
+  const hv = bodyOf('hoverVoxel');
+  assert.match(hv, /const gb = S\.bodies \? ghostHitAt\(x, y\) : null;/,
+    'the outline never asks who stands here, so it cannot agree with the click');
+  assert.match(hv, /if \(gb && ghostTakesPixel\(gb, null, p\)\) \{/,
+    'the outline re-invented its own pixel rule instead of using the click\'s');
+  assert.match(hv, /from: 'body'/, 'a body pixel is reported as whatever the world pick found');
+  const hp = bodyOf('hoverPass');
+  assert.match(hp, /g\.scale\.set\(BODY_W \+ 0\.12, BODY_H, BODY_W \+ 0\.12\);/,
+    'the outline is a 1x1x1 box around a block, not around a 0.6 x 1.8 person');
+  assert.match(hp, /g\.scale\.set\(1, 1, 1\);/,
+    'a body outline leaves an enlarged box behind for the next voxel it highlights');
+  assert.match(hp, /HOVER\.why = `\$\{lab\.name\} stands here/,
+    'the outline answers with a voxel instead of a name');
+  assert.match(src, /refused: 0, body: null \};/, 'the hover state cannot say which person it outlined');
+  assert.match(bodyOf('hoverAtPixel'), /body: HOVER\.body, why: HOVER\.why/,
+    'a probe cannot ask who the outline settled on, so this rule cannot be measured');
+});
+
+test('a body name tag opens the evidence, and only the card filters the replay', () => {
+  const tags = src.slice(src.indexOf('function ghostTags('), src.indexOf('/** Put the labels where the bodies are.'));
+  assert.ok(/addEventListener\('click', \(\) => showGhostCard\(b\)\)/.test(tags),
+    'the tag is the one part of a body that is always reachable, so it opens the card');
+  assert.ok(!/ghostPickPlayer/.test(tags), 'filtering the replay is not hidden behind a name tag');
+  const card = src.slice(src.indexOf('function showGhostCard('), src.indexOf('function ghostPickPlayer(player)'));
+  assert.ok(/addEventListener\('click', \(\) => ghostPickPlayer\(b\.player\)\)/.test(card),
+    'the card carries the who filter, where it can be undone');
+});
+
+test('a buried body says how deep it is, on the tag and in the note', () => {
+  const sync = bodyOf('ghostSync');
+  assert.ok(/b\.down = bodyDepth\(b\)/.test(sync), 'the depth under the open sky is a fact of the moment');
+  assert.ok(/q\.d != null|b\.down != null/.test(sync), 'a column with no heightmap is unknown, never "underground"');
+  const tags = src.slice(src.indexOf('function ghostTags('), src.indexOf('/** Put the labels where the bodies are.'));
+  assert.ok(/b\.down != null && b\.down > 3/.test(tags), 'the tag carries the depth next to the seat hedge');
+  const note = bodyOf('peopleNote');
+  assert.ok(/caves/.test(note) && /\?caves=1/.test(note),
+    'the note names the one control that draws the rock a mined body stands in');
 });

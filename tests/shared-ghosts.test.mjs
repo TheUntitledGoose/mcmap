@@ -167,6 +167,23 @@ test('the seat walks down from the acted block and stands the body on the first 
   assert.ok(SEAT_LOOK > 0, 'and the search is bounded, not "scan to the bottom of the world"');
 });
 
+test('the look distance is the measured knee, and a column the browser never fetched says unknown', () => {
+  const { tl, worldOf } = rig([[1, 5, 66, 5, 2, 1, T(0), 'minecraft:stone', '', HAND]]);
+  // build/dbg-seat.mjs over 1,800 sampled hand rows against real region data and the real collision
+  // table: a floor is found for 88% of actions at 4 blocks down, 95% at 8, 97% at 12. Eight is the knee.
+  assert.equal(SEAT_LOOK, 8, 'eight blocks down, off the measured curve');
+  const deep = seatOf(tl, 0, { solid: () => false, worldOf });
+  assert.equal(deep.seat, 'float', 'known air all the way down: the body is over nothing, and says so');
+  const reach = seatOf(tl, 0, { solid: (x, y) => y <= 54, look: 12, worldOf });
+  assert.equal(reach.seat, 'ground', 'asking it to look 12 finds the floor 12 under');
+  // The page holds some chunks and not others. Air it has seen is a fact; a column it has never fetched
+  // is not, and answering 'float' there would claim a person was standing in mid-air.
+  const unseen = seatOf(tl, 0, { solid: (x, y) => (y > 60 ? false : null), worldOf });
+  assert.equal(unseen.seat, 'unknown', 'no voxels below: the floor is not knowable, so say that');
+  assert.equal(seatOf(tl, 0, { solid: (x, y) => y <= 62, worldOf }).above, 4,
+    'and how far under the acted block the floor was, for the panel to quote');
+});
+
 test('a track keeps its shape and always ends where the player left', () => {
   const rows = [];
   for (let k = 0; k < 40; k++) rows.push([3, 40 + k, 64, 90, 2, 1, T(k * 5), 'minecraft:stone', '', HAND]);

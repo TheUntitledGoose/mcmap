@@ -48,6 +48,15 @@ import { decodeTimeline, readPack, tlPackCoord } from '../../shared/ledger-pack.
 // scrubber; the numbers in the readouts come from the tested functions.
 import { actionName, buildTimeQuads, claimName, filterRows, playhead, plainName, quadAt, rowForBlock, standsAt, voxelKey, voxelRows } from './ledger-time.mjs';
 import { buildTimeBlocks, markerOfIndex, resetMarkerLift } from './ledger-blocks.mjs';
+// M15: the people in the log. shared/ghosts.mjs decides where a body is ALLOWED to stand (only rows that
+// player's own hand caused, cut off at a measured silence) and what the floor under their feet is;
+// web/js/ledger-ghosts.js turns that into one body buffer, one route buffer, and the words next to them.
+// Both are tested without a browser (tests/shared-ghosts.test.mjs, tests/web-ghosts.test.mjs). What this
+// layer never claims: the ledger holds no player coordinates, and this build holds no per-player skins.
+import { nearestVisit, presenceOf, RUN_GAP_SEC } from '../../shared/ghosts.mjs';
+import {
+  absentText, BODY_H, BODY_W, bodyGeom, bodyLabel, bodiesHere, historyNear, occupancyOf, trackGeom,
+} from './ledger-ghosts.js';
 
 
 const $ = (id) => document.getElementById(id);
@@ -277,6 +286,26 @@ const S = {
   // guess read off the mesh: a voxel the filtered log never touches is picked normally, because silence
   // from the log is not evidence of absence. URL: ?timepick=0
   timePick: num('timepick', 1) ? 1 : 0,
+  // M15: stand the players back in. It comes on with the time machine rather than as a switch to go
+  // hunting for, because a viewer who turns on "watch the house get built" and sees no people has been
+  // left to conclude the log holds none - when it holds 94,437 rows their own hands caused. Where a body
+  // may stand at all is measured and tested in shared/ghosts.mjs; this number only says whether to draw
+  // one. URL: ?bodies=0
+  bodies: num('bodies', 1) ? 1 : 0,
+  // Silence that ends a body, in seconds. Measured on this save (build/dbg-gaps.mjs): one player's hand
+  // actions sit 1 s apart at p50 and 5-20 s at p90, but across a silence over 300 s the hand has already
+  // moved a median 52-155 blocks (p90 over 1,100) - so five minutes of nothing is not the same person
+  // still standing there. The body stops, and the note says who went quiet and when. URL: ?bodygap=
+  bodyGap: Math.max(30, Math.min(86400, num('bodygap', RUN_GAP_SEC))),
+  bodyTracks: num('bodytracks', 1) ? 1 : 0,       // the route inside the visit a body stands in
+  bodyTags: num('bodytags', 1) ? 1 : 0,           // the name and the seat hedge over each body
+  // Bodies obey walls by default: a person inside a house is inside it, and a body floating over its roof
+  // is a lie. ?bodythrough=1 is a finder at whole-world scale, and the note names which mode is on.
+  bodyThrough: num('bodythrough', 0) ? 1 : 0,
+  // Who answers a click when a person and a change marker both sit on that ray. 1 = the person, because
+  // a marker is an annotation and a body is a claim about the world; 0 = whichever is nearest. An A/B
+  // switch, so it is URL-only: ?bodypick=0.
+  bodyPick: num('bodypick', 1) ? 1 : 0,
   // A line around the voxel under the cursor. Cheap by policy, not by luck: one reusable 24-vertex box
   // and one raycast at `hoverMs` intervals, because a highlight that allocates a mesh per hover is a
   // hitch per hover. URL: ?nohover, ?hoverms=60
@@ -3281,6 +3310,10 @@ function frameBody(now) {
   lap('mesh');
   hoverPass(now);
   lap('hover');
+  // Bodies are re-seated on a 400 ms tick rather than per frame - not for cost but because the answer
+  // changes when a CHUNK arrives - and the name labels follow the camera without any raycast at all.
+  ghostTick(now);
+  lap('people');
   // Refill when idle: request() skips coordinates already held, so this converges on the radius
   // around the camera instead of storming the server every frame. It used to run on every idle
   // frame, which at skin 96 is a 37 000-key scan and sort per frame - about 10 ms of pure
@@ -3983,6 +4016,7 @@ function timeHitAt(x, y) {
   const xyz = timeRowWorld(row);
   if (!xyz) return null;
   return { row, item, xy: [x, y], voxel: xyz, sec: TLAYER.tl.sec[row], action: TLAYER.tl.action[row],
+    dist: hit.distance,                       // so a body and a marker can be settled by who is nearer
     look: TLAYER.look, point: [+hit.point.x.toFixed(2), +hit.point.y.toFixed(2), +hit.point.z.toFixed(2)] };
 }
 
@@ -4001,9 +4035,16 @@ async function askAt(x, y) {
     showLedger(`no ledger: ${LEDGER.meta?.why ?? 'this world has no log'}`);
     return null;
   }
-  const t = timeHitAt(x, y);
+  // Three things can own a pixel: a stand-in body, a change marker, and the world's own geometry. A
+  // marker is an annotation painted over a voxel, so it does not get to hide a person (see
+  // ghostTakesPixel); rock does, unless ?bodythrough=1 says to draw people through the world anyway.
+  const { body, marker: t, world: p } = pixelHits(x, y);
+  if (body && ghostTakesPixel(body, t, p)) {
+    LEDGER.askWhy = GHOST.hitWhy;
+    showGhostCard(body);
+    return null;
+  }
   if (t) { LEDGER.askWhy = `the ${TLAYER.look} marker for row ${t.row}`; return ledgerAsk(t.voxel[0], t.voxel[1], t.voxel[2]); }
-  const p = pickWorld(x, y);
   if (!p || !p.block) { LEDGER.askWhy = 'the pixel hit no drawn block'; closeLedgerCard(); return null; }
   // A block the log says is not there at this moment is still worth asking about - its history answers
   // "when did this appear" - but the answer has to lead with the fact that it is not standing now.
@@ -4090,7 +4131,7 @@ function timeHitProbe(limit = 600) {
 // a hitch per hover, and this viewer has already been told about those.
 let hoverBox = null;
 const HOVER = { at: null, from: '', changes: 0, why: '', ms: 0, last: 0, passes: 0, skips: 0, boxMs: 0,
-  stand: null, standWhy: '', refused: 0 };
+  stand: null, standWhy: '', refused: 0, body: null };
 let pointerXY = null, pointerOut = false, pointerDown = false;
 let hoverSig = '', hoverDirty = true;
 canvas.addEventListener('pointermove', (e) => { pointerXY = [e.clientX, e.clientY]; pointerOut = false; hoverDirty = true; });
@@ -4159,6 +4200,15 @@ function timeDrawnAt(x, y, z) {
  */
 function hoverVoxel(x, y) {
   const p = pickWorld(x, y);
+  // The body ray measured 0.1 ms for the 5-15 people on screen, against the 17.5 ms world pick this
+  // function already pays, so letting the outline agree with the click is affordable rather than brave.
+  // Same `ghostTakesPixel` rule, so a pixel cannot outline a marker cube and then answer with a person.
+  const gb = S.bodies ? ghostHitAt(x, y) : null;
+  if (gb && ghostTakesPixel(gb, null, p)) {
+    const t = S.time ? timeDrawnAt(gb.x, gb.y, gb.z) : null;
+    return { body: gb, voxel: [gb.x, gb.y, gb.z], from: 'body', changes: t ? t.n : 0, row: t ? t.row : -1,
+      stand: null, standWhy: '', p };
+  }
   if (!p || !p.block) return null;
   const t = S.time ? timeDrawnAt(p.block[0], p.block[1], p.block[2]) : null;
   const st = p.stand;
@@ -4206,6 +4256,19 @@ function hoverPass(now) {
   HOVER.changes = h.changes || 0;
   HOVER.stand = h.stand ? h.stand.stands : null;
   HOVER.standWhy = h.standWhy ?? '';
+  HOVER.body = h.body ? h.body.player : null;
+  if (h.body) {
+    // Outline the person, not the block under them: BODY_W x BODY_H is what the body geometry draws.
+    g.visible = true;
+    g.scale.set(BODY_W + 0.12, BODY_H, BODY_W + 0.12);
+    g.position.set(h.body.x + 0.5, h.body.y + BODY_H / 2, h.body.z + 0.5);
+    const lab = bodyLabel(TLAYER.tl, h.body, ghostNames());
+    HOVER.why = `${lab.name} stands here (${h.body.seat} at y ${h.body.y}) - ${lab.sub}`;
+    // The colour policy is unchanged: green when a drawn change sits on that same voxel.
+    g.children[0].material.color.setHex(h.changes ? 0x6fe08a : 0xf4f7fa);
+    return;
+  }
+  g.scale.set(1, 1, 1);
   // The block is drawn, but the log says it does not stand at this moment: no outline. Highlighting it
   // would invite a click on a wall that has not been placed yet.
   if (h.stand && h.stand.stands === 0) {
@@ -4229,7 +4292,7 @@ function hoverAtPixel(x, y) {
   pointerXY = [x, y]; pointerOut = false; hoverDirty = true; HOVER.last = 0;
   hoverPass(performance.now());
   return { at: HOVER.at, from: HOVER.from, changes: HOVER.changes, ms: +HOVER.ms.toFixed(2),
-    visible: !!(hoverBoxOf().visible && S.hover) };
+    body: HOVER.body, why: HOVER.why, visible: !!(hoverBoxOf().visible && S.hover) };
 }
 
 function setLedger(on) {
@@ -4692,11 +4755,16 @@ function timeRebuild() {
     else { S.timePlay = 1; timeSeekRow(0); }
   }
   histSync(true);
+  // Presence is a property of the ROWS, not of the filter, so it is (re)built here once per timeline and
+  // never per frame: 10 ms over 351,531 rows. The bodies then get a seat from the voxels this page holds.
+  ghostPresence();
+  ghostSync(true);
   if (panel) panel.refresh();
 }
 
 /** The rows and sentences a playhead move can change - the short list `timeApply` refreshes. */
-const TIME_ROWS = ['timeAt', 'time', 'timeTiles', 'timePlay', 'timeTerrain', 'note_time', 'note_hist'];
+const TIME_ROWS = ['timeAt', 'time', 'timeTiles', 'timePlay', 'timeTerrain', 'note_time', 'note_hist',
+  'note_people'];
 
 /**
  * Move the playhead: one binary search and one draw range. `drawn` is what the readout and every probe
@@ -4719,11 +4787,545 @@ function timeApply() {
   TLAYER.sec = ph.sec;
   hoverDirty = true;          // the outline follows the playhead, so a moving playhead re-picks
   histSync();
+  // The bodies follow the same moment the markers do. Asking who stands here costs 0.003 ms, and the
+  // buffer is only re-cut when the answer (place + seat) actually moved.
+  ghostSync();
   // A playhead move is the one thing in this viewer that happens every frame, and the panel's full sweep
   // runs once a second (and not at all while a thumb is held). So name the rows and sentences this move can
   // change: the date under the thumb has to move with the thumb.
   if (panel) panel.refreshRows(TIME_ROWS);
   return n;
+}
+
+// ---- the people in the log (M15) ---------------------------------------------------------------
+// Where a body may come from, in one line: a row this dimension attributes to a named player AND whose
+// cause the log names as that player's own hand (`tl.byHand`). Everything else about presence - the
+// silence cut that ends a visit, the floor under the feet, the route walked inside a visit - lives in
+// shared/ghosts.mjs, measured against this save by build/dbg-gaps.mjs, build/dbg-seat.mjs and
+// build/dbg-presence.mjs, and tested by tests/shared-ghosts.test.mjs. The buffers, the labels and the
+// colour live in web/js/ledger-ghosts.js, tested by tests/web-ghosts.test.mjs. This block owns three.js
+// objects, DOM name tags, and the sentences.
+//
+// Four rules this block is responsible for:
+//   NOTHING IS INVENTED. The ledger has no player coordinates - the `Players` table holds a join time and
+//   nothing else (build/dbg-ledger-truth.mjs). A body appears only at a block that player's hand changed.
+//   There is no skin in this build either (neither the client jar nor this save carries a per-player
+//   texture, and the viewer does not go to the network), so the figure is a stand-in in that player's
+//   colour, and both the label and the card say what the evidence was.
+//   ABSENCE IS AN ANSWER. A player who has not acted yet, and a player whose freshest action is older
+//   than the silence cut, each get a reason in the note. The measurement that makes this necessary: the
+//   overworld's hand activity spans 7.2 of its 822 logged days, and supports a body SOMEWHERE at only
+//   0.26% of its seconds. Without the reason, a scrub into the middle of the log looks like a broken
+//   feature rather than an empty decade.
+//   THE FLOOR IS THE PAGE'S OWN VOXELS, so a seat can improve when a chunk arrives - hence the 400 ms
+//   tick as well as the playhead hook. A body over terrain that has not been fetched says the ground is
+//   not loaded instead of standing on air.
+//
+// Cost, measured over the shipped timeline: 10 ms for the presence pass over 351,531 rows, 0.003 ms per
+// "who stands here" question, 216 triangles per body and two draw calls for all of them. It is NOT in
+// the hover path: a body takes a click's raycast, never a hover's.
+const GHOST = {
+  presence: null, pgen: -1, pgap: -1, occ: null, err: '',
+  bodies: [], standing: 0, why: [], seats: {},
+  under: null, deepestY: null, deepestDown: null,   // how many bodies sit under the open sky (the note counts them)
+  mesh: null, lines: null, per: null, sig: '',
+  tagBox: null, tags: [], tagsShown: 0, tagsSmall: 0, tagSig: '', tagMs: 0,
+  sel: -1,                       // a chosen player's timeline index; -1 = everybody
+  nameSrc: null, nameList: [],
+  buildMs: 0, syncMs: 0, cutMs: 0, syncs: 0, cuts: 0, next: 0, hitMs: 0, hitWhy: '', hitDist: 0,
+  v1: null, v2: null,            // two scratch vectors, so a label pass allocates nothing
+};
+
+/** Names indexed by the TIMELINE's player byte, which is the ledger's 1-based id minus one. */
+function ghostNames() {
+  const src = LEDGER.meta?.players ?? null;
+  if (!src) return [];
+  if (GHOST.nameSrc !== src) {
+    GHOST.nameSrc = src;
+    GHOST.nameList = [];
+    for (const p of src) GHOST.nameList[p.id - 1] = p;
+  }
+  return GHOST.nameList;
+}
+const ghostNameOf = (player) => ghostNames()[player]?.name ?? `player ${player + 1}`;
+
+function ghostTagBox() {
+  if (!GHOST.tagBox) {
+    GHOST.tagBox = document.createElement('div');
+    GHOST.tagBox.id = 'gtags';
+    document.body.append(GHOST.tagBox);
+  }
+  return GHOST.tagBox;
+}
+
+/**
+ * One pass over the timeline's rows, on a timeline load or a silence-cut change. Never per frame:
+ * 10 ms over this dimension's 351,531 rows, measured against the shipped pack.
+ */
+function ghostPresence() {
+  GHOST.presence = null; GHOST.pgen = -1; GHOST.occ = null; GHOST.err = '';
+  if (!TLAYER.tl) return null;
+  if (!LEDGER.pack?.cell) { GHOST.err = 'the people need the chunk table, and it has not loaded'; return null; }
+  if (TLAYER.tl.version < 4) {
+    GHOST.err = `this timeline (v${TLAYER.tl.version}) does not say what caused each row, so nobody can be `
+      + 'placed: re-run node server/bake-ledger.mjs and reload';
+    return null;
+  }
+  const t0 = performance.now();
+  // `worldOf` is the pack's chunk table, not the row's own columns: a timeline row stores a cell INDEX
+  // plus chunk-local x/z, so folding the table in is the difference between a person standing at
+  // (-43, 15) and 20,322 chunks of people piled into one 16-block square.
+  GHOST.presence = presenceOf(TLAYER.tl, { gap: S.bodyGap, worldOf: (ci) => LEDGER.pack.cell(ci) });
+  GHOST.pgen = TLAYER.gen; GHOST.pgap = S.bodyGap;
+  GHOST.occ = occupancyOf(GHOST.presence, TLAYER.tl.spanSec);
+  GHOST.buildMs = performance.now() - t0;
+  if (!GHOST.presence.players.length) {
+    GHOST.err = 'this dimension has no row the log attributes to a player\'s own hand - nothing can stand here';
+  }
+  return GHOST.presence;
+}
+
+function ghostClear() {
+  if (GHOST.mesh) { ledgerGroup.remove(GHOST.mesh); GHOST.mesh.geometry.dispose(); GHOST.mesh = null; }
+  if (GHOST.lines) { ledgerGroup.remove(GHOST.lines); GHOST.lines.geometry.dispose(); GHOST.lines = null; }
+  GHOST.per = null; GHOST.sig = ''; GHOST.standing = 0; GHOST.bodies = []; GHOST.tagSig = '';
+  if (GHOST.tagBox) GHOST.tagBox.textContent = '';
+  GHOST.tags = []; GHOST.tagsShown = 0;
+}
+
+let ghostBodyMat = null, ghostLineMat = null;
+function ghostMats() {
+  if (!ghostBodyMat) {
+    // Flat unlit colour, because these are claims about evidence rather than objects in the world: a body
+    // that picked up the world's lighting would read as a block the mesher drew.
+    ghostBodyMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false, side: THREE.DoubleSide });
+    ghostLineMat = new THREE.LineBasicMaterial({ vertexColors: true, fog: false, transparent: true, opacity: 0.9 });
+  }
+  // A person inside a house is inside it, so bodies obey walls by default; ?bodythrough=1 is a finder at
+  // whole-world scale, and the note names which mode is on. The flat ledger overlays get the opposite
+  // default because they ARE map paint.
+  ghostBodyMat.depthTest = !S.bodyThrough;
+  ghostLineMat.depthTest = !S.bodyThrough;
+  return [ghostBodyMat, ghostLineMat];
+}
+
+/**
+ * Who stands here at the playhead, and repaint only when that answer moved. Asking is 0.003 ms plus a
+ * seat (nine payload lookups), so asking per playhead frame is free; the part that allocates is the
+ * buffer, and that is gated on a signature of place + seat.
+ */
+function ghostSync(force = false) {
+  if (!S.bodies || !S.time || !TLAYER.tl) return 0;
+  if (!GHOST.presence || GHOST.pgen !== TLAYER.gen || GHOST.pgap !== S.bodyGap) ghostPresence();
+  if (!GHOST.presence || !GHOST.presence.players.length) { ghostClear(); return 0; }
+  const t0 = performance.now();
+  const list = bodiesHere(TLAYER.tl, GHOST.presence, Math.round(S.timeAt),
+    { gap: S.bodyGap, cellOf: (ci) => LEDGER.pack.cell(ci), cellAt });
+  GHOST.bodies = list;
+  GHOST.why = list.filter((b) => b.absent).map((b) => absentText(b, ghostNames(), (s) => tlStamp(s)));
+  GHOST.seats = {};
+  let sig = `${Math.round(S.timeAt)}|${S.bodyThrough}${S.bodyTracks}|`;
+  for (const b of list) {
+    if (b.absent) { sig += `${b.player}=-;`; continue; }
+    b.down = bodyDepth(b);          // null when no heightmap covers this column, never a guess
+    GHOST.seats[b.seat] = (GHOST.seats[b.seat] ?? 0) + 1;
+    sig += `${b.player}=${b.x},${b.y},${b.z},${b.seat};`;
+  }
+  GHOST.standing = list.reduce((n, b) => n + (b.absent ? 0 : 1), 0);
+  // How many of them stand below the open sky. A person in a mine IS drawn, but with the caves toggle off
+  // the rock they stand in is not, which reads as a name tag floating over bare ground. The count belongs to
+  // the moment, not to the panel, so a probe can ask it without opening the panel.
+  const deep = list.filter((b) => b.down != null && b.down > 3)
+    .map((b) => ({ y: b.y, d: b.down }));
+  GHOST.under = deep.length;
+  GHOST.deepestY = deep.length ? Math.min(...deep.map((q) => q.y)) : null;
+  GHOST.deepestDown = deep.length ? Math.max(...deep.map((q) => Math.round(q.d))) : null;
+  GHOST.syncMs = performance.now() - t0;
+  GHOST.syncs++;
+  if (!force && sig === GHOST.sig) return GHOST.standing;
+  GHOST.sig = sig;
+  ghostCut(list);
+  return GHOST.standing;
+}
+
+/** One buffer for every standing body and one for every route: two draw calls, not one per person. */
+function ghostCut(list) {
+  const t0 = performance.now();
+  const standing = list.filter((b) => !b.absent);
+  const g = bodyGeom(standing);
+  GHOST.per = g.per;
+  const [bodyMat, lineMat] = ghostMats();
+  if (!GHOST.mesh) {
+    const geo = new THREE.BufferGeometry();
+    const mesh = new THREE.Mesh(geo, bodyMat);
+    mesh.name = 'ledger-people';
+    mesh.renderOrder = 903;                       // over the change markers (902)
+    // The buffer can span a whole dimension when the party splits, and letting three compute a sphere
+    // over it is the same mistake the time layer documents: hand it a sphere and skip culling.
+    mesh.frustumCulled = false;
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 1e9);
+    ledgerGroup.add(mesh);
+    GHOST.mesh = mesh;
+  }
+  const geo = GHOST.mesh.geometry;
+  geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(g.col, 3));
+  geo.setDrawRange(0, g.verts);                   // a soup: the count is corners, not indices
+  const tg = S.bodyTracks
+    ? trackGeom(TLAYER.tl, GHOST.presence, standing, { max: 96, cellOf: (ci) => LEDGER.pack.cell(ci) })
+    : { pos: new Float32Array(0), col: new Float32Array(0), lines: 0 };
+  if (tg.lines) {
+    if (!GHOST.lines) {
+      const lg = new THREE.BufferGeometry();
+      const ls = new THREE.LineSegments(lg, lineMat);
+      ls.name = 'ledger-people-route';
+      ls.renderOrder = 904;
+      ls.frustumCulled = false;
+      lg.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 1e9);
+      ledgerGroup.add(ls);
+      GHOST.lines = ls;
+    }
+    const lg = GHOST.lines.geometry;
+    lg.setAttribute('position', new THREE.BufferAttribute(tg.pos, 3));
+    lg.setAttribute('color', new THREE.BufferAttribute(tg.col, 3));
+    lg.setDrawRange(0, tg.lines * 2);             // two corners per line
+    GHOST.lines.visible = true;
+  } else if (GHOST.lines) GHOST.lines.visible = false;
+  GHOST.cuts++;
+  GHOST.cutMs = performance.now() - t0;
+  ghostTags(standing);
+}
+
+/** The name over a body. DOM, because six crisp labels cost less than a text atlas and stay readable. */
+function ghostTags(list) {
+  const box = ghostTagBox();
+  box.textContent = '';
+  GHOST.tags = [];
+  GHOST.tagSig = '';
+  if (!S.bodyTags || !list.length) { GHOST.tagsShown = 0; return; }
+  for (const b of list) {
+    const el = document.createElement('div');
+    el.className = 'gtag';
+    const lab = bodyLabel(TLAYER.tl, b, ghostNames());
+    const nm = document.createElement('b');
+    nm.textContent = lab.name;
+    const sub = document.createElement('span');
+    // The seat hedge travels here, not in a tooltip - and so does the depth, because a person 40 blocks
+    // under the open sky is drawn but hidden by the hill, and a tag with no explanation looks like a bug.
+    sub.textContent = lab.sub + (b.down != null && b.down > 3 ? ` · ${Math.round(b.down)} blocks down` : '');
+    el.append(nm, sub);
+    // A name that can be clicked is how "show me only what she changed" works without a dropdown hunt:
+    // it is the same filter as the panel's `whose actions` row, reached from the body itself.
+    // The name tag is the one part of a body that is always reachable: a person standing inside a hill is
+    // drawn behind rock. So the tag opens the evidence, and filtering the replay to that player is a button
+    // in the card, where it can be undone.
+    el.title = 'what the log says about this person (click)';
+    el.addEventListener('click', () => showGhostCard(b));
+    box.append(el);
+    GHOST.tags.push({ el, b });
+  }
+}
+
+/** Put the labels where the bodies are. Runs on a camera or body change, not blindly every frame. */
+function ghostPlace() {
+  if (!GHOST.tags.length) { GHOST.tagsShown = 0; return; }
+  const sig = `${camSig()}|${GHOST.sig}|${S.bodyTags}`;
+  if (sig === GHOST.tagSig) return;
+  GHOST.tagSig = sig;
+  const t0 = performance.now();
+  GHOST.v1 ??= new THREE.Vector3();
+  GHOST.v2 ??= new THREE.Vector3();
+  let shown = 0, small = 0;
+  for (const { el, b } of GHOST.tags) {
+    const top = GHOST.v1.set(b.x + 0.5, b.y + BODY_H + 0.35, b.z + 0.5).project(camera);
+    const px = (top.x * 0.5 + 0.5) * innerWidth, py = (-top.y * 0.5 + 0.5) * innerHeight;
+    if (top.z > 1 || px < -60 || py < -40 || px > innerWidth + 60 || py > innerHeight + 40) {
+      el.style.display = 'none'; continue;              // behind the camera, or off the edge
+    }
+    // How tall the person is IN PIXELS. At whole-world zoom a 1.8 block body is a fraction of a pixel,
+    // and six names stacked on one pixel read as a bug rather than as six people: the label goes away,
+    // and the note counts how many it dropped so the absence is a number and not a mystery.
+    const bot = GHOST.v2.set(b.x + 0.5, b.y, b.z + 0.5).project(camera);
+    const pxH = Math.abs(top.y - bot.y) * innerHeight / 2;
+    if (pxH < 3) { el.style.display = 'none'; small++; continue; }
+    el.style.display = '';
+    el.style.transform = `translate(${Math.round(px)}px, ${Math.round(py)}px) translate(-50%, -100%)`;
+    shown++;
+  }
+  GHOST.tagsShown = shown; GHOST.tagsSmall = small; GHOST.tagMs = performance.now() - t0;
+}
+
+/** The frame hook: seats follow chunks as they arrive, labels follow the camera. */
+function ghostTick(now) {
+  if (!S.bodies || !S.time) {
+    if (GHOST.mesh || GHOST.lines || GHOST.tags.length) ghostClear();
+    return;
+  }
+  if (now >= GHOST.next) { GHOST.next = now + 400; ghostSync(); }
+  ghostPlace();
+}
+
+/**
+ * A click on a person. This raycast stays OUT of the hover path, which must not pay for a raycast at
+ * all: the body buffer is 216 triangles per person, so it is a click's cost in microseconds.
+ */
+function ghostHitAt(x, y) {
+  GHOST.hitWhy = 'no body on screen';
+  if (!S.bodies || !GHOST.mesh || !GHOST.standing || !GHOST.per) return null;
+  const t0 = performance.now();
+  camera.updateMatrixWorld();
+  const rc = new THREE.Raycaster();
+  rc.setFromCamera(new THREE.Vector2((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1), camera);
+  rc.far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
+  const hit = rc.intersectObject(GHOST.mesh, false)[0];
+  GHOST.hitMs = performance.now() - t0;
+  if (!hit || hit.faceIndex === undefined) { GHOST.hitWhy = 'that pixel hit no body'; return null; }
+  GHOST.hitDist = hit.distance;
+  // `per` ranges are CORNER indices and three hands back a TRIANGLE number: a soup's triangle t starts
+  // at corner 3t, so asking with t alone answers whoever stands 72 triangles away.
+  const corner = hit.faceIndex * 3;
+  const span = GHOST.per.find((q) => corner >= q.from && corner < q.to);
+  if (!span) { GHOST.hitWhy = `triangle ${hit.faceIndex} belongs to no body`; return null; }
+  const b = GHOST.bodies.find((q) => !q.absent && q.player === span.player);
+  // The body's OWN triangle number, not the buffer-wide one: "triangle 314 of that body's 72
+  // triangles" reads like an off-by-something bug when the ranges are per-body corners.
+  GHOST.hitWhy = `${ghostNameOf(span.player)}, triangle ${hit.faceIndex - span.from / 3} of that body's ${
+    (span.to - span.from) / 3}`;
+  return b ?? null;
+}
+
+/**
+ * Whoever is NEAREST the eye owns the pixel, because that is what the person sees: a body drawn behind a
+ * wall (the default, since bodies obey walls) must not steal a click meant for the wall. With
+ * ?bodythrough=1 bodies are deliberately over everything, so they answer the click outright.
+ */
+// One exception, and it is a measurement rather than a taste: a change marker is deliberately grown
+// OUTWARD from the block it describes (0.09 blocks per side, plus the stack ramp), so its surface sits
+// OUTSIDE the body standing in that block. A plain nearest-wins rule therefore handed every pixel of
+// every body to a marker - the probe aimed at a person's torso and got back "the blocks marker for row
+// 9152". A marker inside this body's own column and height does not compete: the person does.
+// Two measurements, two rules.
+// (a) A change marker is grown OUTWARD from the block it describes (0.09 per side plus the stack ramp),
+//     so its shell sits outside the body standing in that block: a plain nearest-wins rule handed every
+//     pixel of every body to a marker.
+// (b) The exception for "a marker in this body's own column" was not enough. Around a replayed build
+//     site the air is FULL of markers: 48 candidate framings around 5 standing bodies, and a marker owned
+//     the body's own pixel in 41 of them, 3-5 blocks in front. A person is unclickable where the log says
+//     people worked - which is exactly where you would go to look at one.
+// So: a body on this ray answers before any MARKER does. Rock is different, and stays authoritative: a
+// wall between the eye and a body keeps the click, because the pixel the user aimed at is that wall, and
+// `?bodythrough=1` already exists to say "look through it anyway". `?bodypick=0` restores nearest-wins.
+function ghostTakesPixel(body, marker, world) {
+  if (S.bodyThrough) return true;
+  if (!S.bodyPick) {
+    if (marker?.voxel && marker.voxel[0] === body.x && marker.voxel[2] === body.z
+      && marker.voxel[1] >= body.y - 1 && marker.voxel[1] <= body.y + 1) return true;
+  }
+  GHOST.v1 ??= new THREE.Vector3();
+  const dm = S.bodyPick ? Infinity : (marker?.dist ?? Infinity);
+  let dw = Infinity;
+  GHOST.hitFloor = false;
+  if (world?.point) {
+    dw = camera.position.distanceTo(GHOST.v1.set(world.point[0], world.point[1], world.point[2]));
+    // Measured at a real hillside party: the body lost its own pixel to ground 13 blocks in front of it,
+    // at a distance 3.5 shorter than the body's. That ground is the floor they stand on and the bank in
+    // front of it, and it is nearer than their middle. A face that points up and sits at or below their
+    // feet does not hide anyone; a wall, a bank above their feet, or a roof still does.
+    if (world.nrm && world.nrm[1] > 0.9 && world.point[1] <= body.y + 0.25) {
+      GHOST.hitFloor = true;
+      dw = Infinity;
+    }
+  }
+  return GHOST.hitDist <= dm && GHOST.hitDist <= dw;
+}
+
+/** The three rays a click answers, in one pass: a stand-in body, a change marker, the world's geometry. */
+function pixelHits(x, y) {
+  return { body: ghostHitAt(x, y), marker: timeHitAt(x, y), world: pickWorld(x, y) };
+}
+
+/** Who WOULD answer a click here, under the rule above. A probe should measure the page's policy rather
+    than re-derive it from three distances and get it wrong in a different way. */
+function pixelOwner(x, y) {
+  const h = pixelHits(x, y);
+  const takes = !!h.body && ghostTakesPixel(h.body, h.marker, h.world);
+  const v = GHOST.v1 ??= new THREE.Vector3();
+  return {
+    owner: takes ? 'body' : h.marker ? 'marker' : h.world ? 'world' : 'nothing',
+    floor: GHOST.hitFloor,
+    player: takes && h.body ? h.body.player : null,
+    bodyDist: h.body ? +GHOST.hitDist.toFixed(2) : null,
+    markerDist: h.marker ? +h.marker.dist.toFixed(2) : null,
+    worldDist: h.world?.point
+      ? +camera.position.distanceTo(v.set(h.world.point[0], h.world.point[1], h.world.point[2])).toFixed(2)
+      : null,
+    rule: S.bodyThrough ? 'through' : S.bodyPick ? 'people first' : 'nearest',
+  };
+}
+
+/** The body's own card: who, what the viewer is allowed to draw from, and that player's history. */
+function showGhostCard(b) {
+  const el = ledgerCardEl();
+  el.textContent = '';
+  LEDGER.cardRows = 0; LEDGER.cardTotal = 0;
+  const names = ghostNames();
+  const who = ghostNameOf(b.player);
+  const lab = bodyLabel(TLAYER.tl, b, names);
+  const head = document.createElement('div');
+  head.className = 'lcard-head';
+  head.append(document.createTextNode(`${who} at ${b.x}, ${b.y}, ${b.z}: ${lab.sub}`));
+  const x = document.createElement('button');
+  x.className = 'lcard-x'; x.textContent = '\u00d7'; x.title = 'close (Esc)';
+  x.addEventListener('click', closeLedgerCard);
+  head.append(x);
+  el.append(head);
+  const sub = document.createElement('div');
+  sub.className = 'lcard-sub';
+  sub.textContent = 'a stand-in figure, not a skin and not a position. The ledger stores no player '
+    + 'coordinates, so this sits at a block that player\'s own hand changed'
+    + (b.seat === 'ground' ? ` and stands on the block at y ${b.floor}` : ` (feet: ${b.seat ?? 'near'})`)
+    + ', with nothing in the log about them in between.';
+  el.append(sub);
+  const note = document.createElement('div');
+  note.className = 'lcard-note';
+  const hist = historyNear(TLAYER.tl, GHOST.presence, b.player, Math.round(S.timeAt),
+    { max: 14, cellOf: (ci) => LEDGER.pack.cell(ci) });
+  for (const h of hist) {
+    const line = document.createElement('div');
+    line.className = 'lcard-line';
+    const go = document.createElement('button');
+    go.className = 'lcard-row';
+    go.textContent = `${tlStamp(h.sec)}  ${actionName(h.action)} ${h.block ? plainName(h.block) : ''}  ${h.x},${h.y},${h.z}`;
+    go.title = 'go to that block';
+    go.addEventListener('click', () => gotoLedger(h.x + 0.5, h.y + 1, h.z + 0.5, 20));
+    const s = document.createElement('button');
+    s.className = 'lcard-seek';
+    s.textContent = '\u23ea';
+    s.title = 'move the playhead to this action';
+    s.addEventListener('click', () => { S.timeAt = h.sec; timeApply(); });
+    line.append(go, s);
+    note.append(line);
+  }
+  el.append(note);
+  if (!hist.length) {
+    const m = document.createElement('div');
+    m.className = 'lcard-sub';
+    m.textContent = 'no hand action of theirs at or before this moment';
+    el.append(m);
+  }
+  const act = document.createElement('div');
+  act.className = 'lcard-sub';
+  const f = document.createElement('button');
+  f.className = 'lcard-row';
+  f.textContent = GHOST.sel === b.player ? 'show everybody again' : `show only ${who}'s changes`;
+  f.addEventListener('click', () => ghostPickPlayer(b.player));
+  act.append(f);
+  el.append(act);
+}
+
+/**
+ * Point the whole overlay and the replay at one player. The presence layer does NOT follow this filter -
+ * presence is a fact about the log, not about what you asked to draw - so the bodies keep their seats
+ * while the markers and the corrected terrain narrow to one person.
+ */
+function ghostPickPlayer(player) {
+  if (GHOST.sel === player) { GHOST.sel = -1; S.ledgerWho = 0; }
+  else { GHOST.sel = player; S.ledgerWho = player + 1; }      // the panel's filter is a 1-based ledger id
+  ledgerRebuild();
+  if (S.time) timeRebuild();
+  if (panel) panel.refresh();
+  const mine = GHOST.presence?.players.find((p) => p.player === player);
+  showLedger(S.ledgerWho
+    ? `the overlay, the markers and the replay now follow ${ghostNameOf(player)}: `
+      + `${TLAYER.rows.toLocaleString()} of ${TLAYER.tl.count.toLocaleString()} logged rows, `
+      + `${mine ? mine.rows.length.toLocaleString() : 0} of them by that player's own hand`
+    : 'the overlay, the markers and the replay are back to anybody');
+}
+
+/** The sentences that answer "is this broken, or is nobody here?". */
+/**
+ * The open-sky height of one column: the real chunk's WORLD_SURFACE where the page holds that chunk, the
+ * coarse whole-dimension layer where it does not, and `null` where neither covers it. Unknown is never
+ * reported as "underground".
+ */
+function surfaceTop(wx, wz) {
+  const cx = Math.floor(wx / CH), cz = Math.floor(wz / CH);
+  const c = store && store.get(cx, cz);
+  if (c && c.height) return c.surfaceAt(wx & 15, wz & 15);
+  if (overview) {
+    const i = Math.floor((cx - overview.x0) / overview.cell);
+    const j = Math.floor((cz - overview.z0) / overview.cell);
+    if (i >= 0 && j >= 0 && i < overview.w && j < overview.h) return overview.height[j * overview.w + i] - HEIGHT_BIAS;
+  }
+  return null;
+}
+
+/**
+ * How far below the open sky a body stands. `null` when no heightmap covers that column.
+ *
+ * This exists because "is this broken, or is nobody here?" has a third answer: somebody IS here, in a mine,
+ * and the rock they stand in is not drawn with the caves toggle off.
+ */
+function bodyDepth(b) {
+  const h = surfaceTop(b.x, b.z);
+  return h == null ? null : h - b.y;
+}
+
+function peopleNote() {
+  if (!S.bodies) return 'People are off, so no body is drawn at all. ?bodies=1';
+  if (!S.time) return 'the people come with the time machine: press M, and the log\'s players stand where their own hands changed blocks';
+  if (GHOST.err) return GHOST.err;
+  const p = GHOST.presence;
+  if (!p || !p.players.length) return 'nobody: this dimension has no row the log attributes to a player\'s own hand';
+  const o = GHOST.occ;
+  const out = [];
+  out.push(`${p.players.length} named players acted here by hand: ${p.handRows.toLocaleString()} actions in `
+    + `${p.visits} visits, ${tlStamp(p.first)} to ${tlStamp(p.last)} - `
+    + `${(p.spanSec / 86400).toFixed(1)} of this dimension's ${(TLAYER.tl.spanSec / 86400).toFixed(0)} logged days.`);
+  out.push(`A body is supported SOMEWHERE at only ${o.pct.toFixed(2)}% of those seconds, and at most ${o.peak} `
+    + `people at once, so "nobody stands here" is the normal answer rather than a bug.`);
+  const seatTxt = Object.entries(GHOST.seats).map(([k, v]) => `${v} ${k}`).join(', ');
+  out.push(GHOST.standing
+    ? `${GHOST.standing} stand at ${tlStamp(Math.round(S.timeAt))}${seatTxt ? ` (feet: ${seatTxt})` : ''}`
+      + `${S.bodyThrough ? ', drawn through the world' : ', obeying walls'}.`
+    : `nobody stands at ${tlStamp(Math.round(S.timeAt))}.`);
+  // The third answer: a person in a mine is drawn, but the ground they stand in is culled with the caves
+  // toggle off, so what you see is a name tag over bare earth. Say so, and name the control.
+  if (GHOST.standing && GHOST.under) {
+    out.push(`${GHOST.under} of those stand below the open sky, the lowest at y ${GHOST.deepestY}, `
+      + `${GHOST.deepestDown} blocks down. `
+      + (S.caves ? 'The caves toggle is on, so the rock they stand in is drawn.'
+        : 'With the caves toggle off that rock is not drawn, so a person in a hole looks like a name tag over '
+          + 'bare ground: the "caves" row in the panel, or ?caves=1.'));
+  }
+  out.push(S.bodyThrough ? 'a body answers a click through anything (bodythrough).'
+    : S.bodyPick ? 'a person answers a click before a change marker does; rock in front of them still answers first (?bodypick=0 to put the nearest thing back).'
+      : 'the nearest drawn thing answers the click, change markers included.');
+  for (const w of GHOST.why.slice(0, 3)) out.push(w);
+  if (GHOST.why.length > 3) out.push(`... and ${GHOST.why.length - 3} more with no body at this moment`);
+  if (!GHOST.standing) {
+    const n = nearestVisit(p, Math.round(S.timeAt));
+    if (n) out.push(`the nearest logged action is ${(n.dist / 86400).toFixed(2)} days off: ${ghostNameOf(n.player)} `
+      + `${tlStamp(n.visit.t0)} to ${tlStamp(n.visit.t1)}, ${n.visit.n} actions across ${n.visit.cells} chunks`);
+  }
+  if (GHOST.tags.length && GHOST.tagsSmall) {
+    out.push(`${GHOST.tagsSmall} name tag${GHOST.tagsSmall === 1 ? '' : 's'} hidden: that body is under 3 pixels tall here`);
+  }
+  return out.join('\n');
+}
+
+function setBodyGap(v) {
+  S.bodyGap = Math.max(30, Math.min(86400, +v || RUN_GAP_SEC));
+  ghostPresence();
+  ghostSync(true);
+  if (panel) panel.refresh();
+}
+
+function setBodies(on) {
+  S.bodies = on ? 1 : 0;
+  if (S.bodies) { ghostPresence(); ghostSync(true); }
+  else ghostClear();
+  if (panel) panel.refresh();
 }
 
 /**
@@ -5646,6 +6248,8 @@ window.__world = {
     return out;
   },
   at: (wx, wy, wz) => atState(wx, wy, wz),
+  // open-sky height of a column from the page's own heightmaps, or null when nothing covers it
+  surfaceAt: (wx, wz) => surfaceTop(wx, wz),
   light: (wx, wy, wz) => atLight(wx, wy, wz),
   // [level, brightness-multiplier, colour-that-would-be-painted] for the cell a probe cares about.
   litAt: (wx, wy, wz) => store
@@ -5836,6 +6440,50 @@ window.__world = {
   // M12b: the time machine's readout. `drawn` is the number that proves the playhead moved -
   // "the layer exists" is not evidence. `quads` is the size of the current filter, and the three ms
   // figures are the fetch, the filter and the mesh build, which are three different questions.
+  // M15: the stand-in bodies. `standing` is the number that proves a body is drawn; `why` is the list
+  // of reasons the others are NOT, and `seats` splits ground from float/unknown, so a body over a ravine
+  // reads as what it is instead of looking like a broken figure.
+  ghosts: () => ({
+    on: !!S.bodies, timeOn: !!S.time, err: GHOST.err,
+    pickRule: S.bodyThrough ? 'through' : S.bodyPick ? 'people first' : 'nearest',
+    standing: GHOST.standing, absent: GHOST.why.length, why: GHOST.why, seats: GHOST.seats,
+    under: GHOST.under, deepestY: GHOST.deepestY, deepestDown: GHOST.deepestDown,
+    bodies: GHOST.bodies.map((b) => (b.absent
+      ? { player: b.player, absent: b.absent, age: b.age, acted: b.acted }
+      : { player: b.player, row: b.row, sec: b.sec, age: b.age, action: b.action, block: b.block,
+        x: b.x, y: b.y, z: b.z, floor: b.floor, seat: b.seat, above: b.above, down: b.down, visit: b.visit })),
+    presence: GHOST.presence ? {
+      gap: GHOST.presence.gap, handRows: GHOST.presence.handRows, visits: GHOST.presence.visits,
+      first: GHOST.presence.first, last: GHOST.presence.last, spanSec: GHOST.presence.spanSec,
+      logSec: GHOST.presence.logSec,
+      players: GHOST.presence.players.map((p) => ({
+        player: p.player, name: ghostNameOf(p.player), rows: p.rows.length, visits: p.visits.length,
+        first: p.first, last: p.last,
+      })),
+    } : null,
+    occ: GHOST.occ,
+    verts: GHOST.mesh ? GHOST.mesh.geometry.attributes.position.count : 0,
+    drawn: GHOST.mesh ? GHOST.mesh.geometry.drawRange.count : 0,
+    routes: GHOST.lines ? GHOST.lines.geometry.drawRange.count / 2 : 0,
+    tagsShown: GHOST.tagsShown, tagsSmall: GHOST.tagsSmall, through: !!S.bodyThrough,
+    sel: GHOST.sel, gap: S.bodyGap, at: Math.round(S.timeAt),
+    buildMs: +GHOST.buildMs.toFixed(1), syncMs: +GHOST.syncMs.toFixed(3), cutMs: +GHOST.cutMs.toFixed(2),
+    syncs: GHOST.syncs, cuts: GHOST.cuts, tagMs: +GHOST.tagMs.toFixed(3),
+    hitMs: +GHOST.hitMs.toFixed(3), hitWhy: GHOST.hitWhy, hitDist: +GHOST.hitDist.toFixed(2),
+  }),
+  // Probes need to be able to put the playhead somewhere and ask for the answer in the same call.
+  ghostApply: (sec = null) => { if (sec !== null) S.timeAt = +sec; return ghostSync(true); },
+  ghostReload: () => ghostPresence(),
+  ghostHit: (x, y) => ghostHitAt(x, y),
+  // A probe's view of the same list the body card shows: that player's own hand rows, in world blocks.
+  // Without it a probe can only aim at the playhead, and cannot find the moment a person stood at a block
+  // that still exists today.
+  ghostRows: (player = 0, sec = null, max = 40) =>
+    historyNear(TLAYER.tl, GHOST.presence, player | 0, sec ?? Math.round(S.timeAt),
+      { max, cellOf: (ci) => LEDGER.pack.cell(ci) }),
+  ownerAt: (x = innerWidth / 2, y = innerHeight / 2) => pixelOwner(x, y),
+  ghostPick: (player) => ghostPickPlayer(player | 0),
+  ghostNote: () => peopleNote(),
   hist: histStats,
   time: () => ({
     on: !!S.time, playing: !!S.timePlay, tl: !!TLAYER.tl, err: TLAYER.err,
@@ -6639,6 +7287,28 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
       { kind: 'note', key: 'note_time', text: () => timeNote(),
         hint: 'The one sentence that answers "am I watching a bug, or an empty decade?". Unattributed rows -\n269,358 of this dimension\'s 351,531, most of them water, fire, growth and mobs - belong to anybody:\nfiltering to one player is a much smaller claim, and it costs 35 ms to re-cut instead of 100.' },      { kind: 'note', text: () => ledgerNote() },
       { kind: 'note', key: 'note_hist', text: () => histNote() },
+      { key: 'bodies', label: 'stand the players back in', kind: 'check',
+        fmt: () => (GHOST.standing ? `${GHOST.standing} standing` : 'nobody at this moment'),
+        get: () => !!S.bodies, set: (v) => setBodies(v),
+        hint: 'The log has no player coordinates: the `Players` table holds a join time and nothing else\n(build/dbg-ledger-truth.mjs). So a figure appears only where the log names that player\'s OWN HAND as\nthe cause of a block change - timeline v4\'s source byte, and the gate is `tl.byHand`. Of this save\'s\n424,599 rows, 94,437 say "player"; 28,795 of the player-ATTRIBUTED overworld rows were caused instead by\na creeper, TNT, an end crystal, water or gravity, and a measured row of that kind sits a median 20 blocks\n(p90 166) from that player\'s nearest hand action, so a name alone is not evidence of a body. Measured\nover the shipped pack: 56,949 hand actions in 393 visits, a body supported SOMEWHERE at 0.26% of the\noverworld\'s logged seconds (9.84% in the nether), up to 5 people at once, 10 ms to work the whole\ndimension out and 0.0005 ms to ask who stands here. Feet come from this page\'s own voxels: 95% of hand\nactions find a floor within 8 blocks, and the rest say so next to the body. Bodies are stand-ins, not\nskins: neither this save nor the client jar holds a per-player texture and the viewer does not go to the\nnetwork. Cost: 216 triangles per body, two draw calls, and no raycast in the hover path. URL: ?bodies=0' },
+      { key: 'bodygap', label: 'silence that ends a body', stops: [60, 120, 300, 900, 3600, 21600],
+        fmt: (v) => (v >= 3600 ? `${(v / 3600).toFixed(1)} h` : `${v | 0} s`),
+        get: () => S.bodyGap, set: (v) => setBodyGap(v),
+        hint: 'How long a body may stay put after that player\'s last logged hand action. Measured on this\nsave (build/dbg-gaps.mjs, all six players, overworld): consecutive hand actions sit 1 s apart at p50 and\n5-20 s at p90, so a minute of silence means nothing - but across a silence over 300 s the hand has\nalready MOVED a median 52-155 blocks and a p90 over 1,100, so the body is not stretched across the gap. It\nstops, and the sentence below says who went quiet and when. This is the only number that decides how long\na claim of presence lasts, and it is deliberately adjustable: at 21,600 s you see the shape of a whole\nvisit at once, at 60 s only the second you are standing in. Re-cutting the visits costs 10 ms. URL:\n?bodygap=' },
+      { key: 'bodytracks', label: 'draw the route walked in a visit', kind: 'check',
+        fmt: () => (GHOST.lines && GHOST.lines.visible ? `${(GHOST.lines.geometry.drawRange.count / 2) | 0} segments` : 'off'),
+        get: () => !!S.bodyTracks, set: (v) => { S.bodyTracks = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
+        hint: 'A line through the hand actions of the visit each standing body is in, thinned to 96 points and\nalways ending where that player left. It is a straight-line JOIN of evidence, not a walked path, and it is\ndrawn only for a body that stands now: an absent player has no route to draw, and a route that runs across\na gap claims a person walked somewhere the log never saw them. URL: ?bodytracks=0' },
+      { key: 'bodytags', label: 'name and hedge over each body', kind: 'check',
+        fmt: () => (GHOST.tags.length ? `${GHOST.tagsShown} shown, ${GHOST.tagsSmall} too small` : 'off'),
+        get: () => !!S.bodyTags, set: (v) => { S.bodyTags = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
+        hint: 'Two lines over a body: the name, and under it what the body is standing on - "placed oak_stairs,\n4 s ago - no floor found under it". DOM rather than a texture atlas, because six crisp labels cost less\nthan one and the hedge has to be legible, not sitting in a tooltip nobody opens. A label disappears when\nthe person is under 3 pixels tall, and the sentence below counts how many it dropped. Clicking a name\nfilters the whole overlay and the replay to that player; click it again for everybody. URL: ?bodytags=0' },
+      { key: 'bodythrough', label: 'draw bodies through the world', kind: 'check',
+        fmt: () => (S.bodyThrough ? 'through - a finder at far zoom' : 'obeying walls'),
+        get: () => !!S.bodyThrough, set: (v) => { S.bodyThrough = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
+        hint: 'Off, bodies obey walls, because a person inside a house is INSIDE it and a body floating over its\nroof is a lie. On puts every body over everything, which is the only way to find them at whole-world zoom\n- and the reason the note says which mode is on. This also decides whether a body or the wall answers a\nclick: with walls on, whoever is nearest the eye owns the pixel. URL: ?bodythrough=1' },
+      { kind: 'note', key: 'note_people', text: () => peopleNote(),
+        hint: 'The sentence that answers "is this broken, or is nobody here?". It names the window the log can\nplace a body in at all (7.2 of this dimension\'s 822 days), the share of its seconds that supports a body\nsomewhere (0.26%), who is absent and why, and how many name tags were dropped for being under 3 pixels.' },
       { kind: 'note', text: 'M the time machine - K play or pause - drag playhead to scrub - Esc clears the card and the markers' },
       { kind: 'note', text: 'click a block for its history - L the overlay - T middle of view - F tour - Esc clears the card and the markers' },
       { kind: 'section', key: 'sec_far', label: 'the far world', open: false,
