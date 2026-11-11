@@ -4920,7 +4920,7 @@ const GHOST = {
   bodies: [], standing: 0, why: [], seats: {},
   under: null, deepestY: null, deepestDown: null,   // how many bodies sit under the open sky (the note counts them)
   mesh: null, lines: null, per: null, sig: '',
-  tagBox: null, tags: [], tagsShown: 0, tagsSmall: 0, tagSig: '', tagMs: 0,
+  tagBox: null, tags: [], tagsShown: 0, tagsSmall: 0, tagOff: 0, tagClamped: 0, tagSig: '', tagMs: 0,
   sel: -1,                       // a chosen player's timeline index; -1 = everybody
   nameSrc: null, nameList: [],
   buildMs: 0, syncMs: 0, cutMs: 0, syncs: 0, cuts: 0, next: 0, hitMs: 0, hitWhy: '', hitDist: 0,
@@ -5092,6 +5092,10 @@ function ghostCut(list) {
   GHOST.cuts++;
   GHOST.cutMs = performance.now() - t0;
   ghostTags(standing);
+  // Build and place in one breath. A chunk arriving mid-frame rebuilds the labels outside the frame loop,
+  // and until the next frame every one of them sat unpainted at the corner of the screen - which is what
+  // the corner name in the screenshot was.
+  ghostPlace();
 }
 
 /** The name over a body. DOM, because six crisp labels cost less than a text atlas and stay readable. */
@@ -5104,6 +5108,10 @@ function ghostTags(list) {
   for (const b of list) {
     const el = document.createElement('div');
     el.className = 'gtag';
+    // Start hidden: the box is at the ORIGIN of the screen, so a label that exists before it has been
+    // placed paints over the HUD at the top-left corner. Placement happens in the same breath now, and
+    // this is the belt: an unplaced name must never be the thing a viewer sees.
+    el.style.display = 'none';
     const lab = bodyLabel(TLAYER.tl, b, ghostNames());
     const nm = document.createElement('b');
     nm.textContent = lab.name;
@@ -5134,11 +5142,12 @@ function ghostPlace() {
   GHOST.v1 ??= new THREE.Vector3();
   GHOST.v2 ??= new THREE.Vector3();
   let shown = 0, small = 0;
+  GHOST.tagOff = 0; GHOST.tagClamped = 0;     // how many labels fell off this view, and how many had to slide
   for (const { el, b } of GHOST.tags) {
     const top = GHOST.v1.set(b.x + 0.5, b.y + BODY_H + 0.35, b.z + 0.5).project(camera);
     const px = (top.x * 0.5 + 0.5) * innerWidth, py = (-top.y * 0.5 + 0.5) * innerHeight;
     if (top.z > 1 || px < -60 || py < -40 || px > innerWidth + 60 || py > innerHeight + 40) {
-      el.style.display = 'none'; continue;              // behind the camera, or off the edge
+      el.style.display = 'none'; GHOST.tagOff++; continue;   // behind the camera, or off the edge
     }
     // How tall the person is IN PIXELS. At whole-world zoom a 1.8 block body is a fraction of a pixel,
     // and six names stacked on one pixel read as a bug rather than as six people: the label goes away,
@@ -5147,7 +5156,14 @@ function ghostPlace() {
     const pxH = Math.abs(top.y - bot.y) * innerHeight / 2;
     if (pxH < 3) { el.style.display = 'none'; small++; continue; }
     el.style.display = '';
-    el.style.transform = `translate(${Math.round(px)}px, ${Math.round(py)}px) translate(-50%, -100%)`;
+    // The body is on screen, so its words have to be too. A 300 px sentence anchored 10 px past the left
+    // edge renders as half a name, which reads as a broken page rather than as a person near the edge - so
+    // the label slides along the frame while the body stays where it is.
+    const wdt = el.offsetWidth || 140, hgt = el.offsetHeight || 26;
+    const cx = Math.min(innerWidth - wdt / 2 - 4, Math.max(wdt / 2 + 4, px));
+    const cy = Math.min(innerHeight - 6, Math.max(hgt + 6, py));
+    GHOST.tagClamped = (GHOST.tagClamped ?? 0) + (Math.abs(cx - px) > 0.5 || Math.abs(cy - py) > 0.5 ? 1 : 0);
+    el.style.transform = `translate(${Math.round(cx)}px, ${Math.round(cy)}px) translate(-50%, -100%)`;
     shown++;
   }
   GHOST.tagsShown = shown; GHOST.tagsSmall = small; GHOST.tagMs = performance.now() - t0;
@@ -6758,7 +6774,9 @@ window.__world = {
     verts: GHOST.mesh ? GHOST.mesh.geometry.attributes.position.count : 0,
     drawn: GHOST.mesh ? GHOST.mesh.geometry.drawRange.count : 0,
     routes: GHOST.lines ? GHOST.lines.geometry.drawRange.count / 2 : 0,
-    tagsShown: GHOST.tagsShown, tagsSmall: GHOST.tagsSmall, through: !!S.bodyThrough,
+    tagsShown: GHOST.tagsShown, tagsSmall: GHOST.tagsSmall, tagOff: GHOST.tagOff,
+    tagClamped: GHOST.tagClamped ?? 0,
+    through: !!S.bodyThrough,
     sel: GHOST.sel, gap: S.bodyGap, at: Math.round(S.timeAt),
     buildMs: +GHOST.buildMs.toFixed(1), syncMs: +GHOST.syncMs.toFixed(3), cutMs: +GHOST.cutMs.toFixed(2),
     syncs: GHOST.syncs, cuts: GHOST.cuts, tagMs: +GHOST.tagMs.toFixed(3),
@@ -7607,7 +7625,10 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         get: () => !!S.bodyTracks, set: (v) => { S.bodyTracks = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
         hint: 'A line through the hand actions of the visit each standing body is in, thinned to 96 points and\nalways ending where that player left. It is a straight-line JOIN of evidence, not a walked path, and it is\ndrawn only for a body that stands now: an absent player has no route to draw, and a route that runs across\na gap claims a person walked somewhere the log never saw them. URL: ?bodytracks=0' },
       { key: 'bodytags', label: 'name and hedge over each body', kind: 'check',
-        fmt: () => (GHOST.tags.length ? `${GHOST.tagsShown} shown, ${GHOST.tagsSmall} too small` : 'off'),
+        fmt: () => (GHOST.tags.length
+          ? `${GHOST.tagsShown} shown, ${GHOST.tagsSmall} too small, ${GHOST.tagOff} off this view`
+            + (GHOST.tagClamped ? `, ${GHOST.tagClamped} slid to stay in frame` : '')
+          : 'off'),
         get: () => !!S.bodyTags, set: (v) => { S.bodyTags = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
         hint: 'Two lines over a body: the name, and under it what the body is standing on - "placed oak_stairs,\n4 s ago - no floor found under it". DOM rather than a texture atlas, because six crisp labels cost less\nthan one and the hedge has to be legible, not sitting in a tooltip nobody opens. A label disappears when\nthe person is under 3 pixels tall, and the sentence below counts how many it dropped. Clicking a name\nfilters the whole overlay and the replay to that player; click it again for everybody. URL: ?bodytags=0' },
       { key: 'bodythrough', label: 'draw bodies through the world', kind: 'check',

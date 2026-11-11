@@ -210,7 +210,10 @@ second — and `Esc` gives the camera back.
 orbit mode for its block history card. With the time machine on, a stand-in figure stands
 where each player's hand acted: click the figure, or the name tag over it, for what the log
 actually says about that person (the tag is the part that stays reachable when rock is in
-front of them, and "only this player's edits" is a button inside that card, not a click away).
+front of them, and "only this player's edits" is a button inside that card, not a click away). A name
+label never leaves the picture: it slides along the frame when its person stands near an edge, and it
+disappears instead of half-rendering off the window — the panel row counts why (too small to see, or off
+this view).
 
 Everyday settings live in the panel (nine rows plus three collapsed groups). Every panel
 row also has a URL parameter, so a view is a link:
@@ -288,7 +291,7 @@ MB kept getting flat tiles after the replay was repriced as blocks). The panel b
 ## Tests and measurement
 
 ```bash
-npm test                # 445 tests: formats, codecs, stores, mesher, lighting, collision,
+npm test                # 447 tests: formats, codecs, stores, mesher, lighting, collision,
                         # pool split, ledger, time machine (incl. what a pick may answer and what one
                         # voxel may draw), region coverage, remembered settings, HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds

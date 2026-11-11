@@ -382,6 +382,25 @@ test('a body name tag opens the evidence, and only the card filters the replay',
     'the card carries the who filter, where it can be undone');
 });
 
+test('a name tag slides along the frame instead of rendering half a name off the edge', () => {
+  const p = bodyOf('ghostPlace');
+  assert.match(p, /const wdt = el\.offsetWidth/, 'the clamp guesses a label width nobody measured');
+  assert.match(p, /const cx = Math\.min\(innerWidth - wdt \/ 2 - 4, Math\.max\(wdt \/ 2 \+ 4, px\)\);/,
+    'a label anchored past the edge renders as half a name, which reads as a broken page');
+  assert.match(p, /const cy = Math\.min\(innerHeight - 6, Math\.max\(hgt \+ 6, py\)\);/,
+    'the vertical anchor still leaves the frame');
+  assert.match(p, /translate\(\$\{Math\.round\(cx\)\}px, \$\{Math\.round\(cy\)\}px\)/,
+    'the transform ignores the clamped anchor');
+  assert.match(p, /GHOST\.tagClamped = 0;\s*\/\//, 'the pass does not count how many labels had to slide');
+});
+
+test('a name label is never left standing unpainted at the corner of the screen', () => {
+  const t = bodyOf('ghostTags');
+  const c = bodyOf('ghostCut');
+  assert.match(t, /el\.style\.display = 'none';/, 'a label starts hidden, because its box sits at the top-left corner');
+  assert.match(c, /ghostTags\(standing\);[\s\S]{0,300}ghostPlace\(\);/, 'a rebuilt label is placed in the same breath it was built');
+});
+
 test('a buried body says how deep it is, on the tag and in the note', () => {
   const sync = bodyOf('ghostSync');
   assert.ok(/b\.down = bodyDepth\(b\)/.test(sync), 'the depth under the open sky is a fact of the moment');
