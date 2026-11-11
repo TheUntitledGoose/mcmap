@@ -271,6 +271,13 @@ const S = {
   // of its 313,884 claimed voxels hold more than one claim, p99 holds one, and the worst holds 292, which is
   // why the ramp saturates instead of growing a tower). URL: ?timestack=0
   timeStack: num('timestack', 1) ? 1 : 0,
+  // A marker face that has another marker of the same filter on the other side of it is INSIDE the thing the
+  // players built, and drawing it is what turns a wall of placed blocks into a pile of see-through panels:
+  // measured over the densest placement chunk in the shipped overworld pack (build/dbg-markermass.mjs, the
+  // deepslate-brick wall at x -48..-33, z -128..-113), 60% of its 12,432 marker faces sit against another
+  // claimed voxel, so three in five faces point into the interior and read back through the near skin as
+  // inverted normals. The world's own mesher culls these; this layer now does too. URL: ?timecull=0
+  timeCull: num('timecull', 1) ? 1 : 0,
   // The detail ring's ceiling while the replay runs, in chunks, 0 = leave the radius alone. Asked for and
   // measured, then set down to 0 because it does not pay: at a 140 m pull-back with the 8-chunk default the
   // page held 361 detail meshes / 12.40 M verts / 92.5 fps settled, and 5,709 of the 27,790 changes drawn
@@ -306,6 +313,16 @@ const S = {
   // a marker is an annotation and a body is a claim about the world; 0 = whichever is nearest. An A/B
   // switch, so it is URL-only: ?bodypick=0.
   bodyPick: num('bodypick', 1) ? 1 : 0,
+  // 1 = a change marker writes depth, so it can bury a person standing in the block it annotates. It is an
+  // A/B switch for the pixel A/B above, not a look: ?markdepth=1
+  markDepth: num('markdepth', 0) ? 1 : 0,
+  // What is allowed to hide a person. 1 (default) = only the voxel ground this page actually holds. The
+  // far paint layers (height-field skin, baked LOD plates, overview cells) approximate the surface at
+  // percentile heights and get clipped away near the camera, so a nearer hit in one of them is not
+  // evidence that someone is buried - at a real meadow party every such "occluder" was a baked LOD plate
+  // 0.65 blocks from the eye while the frame showed the body painted at that pixel. 0 = any drawn layer
+  // hides them, which is what this did before it was measured. URL: ?bodywall=0
+  bodyWall: num('bodywall', 1) ? 1 : 0,
   // A line around the voxel under the cursor. Cheap by policy, not by luck: one reusable 24-vertex box
   // and one raycast at `hoverMs` intervals, because a highlight that allocates a mesh per hover is a
   // hitch per hover. URL: ?nohover, ?hoverms=60
@@ -3639,6 +3656,12 @@ function pick(x, y) {
 // The parts of a ray hit that a colour probe needs, shared by the single-hit and hit-stack probes.
 // Attribution is fiddly (a hit sits exactly on a face plane), and the two probes must agree about
 // which block a pixel means, so it lives here once.
+/** Real chunk geometry, as opposed to one of the coarse far layers that only approximate the surface. */
+function isDetailMesh(o) {
+  for (; o; o = o.parent) if (o === lodGroup || o === ovGroup || o === shellGroup) return false;
+  return true;
+}
+
 function describeHit(hit, ray) {
   const p = hit.point, d = ray.direction;
   const n = hit.face && hit.face.normal;
@@ -3667,13 +3690,21 @@ function describeHit(hit, ray) {
   const qid = drawn !== 'detail' && ids && hit.faceIndex !== undefined && hit.faceIndex < ids.length
     ? ids[hit.faceIndex >> 1] : 0;
   const shellState = qid ? assets.states[qid - 1]?.k ?? null : null;
-  const sh = drawn === 'shell' ? shellAt(Math.floor(p.x / 16), Math.floor(p.z / 16)) : null;  const shellColumn = sh
+  const sh = drawn === 'shell' ? shellAt(Math.floor(p.x / 16), Math.floor(p.z / 16)) : null;
+  // Which texture class painted this pixel: 0 opaque, 1 cutout, 2 translucent. A flower, a leaf or a
+  // water film is hit by the ray and can still leave the pixel open, so "the ray landed on it" is not
+  // proof that it hides a person standing behind it.
+  let cls = -1;
+  for (let o = hit.object; o; o = o.parent) { const i = groups.indexOf(o); if (i >= 0) { cls = i; break; } }  const shellColumn = sh
     ? (() => { const id = sh.state[((Math.floor(p.z) & 15) << 4) | (Math.floor(p.x) & 15)];
         return id ? assets.states[id - 1]?.k ?? null : null; })()
     : null;
   return {
     point: [+p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2)],
-    block, drawn, state: drawn === 'shell' ? null : key,
+    // The pick's own distance along the ray, so a stack of hits can be read front to back without
+    // the probe re-deriving it from `point` (which is rounded to 0.01 and loses the ordering at grazing angles).
+    dist: +hit.distance.toFixed(2),
+    block, drawn, cls, state: drawn === 'shell' ? null : key,
     shellState: shellState ?? shellColumn, shellColumn,
     lodTile: drawn === 'lod' ? hit.object.userData?.tile ?? null : null,
     nrm: n ? [Math.round(n.x), Math.round(n.y), Math.round(n.z)] : null,
@@ -4558,6 +4589,17 @@ function timeBlockMatOf() {
   // applying it here is what turns a place filter into a wall of green seen through a house.
   timeBlockMat.depthTest = true;
   timeBlockMat.opacity = 1;                                       // opaque: shape carries the message
+  // ...but it does not get to SEAL a person inside the shell it grew around their voxel. Measured at a real
+  // mine framing (build/q_m15why.js, pixel A/B at the body's own pixel, same camera, bodies on / bodies off /
+  // depthTest off): obeying walls changed 0 of 1,972 sampled pixels in the body's own box, and the same body
+  // with its depth test switched off changed 751. So the body was drawn and rejected by a depth value the
+  // world's own ray never reported - the nearest terrain sat 10.42 away, the body 9.89. What wrote that depth
+  // is the marker over their voxel, 5.02 away, and a marker that writes depth buries the person it annotates.
+  // Markers draw at 902 and bodies at 903, so a marker that only TESTS depth is still hidden by terrain
+  // (terrain wrote that depth first) and stops sealing the people standing in the block it annotates.
+  // An earlier attempt wrote `= !S.markDepth`, which kept the sealing behaviour as the default and made the
+  // A/B switch mean its own opposite; the flag now says what it writes.
+  timeBlockMat.depthWrite = !!S.markDepth;
   return timeBlockMat;
 }
 
@@ -4672,7 +4714,7 @@ function timeRebuild() {
       resetMarkerLift();
       const b = buildTimeBlocks(TLAYER.tl, LEDGER.pack, got.order, assets, blockNameIds(),
         { plates: lk === 'plates', grow: 1 + 2 * S.timeGrow,
-          stackGrow: S.timeStack ? 0.36 : 0 });
+          stackGrow: S.timeStack ? 0.36 : 0, cull: !!S.timeCull });
       lookMb[lk] = Math.round(b.stats.bytes / 1048576);
       const lastTried = lk === tries[tries.length - 1];
       if (b.stats.bytes <= budget || lastTried) {
@@ -4707,6 +4749,7 @@ function timeRebuild() {
     TLAYER.mCx = built.markerCx; TLAYER.mCz = built.markerCz;
     TLAYER.quads = built.stats.markers; TLAYER.verts = built.stats.verts;
     TLAYER.stacked = built.stats.stacked; TLAYER.maxStack = built.stats.maxStack;
+    TLAYER.culled = built.stats.culled; TLAYER.enclosed = built.stats.enclosed;
     if (built.stats.unknown) TLAYER.err = `${built.stats.unknown.toLocaleString()} changes name something this atlas has no model for`;
     geo.setAttribute('position', new THREE.BufferAttribute(built.pos, 3));
     geo.setAttribute('uv', new THREE.BufferAttribute(built.uv, 2));
@@ -4833,6 +4876,7 @@ const GHOST = {
   sel: -1,                       // a chosen player's timeline index; -1 = everybody
   nameSrc: null, nameList: [],
   buildMs: 0, syncMs: 0, cutMs: 0, syncs: 0, cuts: 0, next: 0, hitMs: 0, hitWhy: '', hitDist: 0,
+  hitDetail: null, hitWall: null,
   v1: null, v2: null,            // two scratch vectors, so a label pass allocates nothing
 };
 
@@ -5125,13 +5169,23 @@ function ghostTakesPixel(body, marker, world) {
   const dm = S.bodyPick ? Infinity : (marker?.dist ?? Infinity);
   let dw = Infinity;
   GHOST.hitFloor = false;
-  if (world?.point) {
-    dw = camera.position.distanceTo(GHOST.v1.set(world.point[0], world.point[1], world.point[2]));
-    // Measured at a real hillside party: the body lost its own pixel to ground 13 blocks in front of it,
-    // at a distance 3.5 shorter than the body's. That ground is the floor they stand on and the bank in
-    // front of it, and it is nearer than their middle. A face that points up and sits at or below their
-    // feet does not hide anyone; a wall, a bank above their feet, or a roof still does.
-    if (world.nrm && world.nrm[1] > 0.9 && world.point[1] <= body.y + 0.25) {
+  GHOST.hitDetail = null;
+  // Only the voxels this page actually holds may hide a body. The coarse far layers are a guess about the
+  // surface (percentile height, boxy caps, clipped near the camera), and a nearer hit in one of them was
+  // measured at a meadow party 0.65 blocks from the eye while the frame showed the body painted there.
+  const oc = S.bodyWall ? world?.detail
+    : (world?.point ? { point: world.point, dist: world.dist, block: world.block } : null);
+  if (oc?.point) {
+    dw = oc.dist ?? camera.position.distanceTo(GHOST.v1.set(oc.point[0], oc.point[1], oc.point[2]));
+    GHOST.hitDetail = +dw.toFixed(2);
+    // The ground under their feet is not a wall. The test is positional, not directional: a block in their
+    // OWN column at or below the block they stand on is the floor, and an up-facing normal is not - that
+    // version exempted every hillside in front of a whole party. The height has to come from the seat, not
+    // from `body.y`: a block at their own y within one block horizontally is a TUNNEL WALL, and a mine
+    // framing proved it hides them (stone at 10.42, body at 9.89, body pixel unchanged with walls obeyed).
+    const feet = body.floor ?? body.y - 1;
+    const v = oc.block;
+    if (v && Math.abs(v[0] - body.x) <= 1 && Math.abs(v[2] - body.z) <= 1 && v[1] <= feet) {
       GHOST.hitFloor = true;
       dw = Infinity;
     }
@@ -5148,13 +5202,21 @@ function pixelHits(x, y) {
     than re-derive it from three distances and get it wrong in a different way. */
 function pixelOwner(x, y) {
   const h = pixelHits(x, y);
+  const bd = h.body ? GHOST.hitDist : null;   // pixelHits leaves the body's own distance here
   const takes = !!h.body && ghostTakesPixel(h.body, h.marker, h.world);
   const v = GHOST.v1 ??= new THREE.Vector3();
   return {
     owner: takes ? 'body' : h.marker ? 'marker' : h.world ? 'world' : 'nothing',
     floor: GHOST.hitFloor,
     player: takes && h.body ? h.body.player : null,
-    bodyDist: h.body ? +GHOST.hitDist.toFixed(2) : null,
+    bodyDist: h.body ? +bd.toFixed(2) : null,
+    worldCls: h.world ? h.world.cls : null,
+    detailDist: GHOST.hitDetail,
+    detailState: h.world?.detail?.state ?? null, detailBlock: h.world?.detail?.block ?? null,
+    wall: S.bodyWall ? 'voxels only' : 'any drawn layer',
+    worldDrawn: h.world ? h.world.drawn : null,
+    worldQuad: h.world ? h.world.quad : null,
+    worldState: h.world ? (h.world.state ?? h.world.shellState) : null,
     markerDist: h.marker ? +h.marker.dist.toFixed(2) : null,
     worldDist: h.world?.point
       ? +camera.position.distanceTo(v.set(h.world.point[0], h.world.point[1], h.world.point[2])).toFixed(2)
@@ -5299,7 +5361,7 @@ function peopleNote() {
           + 'bare ground: the "caves" row in the panel, or ?caves=1.'));
   }
   out.push(S.bodyThrough ? 'a body answers a click through anything (bodythrough).'
-    : S.bodyPick ? 'a person answers a click before a change marker does; rock in front of them still answers first (?bodypick=0 to put the nearest thing back).'
+    : S.bodyPick ? 'a person answers a click before a change marker does; the real ground in front of them still answers first (?bodypick=0 to put the nearest thing back, ?bodywall=0 to let far paint hide them too).'
       : 'the nearest drawn thing answers the click, change markers included.');
   for (const w of GHOST.why.slice(0, 3)) out.push(w);
   if (GHOST.why.length > 3) out.push(`... and ${GHOST.why.length - 3} more with no body at this moment`);
@@ -5977,9 +6039,21 @@ function pickState(x, y) {
   // Fog already hides anything past `far`, so a probe that reports a hit 900 blocks away is
   // describing pixels the user sees as plain sky; keep the ray to the visible range.
   rc.far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
-  const hit = rc.intersectObjects(groups, true)[0];
+  const hits = rc.intersectObjects(groups, true);
+  const hit = hits[0];
   if (!hit) return null;
   const h = describeHit(hit, rc.ray);
+  // The first hit answers "what painted this pixel". It is not always the thing that hides a person: a
+  // coarse far layer approximates the ground, and near the camera parts of it are clipped away by the
+  // shader, so the ray can report an occluder the frame never draws. Ask separately for the nearest hit
+  // in real chunk voxels, which is the only ground this page can claim to know.
+  const dh = h.drawn === 'detail' ? hit : hits.find((x) => isDetailMesh(x.object));
+  const dq = !dh || dh === hit ? h : describeHit(dh, rc.ray);
+  const detail = dh ? {
+    point: [+dh.point.x.toFixed(2), +dh.point.y.toFixed(2), +dh.point.z.toFixed(2)],
+    dist: +dh.distance.toFixed(2), block: dq.block, cls: dq.cls, drawn: dq.drawn,
+    state: dq.state ?? dq.shellState,
+  } : null;
   const p = hit.point, key = h.state ?? h.shellState;
   const what = h.drawn, shellKey = h.shellState, shellColKey = h.shellColumn;
   // Shell and detail own different data, and describeHit reports both views: which pass drew the
@@ -5992,7 +6066,10 @@ function pickState(x, y) {
   return {
     point: [+p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2)],
     block: h.block,
+    dist: +hit.distance.toFixed(2),
+    detail,
     pass: hit.object.renderOrder,
+    cls: h.cls,   // 0 opaque / 1 cutout / 2 translucent: the mesher's texture class
     drawn: what,
     obj: hit.object.name ?? null,
     // the quad's own direction, so a probe can compare a pixel against the shade that face gets
@@ -6499,6 +6576,8 @@ window.__world = {
     // the gap between claims and voxels, which is what a person means by "overlapping": how many claims
     // share a voxel with an earlier one, and how deep the deepest such stack goes
     stacked: TLAYER.stacked ?? 0, maxStack: TLAYER.maxStack ?? 0, stackRamp: !!S.timeStack,
+    // faces the layer refused to draw because another claim of this filter sits behind them
+    culledFaces: TLAYER.culled ?? 0, fullyInside: TLAYER.enclosed ?? 0, faceCull: !!S.timeCull,
     geomMbCap: S.timeGeomMb,
     markerGeoMb: TLAYER.mesh ? +(TLAYER.mesh.geometry.attributes.position.array.byteLength
       / 1048576).toFixed(1) : 0,

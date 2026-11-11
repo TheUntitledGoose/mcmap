@@ -128,12 +128,17 @@ test('plates cost a fraction of blocks, and a quad ceiling stops the build inste
   for (let x = 0; x < 12; x++) for (let z = 0; z < 12; z++) {
     rows.push([x, 64, z, 2, 'minecraft:stone', 'minecraft:air', 10 + x * 12 + z]);
   }
-  const cubes = build(rows, {});
-  const plates = build(rows, { plates: true });
+  const cubes = build(rows, { cull: false });
+  const plates = build(rows, { plates: true, cull: false });
   assert.equal(cubes.stats.cubes, 144);
   assert.equal(plates.stats.plates, 144);
   assert.ok(plates.stats.quads * 4 < cubes.stats.quads, 'a plate is one face, not six');
   assert.ok(plates.stats.bytes * 4 < cubes.stats.bytes);
+  // The same floor with face culling on (the default): 144*6 = 864 faces, and the 264 side-by-side pairs eat
+  // 528 of them, so a slab of claims costs its skin. Measured, not assumed.
+  const shut = build(rows, { cull: true });
+  assert.equal(shut.stats.culled, 528, 'a 12x12 floor shares 264 side faces, twice');
+  assert.ok(shut.stats.quads * 2 < cubes.stats.quads, 'and the floor is drawn as a floor, not as 864 panels');
 
   const capped = build(rows, { maxQuads: 300 });
   assert.equal(capped.stats.stopped, true, 'the ceiling must say it stopped');
@@ -163,13 +168,17 @@ test('the panel sentence about what fits is a measured number, not a guess', () 
   const place = [];
   for (let i = 0; i < tl.count; i++) if (tl.action[i] === 1) place.push(i);
   resetMarkerLift();
-  const b = buildTimeBlocks(tl, P, place, assets, byName, {});
+  const b = buildTimeBlocks(tl, P, place, assets, byName, { grow: 1.18, stackGrow: 0.36 });
   assert.equal(b.stats.rows, place.length);
   assert.equal(b.stats.stopped, false, 'the place filter fits, which is why it is the default filter');
   assert.ok(b.stats.markers > 80000, `tens of thousands of block markers, got ${b.stats.markers}`);
-  // 66 MB of geometry for a whole dimension of places: the reason a ceiling exists at all.
-  assert.ok(b.stats.bytes > 40 * 1024 * 1024, 'block markers are a real allocation, not free');
-  assert.ok(b.stats.bytes < 128 * 1024 * 1024);
+  // 63.4 MB of geometry as six faces per claim; 35.8 MB once the faces that sit inside the players' own
+  // build are dropped (241,091 of 553,726, and 1,864 claims end up entirely inside). Both numbers are the
+  // reason a ceiling exists at all, and the smaller one is why blocks fit where plates used to be forced.
+  assert.ok(b.stats.bytes > 30 * 1024 * 1024, 'block markers are a real allocation, not free');
+  assert.ok(b.stats.bytes < 45 * 1024 * 1024, 'and culling the interior of a build is most of the saving');
+  assert.ok(b.stats.culled > b.stats.faces / 2, `${b.stats.culled} faces sit inside another claim of this filter`);
+  assert.equal(b.stats.culled + b.stats.faces, 553726, 'culled plus drawn is what six faces per claim would be');
   assert.ok(b.stats.unknown > 0 && b.stats.unknown < b.stats.markers / 50,
     `a few names the atlas cannot draw: ${b.stats.unknown} of ${b.stats.markers}`);
 
@@ -335,4 +344,96 @@ test('the builder says which chunk each marker stands in, which is how far the r
   assert.equal(b.stats.markers, 2);
   assert.deepEqual(Array.from(b.markerCx), [0, 1], 'the second row stands in the next chunk over');
   assert.deepEqual(Array.from(b.markerCz), [0, 0]);
+});
+
+// A wall of placed blocks is the case the flat tiles never showed: 1,661 cube markers sitting shoulder to
+// shoulder. The world's own mesher throws away a face whose neighbour is solid; a marker layer that does not
+// draws three in five faces into the inside of the thing the players built, and those back-faces seen through
+// the gaps in the near skin are what a person calls "inverted normals, I see the opposite faces".
+test('a face with another claim of the same filter behind it is inside the build, so it is not drawn', () => {
+  const wall = [[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],
+    [3, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 20]];
+  const open = build(wall, { cull: false });
+  const shut = build(wall, { cull: true });
+  assert.equal(open.stats.markers, 2);
+  assert.equal(shut.stats.markers, 2, 'the wall is still two blocks of claim');
+  assert.equal(open.stats.faces, 12, 'six faces each when nothing is culled');
+  assert.equal(shut.stats.faces, 10, 'the two faces that met in the middle are gone');
+  assert.equal(shut.stats.culled, 2);
+  assert.equal(shut.stats.tris, open.stats.tris - 4, 'and the geometry went with them: two quads, four triangles');
+});
+
+test('a claim the build completely hides is skipped, and counted as inside rather than as shapeless', () => {
+  const cube = [];
+  for (let dx = 0; dx < 3; dx++) {
+    for (let dy = 0; dy < 3; dy++) {
+      for (let dz = 0; dz < 3; dz++) cube.push([4 + dx, 64 + dy, 4 + dz, 2, 'minecraft:stone', 'minecraft:air', 10]);
+    }
+  }
+  const shut = build(cube, { cull: true });
+  const open = build(cube, { cull: false });
+  assert.equal(open.stats.markers, 27);
+  assert.equal(shut.stats.markers, 26, 'the one block with a claim on all six sides draws nothing');
+  assert.equal(shut.stats.enclosed, 1);
+  assert.equal(shut.stats.noModel, 0, 'a hidden claim is not a missing model');
+  // 3x3x3: 27*6 faces, 54 of them shared pairs -> the skin is 6*9 = 54 faces.
+  assert.equal(shut.stats.faces, 54);
+});
+
+test('a model marker keeps the shape the model authored, whatever the grow factor says', () => {
+  // A cube needs grow so it is not coplanar with the block it describes. An authored model does not: its
+  // geometry can leave the voxel (a wall torch, a 1x2 monolith), and scaling that distance about the voxel
+  // centre multiplies a real shape into a wrong one. So a model marker must come out the same size at any
+  // grow, while a cube marker must not.
+  const rows = [[2, 64, 3, 2, 'minecraft:oak_stairs', 'minecraft:air', 10]];
+  const flush = build(rows, { grow: 1 });
+  const blown = build(rows, { grow: 3, stackGrow: 0.4 });
+  assert.equal(flush.stats.markers, 1);
+  assert.equal(blown.stats.markers, 1);
+  assert.ok(flush.stats.models === 1 && blown.stats.models === 1, 'oak_stairs must come from the model path');
+  assert.equal(blown.pos.length, flush.pos.length);
+  let maxd = 0;
+  for (let i = 0; i < flush.pos.length; i++) maxd = Math.max(maxd, Math.abs(blown.pos[i] - flush.pos[i]));
+  assert.ok(maxd < 1e-4, `a model marker moved ${maxd.toFixed(3)} blocks under grow=3; it must not move at all`);
+  const cubed = build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10]], { grow: 1 });
+  const cubeg = build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10]], { grow: 1.18 });
+  const wide = (b) => Math.max(...Array.from({ length: b.pos.length / 3 }, (_, v) => b.pos[v * 3]))
+    - Math.min(...Array.from({ length: b.pos.length / 3 }, (_, v) => b.pos[v * 3]));
+  assert.ok(wide(cubeg) > wide(cubed) + 0.15, 'a cube marker still gets the grow that keeps it off the terrain');
+});
+
+// The repeat counter that decides how far a marker reaches used to pack x,y,z into one float
+// ((x+2^21)*2^34 + (y+2^12)*2^22 + (z+2^21)). That is 56 bits, and a double is exact only below 2^53: out at
+// x -40 the spacing is 8, so z -128, -125 and -122 collapse to ONE number. Measured over the shipped
+// overworld place filter with build/dbg-markermass.mjs: 43,235 of 90,045 claims were read as repeats of a
+// neighbour's voxel, and the deepest stack as 35 instead of 13. Half the markers in the picture were being
+// scaled and lifted as if they were the tenth claim on a voxel - a wall of blocks a block wide standing
+// half-way between grid lines, which is what a person means by "waaaay off grid".
+test('two voxels a few blocks apart are two voxels, not the same claim twice', () => {
+  const boxOf = (b, m) => {
+    let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    let prev = m ? 0 : 0;
+    for (let k = (m ? b.markerEnd[m - 1] : 0); k < b.markerEnd[m]; k++) {
+      const p = b.idx[k] * 3;
+      for (let a = 0; a < 3; a++) {
+        lo[a] = Math.min(lo[a], b.pos[p + a]); hi[a] = Math.max(hi[a], b.pos[p + a]);
+      }
+    }
+    return { lo, hi };
+  };
+  const opts = { grow: 1.18, stackGrow: 0.36, cull: false };
+  const apart = build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],
+    [2, 64, 6, 2, 'minecraft:stone', 'minecraft:air', 20],
+    [2, 64, 10, 2, 'minecraft:stone', 'minecraft:air', 30]], opts);
+  assert.equal(apart.stats.stacked, 0, 'three voxels 3 and 4 apart in z are three separate claims');
+  for (let m = 1; m < 3; m++) {
+    const a = boxOf(apart, 0), b = boxOf(apart, m);
+    const w = (q) => q.hi[0] - q.lo[0];
+    assert.ok(Math.abs(w(b) - w(a)) < 1e-6, `marker ${m} is ${w(b).toFixed(3)} wide against ${w(a).toFixed(3)}`);
+  }
+  const twice = build([[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],
+    [2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 20]], opts);
+  assert.equal(twice.stats.stacked, 1, 'one voxel claimed twice is a real stack');
+  const [first, second] = [boxOf(twice, 0), boxOf(twice, 1)];
+  assert.ok(second.hi[0] - first.hi[0] > 0.1, 'and the newer claim reaches outside the older one');
 });

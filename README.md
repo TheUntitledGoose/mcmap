@@ -227,7 +227,9 @@ row also has a URL parameter, so a view is a link:
                       markers flush with their voxel), ?timetiles=0,
                       ?timeterrain=0 (undo the log in the voxels), ?timesharp=12 (replay in a wider
                       square than the view draws sharp), ?timestack=0 (older claims at one voxel stop
-                      owning it), ?hover=0, ?timepick=0 (let the outline answer today's mesh again)
+                      owning it), ?timecull=0 (draw the faces that sit inside the players' own build,
+                      which is what made a wall of placed blocks read as inverted normals),
+                      ?hover=0, ?timepick=0 (let the outline answer today's mesh again)
 ?bodies=0             stop standing the players back in (it comes on with the time machine)
 ?bodygap=300          the silence, in seconds, that ends a body. Measured on this save: one
                       player's hand actions sit 1 s apart at p50, but across a silence over
@@ -239,6 +241,11 @@ row also has a URL parameter, so a view is a link:
                       body obeys walls, because a person inside a house is inside it)
 ?bodypick=0           put nearest-wins back for a pixel: today a person answers a click before a
                       change marker does, and the floor under their feet never counts as occlusion
+?bodywall=0           let any drawn layer hide a body, instead of only the real chunk voxels (a baked
+                      LOD tile is approximated ground and cannot prove a person is out of sight)
+?markdepth=1          make a change marker write depth again: by default it tests the world's depth but
+                      never writes its own, because a marker that writes it seals the body standing in
+                      the voxel the marker annotates
 ?nocov=1              stop using the region listing: ask for every tile again (the pan A/B)
 ?groundttl=120000     how long the page believes that listing, ms
 ?debug=1              instrument panel and HUD
@@ -259,7 +266,7 @@ MB kept getting flat tiles after the replay was repriced as blocks). The panel b
 ## Tests and measurement
 
 ```bash
-npm test                # 411 tests: formats, codecs, stores, mesher, lighting, collision,
+npm test                # 441 tests: formats, codecs, stores, mesher, lighting, collision,
                         # pool split, ledger, time machine (incl. what a pick may answer), region
                         # coverage, remembered settings, HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds

@@ -40,6 +40,7 @@
 
 import { emitCubeFace, emitQuad, hash3, VertexStream } from './mesher.js';
 import { decodeFaceCode } from '../../shared/cube-path.mjs';
+import { DIRS, FACE_DIR } from '../../shared/faces.mjs';
 
 /**
  * Per-action colour wash, indexed by the TIMELINE action byte (0 change, 1 place, 2 break, 3 insert,
@@ -61,6 +62,9 @@ export const ACTION_WASH = [
 const ALL_FACES = [0, 1, 2, 3, 4, 5];
 const TOP_ONLY = [1];
 
+/** The step to the voxel on the other side of face f, in the same DIRS order the mesher uses. */
+const FACE_OFF = DIRS.map((d) => FACE_DIR[d]);
+
 /** Neighbour lookups for a lone marker: -1 means "unknown", which culls nothing. */
 const NO_AT = () => -1;
 const FAKE_CHUNK = { cx: 0, cz: 0 };
@@ -76,6 +80,21 @@ const FAKE_CHUNK = { cx: 0, cz: 0 };
  * and the markers that exist are the OLDEST ones - the scrubber reads forward, so cutting the tail would
  * hide the changes a person is watching for.
  *
+ * Why a face inside the build is not drawn (the `cull` option, on by default): the world's own mesher throws
+ * away a face whose neighbour is solid, and a marker layer that does not is a wall of panels you can see
+ * straight through. Measured over the densest placement chunk in the shipped overworld pack
+ * (build/dbg-markermass.mjs - the deepslate-brick wall at x -48..-33, z -128..-113 this was reported on):
+ * **60% of its 12,432 marker faces sit against another claimed voxel of the same filter**, so three in five
+ * faces point into the interior of the thing the players built. Seen through the gaps in the near skin those
+ * back-faces read as "the normals are inverted and I see the opposite faces". Culling them is also cheaper:
+ * that chunk's cubes drop from 6 faces each to their own outer skin.
+ *
+ * Why a model is NOT scaled about the block centre: a cube needs `grow` so it stops being coplanar with the
+ * block it describes. An authored model needs no such thing, and cannot survive it - the census allows geometry
+ * outside the 0..16 box, and a marker for `soulsweapons:chungus_monolith` already reaches ~2 blocks from its
+ * voxel, so multiplying that reach by the grow factor put it nearly 3 blocks off the grid. The model's own
+ * shape is the claim, so `?timegrow` belongs to cubes.
+ *
  * Returns `done()` streams (indexed) plus three parallel per-marker arrays:
  *   markerSec  the row's second, ascending - binary search it with `quadAt`
  *   markerEnd  cumulative INDEX count through this marker - the draw range is `markerEnd[n-1]`
@@ -89,7 +108,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   // 0 restores same-size markers, which is the A/B. `stackTau` is how many claims at one voxel it takes to
   // get most of the way there.
   const { plates = false, maxQuads = 0, lift = 0.004, maxLift = 0.08, grow = 1,
-    stackGrow = 0, stackTau = 3 } = opts;
+    stackGrow = 0, stackTau = 3, cull = true } = opts;
   // Strictly increasing in the number of claims already drawn at this voxel, and bounded: the newest claim at
   // a voxel is always the outermost shell, and even a voxel logged 292 times stays inside grow + 2*stackGrow.
   const sizeOf = (depth) => grow + 2 * (stackGrow > 0 ? stackGrow * (1 - Math.exp(-depth / stackTau)) : 0);
@@ -104,8 +123,19 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   const stats = {
     rows: order.length, markers: 0, cubes: 0, plates: 0, models: 0, unknown: 0, air: 0,
     noCell: 0, noModel: 0, faces: 0, quads: 0, verts: 0, tris: 0, stopped: false, bytes: 0,
-    stacked: 0, maxStack: 0,
+    stacked: 0, maxStack: 0, culled: 0, enclosed: 0,
   };
+  // Every voxel this filter claims, before a single face is emitted: a face whose other side is claimed by
+  // this same filter is inside the build, and `?timecull=0` is the A/B that draws it anyway.
+  const claimed = cull ? new Set() : null;
+  if (claimed) {
+    for (const i of order) {
+      const c = cellAt(tl.cellOf(i));
+      if (c && c.cx !== undefined && c.cz !== undefined) {
+        claimed.add(vkey(c.cx * 16 + tl.x(i), tl.y(i), c.cz * 16 + tl.z(i)));
+      }
+    }
+  }
   const mSec = new Uint32Array(order.length);
   const mEnd = new Uint32Array(order.length);
   const mRow = new Int32Array(order.length);
@@ -129,9 +159,16 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     }
     const state = assets.states[st];
     const h = hash3(bx, y, wz);
+    let hid = 0;
+    const hidden = (f) => {
+      if (!claimed) return false;
+      const d = FACE_OFF[f];
+      return claimed.has(vkey(bx + d[0], y + d[1], wz + d[2]));
+    };
     if (state.cube?.length) {
       const arm = state.cube[assets.pickArm(state, h)];
       for (const f of (plates ? TOP_ONLY : ALL_FACES)) {
+        if (hidden(f)) { hid++; stats.culled++; continue; }
         const [texIdx] = decodeFaceCode(arm[f]);
         const cell = assets.texCell(texIdx);
         if (!cell) { inner.skipped++; continue; }
@@ -150,7 +187,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
       stats.models++;
     } else { stats.noModel++; continue; }
     const emitted = stream.i - i0;
-    if (!emitted) { stats.noModel++; continue; }      // a fully transparent model draws nothing
+    if (!emitted) { if (hid === (plates ? 1 : 6)) stats.enclosed++; else stats.noModel++; continue; }      // a fully transparent model draws nothing
 
     // Wash + a hair of lift. Repeats of one voxel (place, break, place again) would otherwise be coplanar
     // with each other; the page's material polygon-offsets the whole layer against the world's own faces,
@@ -160,7 +197,9 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     // sets the lift) and therefore whose turn it is in the stack (which sets how far out it reaches).
     const depth = seen0(bx, y, wz) ?? 0;
     const liftY = Math.min(maxLift, depth * lift);
-    const g = depth && stackGrow ? sizeOf(depth) : grow;
+    // Cubes only: an authored model's reach IS the block's shape, and scaling it about the voxel centre
+    // turns a big block into a wrong one (see the header).
+    const g = state.cube?.length ? (depth && stackGrow ? sizeOf(depth) : grow) : 1;
     const mx = bx + 0.5, my = y + 0.5, mz = wz + 0.5;
     for (let v = v0; v < stream.n; v++) {
       stream.col[v * 4] = (stream.col[v * 4] * wash[0]) | 0;
@@ -196,13 +235,24 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
 }
 
 /**
+ * One voxel key, shared by the repeat counter and the inside-the-build face test.
+ *
+ * A string, and that is not laziness: the usual trick of packing x,y,z into one float (`(x+2^21)*2^34 +
+ * (y+2^12)*2^22 + (z+2^21)`) needs 56 bits, and a double is exact below 2^53. Out here it already is not:
+ * the magnitude is ~2^55, so the spacing is 8 and a z of 2, 3 or 4 collapses to ONE number. That is how a
+ * cube marker for a lone block lost its north and south faces to a neighbour that does not exist, and it is
+ * also why a block claimed once can come back with a stack depth of 10 and get scaled like a tenth claim.
+ */
+function vkey(x, y, z) { return `${x},${y},${z}`; }
+
+/**
  * Repeat counting for the sub-millimetre lift. Rebuilding this per build (rather than carrying it between
  * builds) is deliberate: `?timelook=blocks` and `?timecls=2` are different marker sets, and a lift carried
  * over from one to the other would make a marker's height depend on which filter ran first.
  */
 const _seen = new Map();
 function seen0(x, y, z) {
-  const key = (x + 2097152) * 17179869184 + (y + 4096) * 4194304 + (z + 2097152);
+  const key = vkey(x, y, z);
   const n = _seen.get(key) ?? 0;
   _seen.set(key, n + 1);
   if (_seen.size > 4_000_000) _seen.clear();          // a scrub that outlives the map must not grow it

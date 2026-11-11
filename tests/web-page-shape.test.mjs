@@ -221,18 +221,36 @@ test('the playhead pick asks the log, never the mesh, and answers nothing rather
 // marker instead of the person, because a marker is grown OUTWARD from its block and a replayed build site
 // is full of them. The rule is therefore about KINDS, not distances: an annotation does not hide a person,
 // rock does.
-test('a person answers a click before a change marker does, but rock in front of them still does', () => {
+test('a person answers a click before a marker and before far paint, but real ground in front does not', () => {
   const g = bodyOf('ghostTakesPixel');
   assert.match(g, /if \(S\.bodyThrough\) return true;/, 'the whole-world finder no longer answers outright');
   assert.match(g, /const dm = S\.bodyPick \? Infinity : \(marker\?\.dist \?\? Infinity\);/,
     'a marker is back in the distance race, which is the unclickable-person bug again');
   assert.match(g, /return GHOST\.hitDist <= dm && GHOST\.hitDist <= dw;/,
     'a body no longer has to be in front of the world surface, so it answers through walls');
-  // Measured at a real party on a hillside: the body lost its own pixel to ground 13 blocks in front of
-  // it, 3.5 blocks nearer than the body. That ground is the floor they stand on. A face pointing up at or
-  // below their feet hides nobody, so it must not count as "rock in front of them".
-  assert.match(g, /world\.nrm\[1\] > 0\.9 && world\.point\[1\] <= body\.y \+ 0\.25/,
-    'the floor under a body became an occluder, so a person on a slope can never be clicked');
+  // Measured at a meadow party: every "occluder" the first ray found was a baked LOD plate 0.65 blocks
+  // from the eye, and the framebuffer showed the body painted at that very pixel. Coarse far layers are a
+  // guess about the surface, clipped near the camera, so only real chunk voxels may hide a person.
+  assert.match(g, /const oc = S\.bodyWall \? world\?\.detail/,
+    'a coarse far-layer plate can hide a person again, which the frame proved false');
+  assert.match(src, /bodyWall: num\('bodywall', 1\) \? 1 : 0,/, 'the A/B back to the old any-layer rule is gone');
+  assert.match(bodyOf('isDetailMesh'),
+    /if \(o === lodGroup \|\| o === ovGroup \|\| o === shellGroup\) return false;/,
+    'nothing can tell real voxels from far paint, so the pick cannot answer which is which');
+  assert.match(src, /hits\.find\(\(x\) => isDetailMesh\(x\.object\)\)/,
+    'the pick stopped looking past the first hit, so a coarse plate in front hides the answer');
+  // The floor a body stands on is nearer than their middle and does not hide them. The honest form is a
+  // position test - a block in their OWN column at or below the block the SEAT found them standing on.
+  // Asking only whether the face pointed up buried every body at a hillside party behind rock 6 blocks in
+  // front. Asking `body.y` instead of the seat exempted a mine's tunnel WALL: stone at [65,99,-48] is one
+  // block sideways at the body's own height, and the frame showed it hiding them (build/q_m15why.js: body
+  // 9.89, that wall 10.42, 0 of 1,972 box pixels changed with walls obeyed).
+  assert.match(g, /Math\.abs\(v\[0\] - body\.x\) <= 1 && Math\.abs\(v\[2\] - body\.z\) <= 1/, 'the floor test stopped asking whose column this is');
+  assert.match(g, /const feet = body\.floor \?\? body\.y - 1;/,
+    'the test guesses where the feet are instead of asking the seat that stands them there');
+  assert.match(g, /v\[1\] <= feet/, 'a block at their own height now counts as the floor, so a wall hides them and the pick lies');
+  assert.doesNotMatch(g, /v\[1\] >= body\.y - 2/, 'the two-block band is back: it lets a tunnel wall or a fence be called a floor');
+  assert.doesNotMatch(g, /world\.nrm\[1\] > 0\.9/, 'the direction test is back: any up-facing slope buries a whole party');
   assert.match(g, /GHOST\.hitFloor = true;/,
     'nothing records that the floor exempted the body, so the number cannot be checked');
   assert.match(g, /if \(!S\.bodyPick\) \{/, '?bodypick=0 no longer restores plain nearest-wins');
@@ -243,8 +261,32 @@ test('a person answers a click before a change marker does, but rock in front of
     'the click raycasts separately again, so the probe and the click answer different questions');
   assert.match(src, /ownerAt: \(x = innerWidth \/ 2, y = innerHeight \/ 2\) => pixelOwner\(x, y\),/,
     'no probe can ask who would answer this pixel, so the rule can only be argued about');
+  const po = bodyOf('pixelOwner');
+  assert.match(po, /detailDist: GHOST\.hitDetail,/, 'the answer cannot say how far the real ground in front was');
+  assert.match(po, /worldCls: h\.world \? h\.world\.cls : null,/, 'the answer cannot say what kind of face answered');
+  assert.match(po, /worldDrawn: h\.world \? h\.world\.drawn : null,/, 'the answer cannot say which layer painted it');
   assert.match(bodyOf('peopleNote'), /a person answers a click before a change marker does/,
     'the sentence next to the bodies stopped saying who answers a click');
+});
+
+// A marker is an annotation on a voxel, and it grows OUTWARD around that voxel, so it is nearer than
+// whatever stands in the voxel. Measured at a real mine framing (build/q_m15why.js: one body, one camera,
+// three grabs - bodies on, bodies off, bodies drawn with the depth test switched off):
+//   obeying walls  changed   0 of 1,972 pixels in the body's own projected box
+//   depthTest off  changed 751
+// so the body was drawn and rejected by a depth value the world's own ray never reported (nearest terrain
+// 10.42, body 9.89). What wrote that depth was the marker over their voxel at 5.02. Writing `depthWrite =
+// !S.markDepth` kept the burying as the default and made the switch mean its opposite; the pixel A/B is the
+// only reason this was visible at all.
+test('a change marker tests the depth of the world but never writes its own', () => {
+  const m = bodyOf('timeBlockMatOf');
+  assert.match(m, /timeBlockMat\.depthWrite = !!S\.markDepth;/,
+    'a marker writes depth by default again, so it seals a person inside the shell around their voxel');
+  assert.doesNotMatch(m, /depthWrite = !S\.markDepth/,
+    'the depth-write switch means its own opposite again');
+  assert.match(m, /timeBlockMat\.depthTest = true;/,
+    'a marker stopped obeying the world, so a hill in front of it stops hiding it');
+  assert.match(src, /markDepth: num\('markdepth', 0\) \? 1 : 0,/, 'the A/B that lets a marker seal depth is gone');
 });
 
 // A person answers a click before a marker does, so the outline has to answer the same way or the page

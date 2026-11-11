@@ -142,6 +142,66 @@ for (let attempt = 0; attempt < 3 && !shot; attempt++) {
   }
 }
 
+// Is the person actually PAINTED where the page's rays say they are? A colour-buffer A/B at the body's own
+// pixel - same camera, bodies on against bodies off. Rays can be right about a ray and still be wrong about
+// the draw (depth test, render order, a clipped colour), and only the framebuffer settles that.
+const grabAt = (sx, sy) => {
+  const f = w.grab();
+  const gx = Math.floor((sx + 0.5) * f.dpr), gy = Math.floor((innerHeight - sy - 0.5) * f.dpr);
+  const px = [];
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const i = ((gy + dy) * f.w + (gx + dx)) * 4;
+      px.push([f.buf[i], f.buf[i + 1], f.buf[i + 2]]);
+    }
+  }
+  return { buf: f.buf, w: f.w, h: f.h, px };
+};
+let pixels = null;
+if (shot) {
+  // the body's own projected box: the answer to "where would it have to be painted to be seen"
+  const cs = [];
+  for (const dx of [0, 1]) for (const dy of [0, 1.8]) for (const dz of [0, 1]) {
+    const p = w.project(shot.b.x + dx, shot.b.y + dy, shot.b.z + dz);
+    cs.push([p[0], p[1]]);
+  }
+  const bb = [Math.min(...cs.map((p) => p[0])), Math.min(...cs.map((p) => p[1])),
+    Math.max(...cs.map((p) => p[0])), Math.max(...cs.map((p) => p[1]))].map(Math.round);
+  const on = grabAt(shot.mid[0], shot.mid[1]);
+  const before = on.buf.slice();
+  w.set('bodies', 0);
+  await settle(700);
+  const off = grabAt(shot.mid[0], shot.mid[1]);
+  const mean = (arr) => [0, 1, 2].map((c) => +(arr.reduce((s, p) => s + p[c], 0) / arr.length).toFixed(1));
+  // Where did the bodies actually paint? Counting is not enough: a number like 1,121 px could be one
+  // person filling the middle of the frame or five route lines in the corners. So keep the bounding box of
+  // the changed pixels, and the projected box of the body the framing was chosen for, and say how much of
+  // the painting falls inside that box.
+  const fw = off.w;   // framebuffer columns (rows come back bottom-up, which does not matter for a bbox)
+  let changed = 0, cx0 = 1e9, cy0 = 1e9, cx1 = -1e9, cy1 = -1e9, inBody = 0;
+  for (let i = 0; i < before.length; i += 4) {
+    if (Math.abs(before[i] - off.buf[i]) > 6 || Math.abs(before[i + 1] - off.buf[i + 1]) > 6
+      || Math.abs(before[i + 2] - off.buf[i + 2]) > 6) {
+      changed++;
+      const p = i / 4, x = p % fw, y = (p - x) / fw;
+      if (x < cx0) cx0 = x; if (x > cx1) cx1 = x;
+      if (y < cy0) cy0 = y; if (y > cy1) cy1 = y;
+      if (x >= bb[0] && x <= bb[2] && y >= bb[1] && y <= bb[3]) inBody++;
+    }
+  }
+  const boxDiff = on.px.some((p, i) => Math.abs(p[0] - off.px[i][0]) > 6
+    || Math.abs(p[1] - off.px[i][1]) > 6 || Math.abs(p[2] - off.px[i][2]) > 6);
+  w.set('bodies', 1);
+  await settle(400);
+  pixels = {
+    at: shot.mid, bodyBox: bb, bodyBoxPaintedPx: inBody,
+    changedBox: changed ? [cx0, cy0, cx1, cy1] : null,
+    at: shot.mid, meanOn: mean(on.px), meanOff: mean(off.px), bodyPaintedThere: boxDiff,
+    frameChangedPx: changed, framePx: before.length / 4,
+    frameChangedPct: +(100 * changed / (before.length / 4)).toFixed(2),
+  };
+}
+
 const g = w.ghosts();
 console.log(JSON.stringify({
   want, moment, panelHidden: !panel || panel.style.display === 'none',
@@ -152,6 +212,7 @@ console.log(JSON.stringify({
   rejected: tried.slice(0, 12), rejectedCount: tried.length,
   clearestRejected: best && { at: [best.b.x, best.b.y, best.b.z], d: best.d, pitch: best.pitch,
     owner: best.at.owner, clear: best.clear, bodyDist: best.at.bodyDist, worldDist: best.at.worldDist },
+  pixels,
   standing: g.standing, seats: g.seats, under: g.under, deepestY: g.deepestY, deepestDown: g.deepestDown,
   bodies: g.bodies.map((b) => (b.absent ? { player: b.player, absent: b.absent }
     : { player: b.player, at: [b.x, b.y, b.z], seat: b.seat, down: b.down })),
