@@ -277,16 +277,77 @@ test('a person answers a click before a marker and before far paint, but real gr
 // so the body was drawn and rejected by a depth value the world's own ray never reported (nearest terrain
 // 10.42, body 9.89). What wrote that depth was the marker over their voxel at 5.02. Writing `depthWrite =
 // !S.markDepth` kept the burying as the default and made the switch mean its opposite; the pixel A/B is the
-// only reason this was visible at all.
-test('a change marker tests the depth of the world but never writes its own', () => {
+// only reason this was visible at all. And the ordering fix that looked better - draw the people FIRST and
+// let markers write depth - was measured and rejected: six mine framings searched, five had the page's own
+// pick answer "body" while the aimed pixel showed marker paint (`centreChanged:false`, changedBox 476-997 of
+// a 73x129 box), because the marker nearer than the body owns the pixel either way (build/
+// m15_where_mine_newdef.txt vs m15_where_mine.txt, which finds a body-painted framing on the first try).
+test('one voxel draws one block, and the time-machine sentence says where the other claims went', () => {
+  const n = bodyOf('timeNote');
+  assert.match(n, /TLAYER\.deduped/,
+    'a filter that claims one voxel four times draws one cube, and said nothing about the other three');
+  assert.match(n, /one block draws per voxel/, 'the page stopped admitting that claims are dropped');
+  assert.match(n, /\?timestack=1 nests every claim outside the last/, 'the way to see them is not named');
+  const t = bodyOf('timeBlockMatOf');
+  assert.match(t, /polygonOffset/, 'a flush marker now needs the polygon offset to sit off the world\'s depth');
+});
+
+test('a change marker tests the world\'s depth but never writes its own, and the people draw after it', () => {
   const m = bodyOf('timeBlockMatOf');
   assert.match(m, /timeBlockMat\.depthWrite = !!S\.markDepth;/,
-    'a marker writes depth by default again, so it seals a person inside the shell around their voxel');
+    'the depth-write flag stopped saying what it writes');
   assert.doesNotMatch(m, /depthWrite = !S\.markDepth/,
     'the depth-write switch means its own opposite again');
   assert.match(m, /timeBlockMat\.depthTest = true;/,
     'a marker stopped obeying the world, so a hill in front of it stops hiding it');
-  assert.match(src, /markDepth: num\('markdepth', 0\) \? 1 : 0,/, 'the A/B that lets a marker seal depth is gone');
+  assert.match(src, /markDepth: num\('markdepth', 0\) \? 1 : 0,/,
+    'the default went back to writing depth, which buries the person standing in the block a marker annotates');
+  assert.doesNotMatch(src, /markDepth: num\('markdepth', 1\)/,
+    'a default that was measured to bury bodies is back');
+  // A person owns the pixel over the annotation on their own block because they draw LAST, and the marker
+  // layer that could seal them in does not write depth by default.
+  assert.match(bodyOf('ghostCut'), /mesh\.renderOrder = 903;/,
+    'the people no longer draw after the change markers, so a marker paints over a person again');
+  assert.match(bodyOf('timeRebuild'), /renderOrder = 902;/,
+    'the marker layer still draws before the people');
+});
+
+// The playhead's unit is a ROW: of this dimension's 351,531 rows many share one second, so a key that moved
+// by seconds would skip changes rather than show them.
+test('< and > step one logged change at a time, and say what they landed on', () => {
+  assert.match(src, /if \(e\.key === '<' \|\| e\.code === 'Comma'\) \{ timeStepRows\(-1\); return; \}/,
+    'the back key');
+  assert.match(src, /if \(e\.key === '>' \|\| e\.code === 'Period'\) \{ timeStepRows\(1\); return; \}/,
+    'the forward key');
+  const f = bodyOf('timeStepRows');
+  assert.match(f, /if \(!S\.time\) setTime\(true\);/, 'pressing it before the machine is armed arms it');
+  assert.match(f, /S\.timePlay = 0;/, 'a step you press is a step you want to look at');
+  assert.match(f, /Math\.max\(0, Math\.min\(last, from \+ \(n \| 0\)\)\)/, 'clamped inside the filter');
+  assert.match(f, /TLAYER\.quadRow\[i\]/, 'it answers with the ROW, not the second');
+  assert.match(f, /actionName\(tl\.action\[row\]\)/, 'and names the action it landed on');
+});
+
+// Following is a claim about the evidence: the camera may only go where a hand action put the person, and it
+// holds when the silence ends the visit rather than gliding to wherever the playhead goes next.
+test('following a person follows the evidence, jumps between visits, and stops with it', () => {
+  const f = bodyOf('ghostFollowCam');
+  assert.match(f, /GHOST\.bodies\.find\(\(q\) => !q\.absent && q\.player === GHOST\.follow\)/,
+    'the camera is driven by the standing body, not by the playhead date');
+  assert.match(f, /b\.floor != null \? b\.floor \+ 1 : b\.y/, 'it looks at a person, not at their knees');
+  assert.match(f, /d > S\.followSnap/, 'a new visit is a jump, not a 30-second pan over country nobody walked');
+  assert.match(f, /1 - Math\.exp\(-6 \* dt\)/, 'the easing is the same speed at any frame rate');
+  assert.match(f, /GHOST\.followWhy =/, 'and when there is no body it says why instead of freezing silently');
+  // The scratch vector this reaches for is made lazily, and a follow camera that grabbed an unmade one threw
+  // in the frame loop 406 times before the first screenshot was taken.
+  assert.match(f, /GHOST\.v3 \?\?= new THREE\.Vector3\(\)/, 'the follow camera uses a scratch vector nobody made');
+  assert.doesNotMatch(f, /GHOST\.v3\.set\(/, 'a bare scratch vector is reached for before it exists');
+  assert.match(src, /ghostFollowCam\(dt\);/, 'it runs in the frame loop, next to the body tick');
+  assert.match(bodyOf('followFromUrl'), /toLowerCase\(\)/, '?follow=Name is case-insensitive');
+  assert.match(bodyOf('setFollow'), /ghostPickPlayer\(p\)/, 'following someone narrows the overlay and replay to them');
+  assert.match(src, /e\.code === 'Escape' && GHOST\.follow >= 0/, 'Esc gives the camera back');
+  assert.match(src, /const cand = pickFollowCandidate\(\);/, 'the B key asks who is nearest');
+  assert.match(src, /nobody stands at this second, so there is nobody to follow/,
+    'B where nobody stands used to do nothing at all');
 });
 
 // A person answers a click before a marker does, so the outline has to answer the same way or the page

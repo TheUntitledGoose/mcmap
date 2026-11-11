@@ -201,6 +201,11 @@ distinction has already cost two debugging sessions to learn the hard way.
 
 Orbit: drag to rotate, wheel to zoom, right-drag to pan. `V` switches to walk mode
 (real body: gravity, collision, jumping — WASD, Space, Shift, Ctrl), `F` free-flight.
+
+While the time machine is armed, `<` and `>` step the playhead **one logged change** at a time (the bare
+`,` and `.` keys work too, because `<` and `>` need Shift and a key nobody can press without another key is
+a key nobody finds), `B` puts the camera on the nearest standing person — or says why nobody stands at this
+second — and `Esc` gives the camera back.
 `H` instruments, `?` help, `T` ask about the block under the crosshair, click a block in
 orbit mode for its block history card. With the time machine on, a stand-in figure stands
 where each player's hand acted: click the figure, or the name tag over it, for what the log
@@ -246,6 +251,15 @@ row also has a URL parameter, so a view is a link:
 ?markdepth=1          make a change marker write depth again: by default it tests the world's depth but
                       never writes its own, because a marker that writes it seals the body standing in
                       the voxel the marker annotates
+?follow=playerA       put the camera on one person, by name or 1-based index. It can only stand where the
+                      EVIDENCE puts them: a body exists where that player's own hand changed a block, so
+                      through a silence longer than ?bodygap the camera HOLDS and says so instead of
+                      gliding somewhere the log never saw. Turning it on also filters the overlay, the
+                      markers and the replay to that player
+?followdist=40        how far the camera keeps itself from the person it follows (at whole-world zoom two
+                      of one person's own actions sit 900 blocks apart, so following pulls the orbit in)
+?followsnap=120       a gap bigger than this is a JUMP, not a pan: across a silence longer than the body
+                      gap a hand moves a median 52-155 blocks and a p90 over 1,100 (build/dbg-gaps.mjs)
 ?nocov=1              stop using the region listing: ask for every tile again (the pan A/B)
 ?groundttl=120000     how long the page believes that listing, ms
 ?debug=1              instrument panel and HUD
@@ -253,6 +267,14 @@ row also has a URL parameter, so a view is a link:
 
 The full list is the first ~200 lines of `web/js/main.js`, and the collapsed groups carry
 the knobs that are only interesting while measuring.
+
+One honest hole in the replay: the atlas carries a shape only for a block that stands somewhere in the world
+**today**, because the atlas is built from a census of the present chunks. 409 of this dimension's 90,045
+place claims (0.45%) name a block the atlas has never seen — carried shulker boxes, a toilet, plushies, and
+96 `minecraft:white_concrete_powder` in the very chunk whose wall looked wrong (the players later re-skinned
+that wall light grey, so the blocks in the log no longer exist anywhere to be censused). Those claims still
+count, still sit on the playhead and still answer a click; they draw no shape. `node build/dbg-unknownnames.mjs`
+names every one of them, and the note carries the count.
 
 The panel also remembers what you moved, per browser (`localStorage`), and re-applies that at boot
 whenever the URL names nothing - which is why a link with any parameter always shows what it
@@ -266,9 +288,9 @@ MB kept getting flat tiles after the replay was repriced as blocks). The panel b
 ## Tests and measurement
 
 ```bash
-npm test                # 441 tests: formats, codecs, stores, mesher, lighting, collision,
-                        # pool split, ledger, time machine (incl. what a pick may answer), region
-                        # coverage, remembered settings, HTTP endpoints
+npm test                # 445 tests: formats, codecs, stores, mesher, lighting, collision,
+                        # pool split, ledger, time machine (incl. what a pick may answer and what one
+                        # voxel may draw), region coverage, remembered settings, HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds
 npm run browser:probe   # headless Chromium against a live server: eval, framebuffer, shot
 node tools/mprobe.mjs --shot N url          # A/B two URLs by pixel band difference

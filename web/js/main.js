@@ -259,18 +259,23 @@ const S = {
   // made the replay read as "2D tiles with no blocks in them". URL: ?timelook=plates, ?timegeommb=128
   timeLook: word('timelook', 'blocks', ['blocks', 'plates', 'tiles']),
   timeGeomMb: Math.max(2, Math.min(2048, num('timegeommb', 384))),
-  // How far a block marker stands out past the block it describes, in blocks per side. A marker for a
-  // change the terrain replay has already corrected sits in the same voxel as that block, so without this
-  // its six faces are coplanar with the block's own and the claim reads as a tinted square painted on the
-  // ground ("I see the 2D tile but no block"). 0.09 puts every face outside the real block. URL: ?timegrow=0
-  timeGrow: Math.max(0, Math.min(0.5, num('timegrow', 0.09))),
-  // The newest claim at a voxel gets the block: a marker is scaled about its block centre by how many claims
-  // this filter already drew at that voxel, so a placement a break supersedes is ENCLOSED by the break instead
-  // of fighting it for the same pixels, and the break is what the outline and the click answer. 0.36 blocks is
-  // where that ramp saturates (measured over the baked overworld timeline with build/dbg-voxelstack.mjs: 6.8%
-  // of its 313,884 claimed voxels hold more than one claim, p99 holds one, and the worst holds 292, which is
-  // why the ramp saturates instead of growing a tower). URL: ?timestack=0
-  timeStack: num('timestack', 1) ? 1 : 0,
+  // How far a block marker stands out past the block it describes, in blocks per side. It defaults to 0: the
+  // marker IS the voxel. A positive shell used to be the default so a marker would not be coplanar with the
+  // block it describes, but two markers side by side then each reach 0.045 blocks into the other's space and
+  // their top faces sit at ONE height over the same strip of pixels - which is what reads, close in, as "the
+  // draw order is fucked and the faces are offset". Coplanarity with the world is settled by the layer's
+  // polygon offset instead. Measured (build/dbg-markerfit.mjs, the chunk in the reported screenshot): grow 1
+  // leaves 76 of 1,562 markers off their voxel, and every one of them is an authored model whose shape
+  // legitimately reaches out, against 353 with the old shell and ramp. URL: ?timegrow=0.09 raises the shell.
+  timeGrow: Math.max(0, Math.min(0.5, num('timegrow', 0))),
+  // A voxel this filter claims more than once gets ONE marker: the newest claim, which is the block standing
+  // there at the playhead and the row a click should answer, carrying how many claims it supersedes. The old
+  // default scaled each later claim outward instead, and that is where the giant pale column in the reported
+  // screenshot came from: a `light_gray_concrete_powder` claim logged six times drew a cube 1.69 blocks wide
+  // standing over its neighbours' faces - 270 of 1,910 markers off-grid in that chunk, up to 0.36 blocks past
+  // the voxel (build/dbg-markerfit.mjs). Repetition belongs in the answer, not in the size of the block.
+  // URL: ?timestack=1 restores the ramp, and turns the dedupe off so the nesting can be seen.
+  timeStack: num('timestack', 0) ? 1 : 0,
   // A marker face that has another marker of the same filter on the other side of it is INSIDE the thing the
   // players built, and drawing it is what turns a wall of placed blocks into a pile of see-through panels:
   // measured over the densest placement chunk in the shipped overworld pack (build/dbg-markermass.mjs, the
@@ -313,9 +318,23 @@ const S = {
   // a marker is an annotation and a body is a claim about the world; 0 = whichever is nearest. An A/B
   // switch, so it is URL-only: ?bodypick=0.
   bodyPick: num('bodypick', 1) ? 1 : 0,
-  // 1 = a change marker writes depth, so it can bury a person standing in the block it annotates. It is an
-  // A/B switch for the pixel A/B above, not a look: ?markdepth=1
+  // 1 = a change marker writes depth, so a marker in FRONT of another marker hides the far one instead of
+  // both painting over each other in buffer order. It is OFF by default because of what it does to people:
+  // a marker over the very voxel a body stands in is nearer than that body, so its depth buries the person
+  // it annotates (build/q_m15why.js pixel A/B: obeying walls changed 0 of 1,972 pixels in the body's own box,
+  // the same body with its depth test switched off changed 751). The ordering it buys is small now that the
+  // layer sits on the grid and culls its inside - and tried from the other side (people drawn at 901, before
+  // the markers), six mine framings searched and five had the page's own pick answer "body" while the aimed
+  // pixel showed marker paint: a click and a picture that disagree are worse than either cause.
+  // URL: ?markdepth=1 turns marker depth-writing on for the A/B.
   markDepth: num('markdepth', 0) ? 1 : 0,
+  // Following a person: how close the orbit comes when follow starts, and how far the camera may be from a
+  // body before it JUMPS rather than eases. The snap distance is the measured gap across a silence: over a
+  // silence longer than the body gap a hand moves a median 52-155 blocks and a p90 over 1,100
+  // (build/dbg-gaps.mjs), so easing across that would be a 30-second pan over country nobody walked.
+  // URL: ?followdist= ?followsnap=
+  followDist: Math.max(4, Math.min(400, num('followdist', 40))),
+  followSnap: Math.max(4, Math.min(2000, num('followsnap', 120))),
   // What is allowed to hide a person. 1 (default) = only the voxel ground this page actually holds. The
   // far paint layers (height-field skin, baked LOD plates, overview cells) approximate the surface at
   // percentile heights and get clipped away near the camera, so a nearer hit in one of them is not
@@ -921,6 +940,26 @@ addEventListener('keydown', (e) => {
   if (e.code === 'Escape') { closeLedgerCard(); if (clearLedgerPins()) showLedger('markers cleared - F tours the hotspots again'); }
   if (e.code === 'BracketLeft') nudgeY(-4);
   if (e.code === 'BracketRight') nudgeY(4);
+  // `<` and `>`: one logged change back or forward. The playhead's own unit is a ROW, not a second - many
+  // rows share one second - so this is the only way to read a build change by change instead of in a blur.
+  // The physical keys are matched too (`Comma` / `Period`): `<` needs Shift on the usual layout, and a key
+  // that only works when held with another one is a key nobody finds.
+  if (e.key === '<' || e.code === 'Comma') { timeStepRows(-1); return; }
+  if (e.key === '>' || e.code === 'Period') { timeStepRows(1); return; }
+  if (e.code === 'KeyB' && S.time) {
+    if (GHOST.follow >= 0) { setFollow(-1, false); return; }
+    const cand = pickFollowCandidate();
+    // Pressing "follow them" where the evidence puts nobody is a real answer, and it has to be said: the
+    // alternative is a key that appears to do nothing at all.
+    if (cand < 0) {
+      showLedger(`nobody stands at this second, so there is nobody to follow - step the playhead with < and `
+        + `>, or widen "silence that ends a body", until someone does`);
+      return;
+    }
+    setFollow(cand, true);
+    return;
+  }
+  if (e.code === 'Escape' && GHOST.follow >= 0) { setFollow(-1, false); return; }
 });
 addEventListener('keyup', (e) => rig.keys.delete(e.code));
 
@@ -3330,6 +3369,7 @@ function frameBody(now) {
   // Bodies are re-seated on a 400 ms tick rather than per frame - not for cost but because the answer
   // changes when a CHUNK arrives - and the name labels follow the camera without any raycast at all.
   ghostTick(now);
+  ghostFollowCam(dt);
   lap('people');
   // Refill when idle: request() skips coordinates already held, so this converges on the radius
   // around the camera instead of storming the server every frame. It used to run on every idle
@@ -4519,6 +4559,7 @@ const ledgerWhoOptions = () => [
 // rather than a hope.
 const TLAYER = {
   tl: null,              // decodeTimeline() of /ledger/timeline for this dimension
+  fact: '',              // coverage facts about the cut (names without a model, rows without ground)
   gen: 0,                // bumped on a dimension switch, so a late answer cannot install
   mesh: null,
   quadSec: null,         // the playhead index: one ascending second per drawn quad
@@ -4530,6 +4571,7 @@ const TLAYER = {
   // look says what was actually built, and lookWhy says why a requested look was refused.
   itemEnd: null, look: '', lookWhy: '', lookBytes: null, markerEnd: null,
   stacked: 0, maxStack: 0,      // claims sharing a voxel with an earlier one, and the deepest stack
+  deduped: 0,                   // claims dropped because a later claim of the same voxel drew the block
   mCx: null, mCz: null, // which chunk each drawn marker stands in, for the replay-reach note
   voxel: null,           // Map block -> its quads, built on the first click on a block card
   cells: null,           // Map "cx,cz" -> pack cell index, for a pick that starts from world blocks
@@ -4620,7 +4662,7 @@ function clearTimeMesh() {
  */
 async function timeLoad() {
   const gen = ++TLAYER.gen;
-  TLAYER.tl = null; TLAYER.err = '';
+  TLAYER.tl = null; TLAYER.err = ''; TLAYER.fact = '';
   // A fresh timeline is a fresh arm: the playhead decision (play from the first logged change, or show
   // the whole filter when paused was asked for) belongs to the moment rows first exist, and that is here
   // as much as in setTime - the boot path with ?time=1 never goes through setTime at all.
@@ -4691,6 +4733,11 @@ function timeRebuild() {
   if (HIST.filterSig !== fsig) { HIST.marks.clear(); HIST.filterSig = fsig; }
   TLAYER.filterMs = performance.now() - t0;
   TLAYER.rows = got.n; TLAYER.other = got.other; TLAYER.truncated = got.truncated;
+  // "259 changes name something this atlas has no model for" is not a FAILURE. Those claims are still in the
+  // count, the playhead and the click, and their voxel still draws (with the fallback shape). A note that
+  // OPENS with that line reads as "the time machine is broken" and hides the sentence about what IS drawn,
+  // which is what it did at the wall. Coverage facts go under the count, not in its place.
+  TLAYER.fact = '';
   if (!got.n) {
     TLAYER.err = got.other
       ? `no rows of that kind by that player - ${got.other.toLocaleString()} rows were filtered out`
@@ -4750,7 +4797,8 @@ function timeRebuild() {
     TLAYER.quads = built.stats.markers; TLAYER.verts = built.stats.verts;
     TLAYER.stacked = built.stats.stacked; TLAYER.maxStack = built.stats.maxStack;
     TLAYER.culled = built.stats.culled; TLAYER.enclosed = built.stats.enclosed;
-    if (built.stats.unknown) TLAYER.err = `${built.stats.unknown.toLocaleString()} changes name something this atlas has no model for`;
+    TLAYER.deduped = built.stats.deduped;
+    if (built.stats.unknown) TLAYER.fact = `${built.stats.unknown.toLocaleString()} changes name something this atlas has no model for`;
     geo.setAttribute('position', new THREE.BufferAttribute(built.pos, 3));
     geo.setAttribute('uv', new THREE.BufferAttribute(built.uv, 2));
     // The wash went in as normalized u8 with the face shade, exactly as the detail pass carries it.
@@ -4763,7 +4811,7 @@ function timeRebuild() {
     TLAYER.quadSec = g.quadSec;
     TLAYER.quadRow = g.quadRow;
     TLAYER.quads = g.quads; TLAYER.verts = g.verts;
-    if (g.skipped) TLAYER.err = `${g.skipped.toLocaleString()} rows had no baked ground under them`;
+    if (g.skipped) TLAYER.fact = `${g.skipped.toLocaleString()} rows had no baked ground under them`;
     geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
     geo.setAttribute('color', new THREE.BufferAttribute(g.col, 3));
     geo.setIndex(new THREE.BufferAttribute(g.idx, 1));
@@ -4776,7 +4824,7 @@ function timeRebuild() {
   geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 1e9);
   const mesh = new THREE.Mesh(geo, look === 'tiles' ? timeMat() : timeBlockMatOf());
   mesh.name = 'ledger-time';
-  mesh.renderOrder = 902;                                   // over the heat layer (900) and pins (901)
+  mesh.renderOrder = 902;          // over the heat layer (900) and pins (901); the people draw after it, at 903
   mesh.frustumCulled = false;
   ledgerGroup.add(mesh);
   TLAYER.mesh = mesh;
@@ -4807,7 +4855,7 @@ function timeRebuild() {
 
 /** The rows and sentences a playhead move can change - the short list `timeApply` refreshes. */
 const TIME_ROWS = ['timeAt', 'time', 'timeTiles', 'timePlay', 'timeTerrain', 'note_time', 'note_hist',
-  'note_people'];
+  'follow', 'note_people'];
 
 /**
  * Move the playhead: one binary search and one draw range. `drawn` is what the readout and every probe
@@ -4877,7 +4925,8 @@ const GHOST = {
   nameSrc: null, nameList: [],
   buildMs: 0, syncMs: 0, cutMs: 0, syncs: 0, cuts: 0, next: 0, hitMs: 0, hitWhy: '', hitDist: 0,
   hitDetail: null, hitWall: null,
-  v1: null, v2: null,            // two scratch vectors, so a label pass allocates nothing
+  follow: -1, followBody: null, followWhy: '', followGap: null, followJumps: 0,
+  v1: null, v2: null, v3: null, // scratch vectors, so a label pass and the follow camera allocate nothing
 };
 
 /** Names indexed by the TIMELINE's player byte, which is the ledger's 1-based id minus one. */
@@ -4926,6 +4975,7 @@ function ghostPresence() {
   if (!GHOST.presence.players.length) {
     GHOST.err = 'this dimension has no row the log attributes to a player\'s own hand - nothing can stand here';
   }
+  followFromUrl();          // ?follow=Name: the name table only exists from here on
   return GHOST.presence;
 }
 
@@ -5003,7 +5053,11 @@ function ghostCut(list) {
     const geo = new THREE.BufferGeometry();
     const mesh = new THREE.Mesh(geo, bodyMat);
     mesh.name = 'ledger-people';
-    mesh.renderOrder = 903;                       // over the change markers (902)
+    mesh.renderOrder = 903;                       // AFTER the change markers (902), which by default only test
+    // depth and never write it: a marker is an annotation around a block, so a person standing in that block
+    // owns the pixel. The mine framing search (build/q_m15where.js) only reaches centreChanged=true with the
+    // body drawn last; drawing it first let a nearer marker paint over it, and the click stopped agreeing
+    // with the picture.
     // The buffer can span a whole dimension when the party splits, and letting three compute a sphere
     // over it is the same mistake the time layer documents: hand it a sphere and skip culling.
     mesh.frustumCulled = false;
@@ -5281,7 +5335,12 @@ function showGhostCard(b) {
   f.className = 'lcard-row';
   f.textContent = GHOST.sel === b.player ? 'show everybody again' : `show only ${who}'s changes`;
   f.addEventListener('click', () => ghostPickPlayer(b.player));
-  act.append(f);
+  const g = document.createElement('button');
+  g.className = 'lcard-row';
+  g.textContent = GHOST.follow === b.player ? 'stop following them' : `follow ${who} with the camera`;
+  g.title = 'the camera goes where the log can place this person, and stops when the evidence does (Esc)';
+  g.addEventListener('click', () => setFollow(b.player, GHOST.follow !== b.player));
+  act.append(f, g);
   el.append(act);
 }
 
@@ -5302,6 +5361,108 @@ function ghostPickPlayer(player) {
       + `${TLAYER.rows.toLocaleString()} of ${TLAYER.tl.count.toLocaleString()} logged rows, `
       + `${mine ? mine.rows.length.toLocaleString() : 0} of them by that player's own hand`
     : 'the overlay, the markers and the replay are back to anybody');
+}
+
+/**
+ * Following a person with the camera.
+ *
+ * What is being followed is the EVIDENCE, not a player: the log has no positions, so the camera can only
+ * stand where a hand action put that person (M15). When the evidence stops - the silence that ends a visit -
+ * the camera stops with it and says so, rather than gliding on to somewhere the log never saw them.
+ *
+ * Two rules the measurement forced:
+ *  - a body's FEET are the seat (`floor + 1`), not the middle of its box, so the camera looks at a person
+ *    rather than at their knees or their hat;
+ *  - when the gap is more than `S.followSnap` blocks the camera JUMPS. Measured across silences over 300 s a
+ *    hand moves a median 52-155 blocks and a p90 over 1,100, so easing across that is a 30-second pan over
+ *    countryside nobody walked.
+ */
+function setFollow(player, on = true) {
+  const p = on ? (player | 0) : -1;
+  GHOST.follow = p;
+  GHOST.followWhy = p < 0 ? 'nobody' : '';
+  GHOST.followBody = null;
+  if (p >= 0) {
+    // A whole-world camera cannot follow anything: at dist 1,200 two of one player's own actions sit 900
+    // blocks apart and neither is on screen. Bring the orbit in to a height where a person is a person.
+    if (rig.dist > S.followDist) rig.dist = S.followDist;
+    if (GHOST.sel !== p) ghostPickPlayer(p);        // their changes, their markers, their terrain
+    ghostSync(true);
+    showLedger(`the camera follows ${ghostNameOf(p)} where the log can place them - `
+      + `${GHOST.standing} stand at this second; step with < and >, and Esc stops following`
+      + (walk.on ? ' - you are walking, so press V to orbit first' : ''));
+  } else {
+    showLedger('the camera is your own again');
+  }
+  if (panel) panel.refreshRows(TIME_ROWS);
+  return GHOST.follow;
+}
+
+/** The nearest standing body to the camera - what "follow them" means when nothing was clicked. */
+function pickFollowCandidate() {
+  let best = -1, bd = Infinity;
+  for (const b of GHOST.bodies) {
+    if (b.absent) continue;
+    const d = (b.x + 0.5 - rig.target.x) ** 2 + (b.z + 0.5 - rig.target.z) ** 2;
+    if (d < bd) { bd = d; best = b.player; }
+  }
+  return best;
+}
+
+/** Every frame: walk the orbit target to the body being followed. Cost is one distance and one lerp. */
+function ghostFollowCam(dt) {
+  if (GHOST.follow < 0) return;
+  const b = GHOST.bodies.find((q) => !q.absent && q.player === GHOST.follow) ?? null;
+  GHOST.followBody = b;
+  if (!b) {
+    GHOST.followWhy = `${ghostNameOf(GHOST.follow)} stands nowhere at this second: no hand action of `
+      + 'theirs covers this moment, so the camera holds where it is rather than glide somewhere unseen';
+    return;
+  }
+  if (walk.on) { GHOST.followWhy = 'you are walking - press V to orbit and follow'; return; }
+  const y = (b.floor != null ? b.floor + 1 : b.y) + 1;      // chest height over the seat, not box middle
+  const v = GHOST.v3 ??= new THREE.Vector3();   // scratch, made on the first frame that follows anyone
+  v.set(b.x + 0.5, y, b.z + 0.5);
+  const d = rig.target.distanceTo(v);
+  GHOST.followGap = +d.toFixed(2);
+  if (d > S.followSnap) {
+    rig.target.copy(v);
+    GHOST.followJumps = (GHOST.followJumps ?? 0) + 1;       // a new visit: jump, don't pan across a continent
+  } else if (d > 0.02) {
+    rig.target.lerp(v, 1 - Math.exp(-6 * dt));       // frame-rate independent easing
+  }
+  GHOST.followWhy = '';
+  updateView();                                            // keep LOD tiers keyed on where we are looking
+  requestAround();
+}
+
+/** What following looks like from outside: who, where the camera got to, and why it stopped. */
+function followState() {
+  const b = GHOST.followBody;
+  return {
+    player: GHOST.follow,
+    name: GHOST.follow >= 0 ? ghostNameOf(GHOST.follow) : '',
+    why: GHOST.followWhy,
+    gap: GHOST.followGap,
+    jumps: GHOST.followJumps ?? 0,
+    snap: S.followSnap, wantDist: S.followDist, dist: +rig.dist.toFixed(1),
+    body: b ? [b.x, b.y, b.z, b.seat] : null,
+    standing: GHOST.standing,
+    target: [+rig.target.x.toFixed(2), +rig.target.y.toFixed(2), +rig.target.z.toFixed(2)],
+  };
+}
+
+/** `?follow=Name` (or an index): arm following once the dimension's name table exists. */
+function followFromUrl() {
+  const q = (params.get('follow') ?? '').trim();
+  if (!q || GHOST.follow >= 0) return -1;
+  const byIdx = /^\d+$/.test(q) ? +q - 1 : -1;
+  const list = ghostNames();
+  let idx = byIdx;
+  if (idx < 0) idx = list.findIndex((n) => (n?.name ?? '').toLowerCase() === q.toLowerCase());
+  if (idx < 0) { GHOST.followWhy = `no player named ${q} in this dimension's log`; return -1; }
+  GHOST.follow = idx;
+  return idx;
 }
 
 /** The sentences that answer "is this broken, or is nobody here?". */
@@ -5372,6 +5533,15 @@ function peopleNote() {
   }
   if (GHOST.tags.length && GHOST.tagsSmall) {
     out.push(`${GHOST.tagsSmall} name tag${GHOST.tagsSmall === 1 ? '' : 's'} hidden: that body is under 3 pixels tall here`);
+  }
+  // Following is a claim about the evidence too: the camera stops where the log stops, and the sentence says
+  // which of the two it is doing right now.
+  if (GHOST.follow >= 0) {
+    out.push(GHOST.followBody
+      ? `the camera follows ${ghostNameOf(GHOST.follow)} at ${GHOST.followBody.x},${GHOST.followBody.y},`
+        + `${GHOST.followBody.z}${GHOST.followGap != null ? ` (${GHOST.followGap} blocks from the view centre)` : ''}`
+        + `${GHOST.followJumps ? ` - it jumped ${GHOST.followJumps} time${GHOST.followJumps === 1 ? '' : 's'} to a new visit` : ''}.`
+      : `${GHOST.followWhy}.`);
   }
   return out.join('\n');
 }
@@ -5808,6 +5978,42 @@ function timeSeekRow(i) {
   return TLAYER.drawn;
 }
 
+/**
+ * `<` and `>`: one logged change back or forward.
+ *
+ * The unit is a ROW, not a second. Of this dimension's 351,531 rows many share one second, so a playhead
+ * driven by the calendar skips changes rather than showing them: at second granularity one press here can
+ * cross 60 logged changes. Stepping by row is the only way to read a build go up change by change, and it is
+ * what makes following one person legible: filter to them, then `<` through their own places.
+ *
+ * It arms the machine if it was not armed, and it stops playback, because a step you press is a step you
+ * want to look at. The sentence names what it landed on - date, action, block, who - so the answer is on the
+ * page rather than only in the picture.
+ */
+function timeStepRows(n) {
+  if (!S.time) setTime(true);
+  if (!TLAYER.quadSec || !TLAYER.quads) {
+    showLedger('this filter has no logged rows to step through');
+    return -1;
+  }
+  S.timePlay = 0;
+  const last = TLAYER.quads - 1;
+  const from = Math.round(TLAYER.cur ?? 0);
+  const i = Math.max(0, Math.min(last, from + (n | 0)));
+  timeSeekRow(i);
+  if (panel) panel.refreshRows(TIME_ROWS);
+  const row = TLAYER.quadRow ? TLAYER.quadRow[i] : -1;
+  TLAYER.stepRow = row;
+  if (row < 0) return i;
+  const tl = TLAYER.tl;
+  const who = tl.player[row] === 255 ? 'nobody named' : ghostNameOf(tl.player[row]);
+  const blk = tl.nameOf(row) ? plainName(tl.nameOf(row)) : 'something this atlas has no name for';
+  showLedger(`${i + 1} of ${TLAYER.quads.toLocaleString()} in this filter - ${tlStamp(tl.sec[row])}: `
+    + `${who} ${actionName(tl.action[row])} ${blk}`
+    + (GHOST.follow >= 0 ? ` (following ${ghostNameOf(GHOST.follow)})` : ''));
+  return i;
+}
+
 /** Jump to a moment: `sec` is seconds since the first logged row in this dimension. */
 function timeGoto(sec) {
   S.timeAt = Math.max(0, Math.round(+sec || 0));
@@ -5999,7 +6205,17 @@ ${TLAYER.look === 'blocks' ? 'drawn as the blocks themselves'
     + (TLAYER.quads && TLAYER.quadSec?.length
       ? `\nthese rows themselves run ${fmtLedger((TLAYER.tl.timeBaseSec + TLAYER.quadSec[0]) * 1000)} to`
         + ` ${fmtLedger((TLAYER.tl.timeBaseSec + TLAYER.quadSec[TLAYER.quadSec.length - 1]) * 1000)}`
-      : '\nthis filter keeps no rows, so there is nothing to scrub');
+      : '\nthis filter keeps no rows, so there is nothing to scrub')
+    // One voxel, one cube. A block this filter claims twice (place, break, place again) draws its NEWEST
+    // claim only, and the page has to say that out loud: "the log says they placed here three times and I
+    // see one block" is otherwise a bug report. The newest one carries the count, so the click answers with
+    // it, and ?timestack=1 draws every claim nested outside the last.
+    + (TLAYER.deduped
+      ? `\n${TLAYER.deduped.toLocaleString()} of these claims sit on a voxel this filter already claimed, so `
+        + 'one block draws per voxel\nand carries the count: ' + `${TLAYER.maxStack ?? 0} claims deep at `
+        + 'the busiest one (?timestack=1 nests every claim outside the last instead)'
+      : '')
+    + (TLAYER.fact ? `\n${TLAYER.fact}` : '');
 }
 
 /** Short wall clock for the slider's value column, scaled to what the history actually spans. */
@@ -6561,9 +6777,20 @@ window.__world = {
   ownerAt: (x = innerWidth / 2, y = innerHeight / 2) => pixelOwner(x, y),
   ghostPick: (player) => ghostPickPlayer(player | 0),
   ghostNote: () => peopleNote(),
+  // Follow the camera on a person: a name, a 0-based timeline index, or nothing to ask where it stands.
+  follow: (who = null) => {
+    if (who === null || who === undefined) return followState();
+    if (who === false || who === '' || who === -1) return setFollow(-1, false);
+    const idx = typeof who === 'number' ? who - 1
+      : ghostNames().findIndex((n) => (n?.name ?? '').toLowerCase() === String(who).toLowerCase());
+    if (idx < 0) { GHOST.followWhy = `no player named ${who} in this dimension's log`; return -2; }
+    return setFollow(idx, true);
+  },
+  followState: () => followState(),
+  stepRows: (n = 1) => timeStepRows(n | 0),
   hist: histStats,
   time: () => ({
-    on: !!S.time, playing: !!S.timePlay, tl: !!TLAYER.tl, err: TLAYER.err,
+    on: !!S.time, playing: !!S.timePlay, tl: !!TLAYER.tl, err: TLAYER.err, fact: TLAYER.fact || '',
     rows: TLAYER.rows, other: TLAYER.other, quads: TLAYER.quads, verts: TLAYER.verts,
     cur: TLAYER.cur, activeDays: TLAYER.activeDays, busyDay: TLAYER.busyDay, busyN: TLAYER.busyN,
     drawn: TLAYER.drawn, sec: TLAYER.sec, at: S.timeAt, speed: S.timeSpeed,
@@ -6578,6 +6805,7 @@ window.__world = {
     stacked: TLAYER.stacked ?? 0, maxStack: TLAYER.maxStack ?? 0, stackRamp: !!S.timeStack,
     // faces the layer refused to draw because another claim of this filter sits behind them
     culledFaces: TLAYER.culled ?? 0, fullyInside: TLAYER.enclosed ?? 0, faceCull: !!S.timeCull,
+    dedupedClaims: TLAYER.deduped ?? 0, grow: S.timeGrow,
     geomMbCap: S.timeGeomMb,
     markerGeoMb: TLAYER.mesh ? +(TLAYER.mesh.geometry.attributes.position.array.byteLength
       / 1048576).toFixed(1) : 0,
@@ -7105,7 +7333,7 @@ function switchDim(id) {
   // M12b: and so is its timeline. A stale timeline would animate another dimension's history over
   // this dimension's cell table, which is the one ledger bug that would look like a correct picture.
   TLAYER.gen++;
-  TLAYER.tl = null; TLAYER.err = ''; TLAYER.bytes = 0; TLAYER.fetchMs = 0;
+  TLAYER.tl = null; TLAYER.err = ''; TLAYER.fact = ''; TLAYER.bytes = 0; TLAYER.fetchMs = 0;
   clearTimeMesh();
   if (S.time) timeLoad();
   resetWorkers();
@@ -7386,10 +7614,15 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         fmt: () => (S.bodyThrough ? 'through - a finder at far zoom' : 'obeying walls'),
         get: () => !!S.bodyThrough, set: (v) => { S.bodyThrough = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
         hint: 'Off, bodies obey walls, because a person inside a house is INSIDE it and a body floating over its\nroof is a lie. On puts every body over everything, which is the only way to find them at whole-world zoom\n- and the reason the note says which mode is on. This also decides whether a body or the wall answers a\nclick: with walls on, whoever is nearest the eye owns the pixel. URL: ?bodythrough=1' },
+      { key: 'follow', label: 'put the camera on a person', kind: 'check',
+        fmt: () => (GHOST.follow < 0 ? 'nobody' : ghostNameOf(GHOST.follow)),
+        get: () => GHOST.follow >= 0,
+        set: (v) => setFollow(v ? (GHOST.follow >= 0 ? GHOST.follow : pickFollowCandidate()) : -1, !!v),
+        hint: 'The camera walks a person instead of the world. It can only stand where the EVIDENCE puts them: a\nbody exists where that player\'s own hand changed a block, so when the silence that ends a visit arrives the\ncamera HOLDS and the note says why, rather than gliding somewhere the log never saw. Turning it on also\nfilters the overlay, the markers and the replay to that player, and pulls the orbit in to 40 blocks, because\nat 1,200 two of one person\'s own actions sit 900 blocks apart and neither is on screen. A gap over 120 blocks\nis a JUMP, not a pan: across a silence longer than the body gap a hand moves a median 52-155 blocks and a p90\nover 1,100 (build/dbg-gaps.mjs), and easing that is a 30-second tour of countryside nobody walked. Keys: B\nfollows the nearest body (or stops), Esc stops, and < and > step one logged change at a time. URL: ?follow=Name,\n?followdist=, ?followsnap=120' },
       { kind: 'note', key: 'note_people', text: () => peopleNote(),
         hint: 'The sentence that answers "is this broken, or is nobody here?". It names the window the log can\nplace a body in at all (7.2 of this dimension\'s 822 days), the share of its seconds that supports a body\nsomewhere (0.26%), who is absent and why, and how many name tags were dropped for being under 3 pixels.' },
-      { kind: 'note', text: 'M the time machine - K play or pause - drag playhead to scrub - Esc clears the card and the markers' },
-      { kind: 'note', text: 'click a block for its history - L the overlay - T middle of view - F tour - Esc clears the card and the markers' },
+      { kind: 'note', text: 'M the time machine - K play or pause - < and > one logged change - drag playhead to scrub - Esc clears the card and the markers' },
+      { kind: 'note', text: 'click a block for its history - L the overlay - T middle of view - F tour - B follow a person - Esc clears the card and the markers' },
       { kind: 'section', key: 'sec_far', label: 'the far world', open: false,
         hint: 'The ground outside the close ring: how it is drawn, how coarse it is allowed to get, and\n'
           + 'what that costs in triangles.' },

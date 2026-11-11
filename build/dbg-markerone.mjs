@@ -1,4 +1,5 @@
 // Which marker geometry leaves its own voxel, and is it the cube or the model that does it?
+// node build/dbg-markerone.mjs [grow] [stackGrow] [dedupe1|0]   (defaults = what the page ships now)
 import fs from 'node:fs';
 import { Assets } from '../web/js/assets.js';
 import { readPack, decodeTimeline } from '../shared/ledger-pack.mjs';
@@ -19,8 +20,9 @@ const rows = place.filter((i) => {
   return c.cx === -3 && c.cz === -8;
 });
 resetMarkerLift();
-const out = buildTimeBlocks(tl, P, rows, assets, nameIds,
-  { grow: 1.18, stackGrow: 0.36, cull: true });
+const out = buildTimeBlocks(tl, P, rows, assets, nameIds, {
+  grow: +(process.argv[2] ?? 1), stackGrow: +(process.argv[3] ?? 0),
+  cull: true, dedupe: (process.argv[4] ?? '1') !== '0' });
 const { pos, idx, markerEnd, markerRow } = out;
 let prev = 0;
 for (let m = 0; m < markerEnd.length; m++) {

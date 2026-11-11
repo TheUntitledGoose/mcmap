@@ -95,6 +95,18 @@ const FAKE_CHUNK = { cx: 0, cz: 0 };
  * voxel, so multiplying that reach by the grow factor put it nearly 3 blocks off the grid. The model's own
  * shape is the claim, so `?timegrow` belongs to cubes.
  *
+ * Why one voxel gets ONE marker (the `dedupe` option, on unless the stack ramp is asked for): a voxel this
+ * filter claims seven times drew seven cubes, and the ramp that made them nested made the newest one up to
+ * 1.69 blocks wide. Measured in the chunk this was reported on (build/dbg-markerfit.mjs), that ramp moved
+ * **270 of 1,910 markers off their voxel, up to 0.36 blocks past it**, so a logged claim stood over its
+ * neighbour's face - "the faces from the blocks are offset" - and a `light_gray_concrete_powder` claim logged
+ * six times came back as a pale column twice as wide as the stone pillar it was standing on. The honest claim
+ * is one block per voxel, and the repetition belongs in the ANSWER (how many times, which rows) rather than in
+ * the size of the thing. `?timestack=1` restores the ramp, and turns dedupe off so the nesting can be seen.
+ *
+ * Why the ramp and dedupe cannot both be on: the ramp's whole point is that a later claim sits OUTSIDE an
+ * earlier one, which needs several markers at one voxel. Dedupe is therefore implied whenever the ramp is off.
+ *
  * Returns `done()` streams (indexed) plus three parallel per-marker arrays:
  *   markerSec  the row's second, ascending - binary search it with `quadAt`
  *   markerEnd  cumulative INDEX count through this marker - the draw range is `markerEnd[n-1]`
@@ -108,10 +120,12 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   // 0 restores same-size markers, which is the A/B. `stackTau` is how many claims at one voxel it takes to
   // get most of the way there.
   const { plates = false, maxQuads = 0, lift = 0.004, maxLift = 0.08, grow = 1,
-    stackGrow = 0, stackTau = 3, cull = true } = opts;
+    stackGrow = 0, stackTau = 3, cull = true, dedupe = true } = opts;
+  const ramp = stackGrow > 0 ? stackGrow : 0;
+  const keepLast = ramp > 0 ? false : dedupe;
   // Strictly increasing in the number of claims already drawn at this voxel, and bounded: the newest claim at
   // a voxel is always the outermost shell, and even a voxel logged 292 times stays inside grow + 2*stackGrow.
-  const sizeOf = (depth) => grow + 2 * (stackGrow > 0 ? stackGrow * (1 - Math.exp(-depth / stackTau)) : 0);
+  const sizeOf = (depth) => grow + 2 * (ramp > 0 ? ramp * (1 - Math.exp(-depth / stackTau)) : 0);
   const cellAt = typeof cells?.cell === 'function' ? (i) => cells.cell(i) : (i) => cells?.[i];
   const stream = new VertexStream(4096, { indexed: true });
   // emitQuad picks a pass out of an array by sprite kind (opaque / cutout / translucent). A marker wants
@@ -123,24 +137,29 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   const stats = {
     rows: order.length, markers: 0, cubes: 0, plates: 0, models: 0, unknown: 0, air: 0,
     noCell: 0, noModel: 0, faces: 0, quads: 0, verts: 0, tris: 0, stopped: false, bytes: 0,
-    stacked: 0, maxStack: 0, culled: 0, enclosed: 0,
+    stacked: 0, maxStack: 0, culled: 0, enclosed: 0, deduped: 0, repeats: 0, deepest: 0,
   };
   // Every voxel this filter claims, before a single face is emitted: a face whose other side is claimed by
-  // this same filter is inside the build, and `?timecull=0` is the A/B that draws it anyway.
+  // this same filter is inside the build, and `?timecull=0` is the A/B that draws it anyway. The same pass
+  // remembers the NEWEST claim at each voxel, which is the one a deduped layer draws.
   const claimed = cull ? new Set() : null;
-  if (claimed) {
-    for (const i of order) {
-      const c = cellAt(tl.cellOf(i));
-      if (c && c.cx !== undefined && c.cz !== undefined) {
-        claimed.add(vkey(c.cx * 16 + tl.x(i), tl.y(i), c.cz * 16 + tl.z(i)));
-      }
-    }
+  const newest = keepLast ? new Map() : null;
+  let kq = 0;
+  for (const i of order) {
+    const c = cellAt(tl.cellOf(i));
+    if (!c || c.cx === undefined || c.cz === undefined) continue;
+    const key = vkey(c.cx * 16 + tl.x(i), tl.y(i), c.cz * 16 + tl.z(i));
+    if (claimed) claimed.add(key);
+    if (newest) newest.set(key, kq);
+    kq++;
   }
+  const claims0 = new Map();
   const mSec = new Uint32Array(order.length);
   const mEnd = new Uint32Array(order.length);
   const mRow = new Int32Array(order.length);
   const mCx = new Int32Array(order.length);
   const mCz = new Int32Array(order.length);
+  const mRep = new Uint16Array(order.length);   // how many earlier claims of this voxel this one supersedes
   let m = 0;
 
   for (let k = 0; k < order.length; k++) {
@@ -149,6 +168,14 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     const c = cellAt(tl.cellOf(i));
     if (!c || c.cx === undefined || c.cz === undefined) { stats.noCell++; continue; }
     const bx = c.cx * 16 + tl.x(i), wz = c.cz * 16 + tl.z(i), y = tl.y(i);
+    const key = vkey(bx, y, wz);
+    // A voxel claimed more than once by this filter belongs to its newest claim: that is the block standing
+    // there at the playhead, and it is the row a click should answer.
+    if (newest && newest.get(key) !== k) {
+      stats.deduped++;
+      const n = claims0.get(key) ?? 0; claims0.set(key, n + 1);
+      continue;
+    }
     const name = tl.nameOf(i);
     const st = name ? (byName.get(name) ?? 0) - 1 : -1;
     const v0 = stream.n, i0 = stream.i;
@@ -195,11 +222,14 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     const wash = ACTION_WASH[tl.action[i]] ?? ACTION_WASH[6];
     // One counter answers both questions about this voxel: how many claims were drawn here before (which
     // sets the lift) and therefore whose turn it is in the stack (which sets how far out it reaches).
-    const depth = seen0(bx, y, wz) ?? 0;
-    const liftY = Math.min(maxLift, depth * lift);
+    const depth = ramp > 0 ? (seen0(bx, y, wz) ?? 0) : ((claims0.get(key) ?? 0));
+    // The lift only exists to separate markers that share a voxel. With one marker per voxel there is nothing
+    // to separate, and a block lifted 0.08 off its grid square is exactly the "waaaay off grid" complaint:
+    // the material's polygon-offset is what keeps a flush marker off the terrain's own depth value.
+    const liftY = ramp ? Math.min(maxLift, depth * lift) : 0;
     // Cubes only: an authored model's reach IS the block's shape, and scaling it about the voxel centre
     // turns a big block into a wrong one (see the header).
-    const g = state.cube?.length ? (depth && stackGrow ? sizeOf(depth) : grow) : 1;
+    const g = state.cube?.length ? (depth && ramp ? sizeOf(depth) : grow) : 1;
     const mx = bx + 0.5, my = y + 0.5, mz = wz + 0.5;
     for (let v = v0; v < stream.n; v++) {
       stream.col[v * 4] = (stream.col[v * 4] * wash[0]) | 0;
@@ -214,6 +244,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
       if (liftY) stream.pos[v * 3 + 1] += liftY;
     }
     if (depth) { stats.stacked++; if (depth + 1 > stats.maxStack) stats.maxStack = depth + 1; }
+    mRep[m] = Math.min(65535, depth);
     stats.quads += emitted / 6;
     mSec[m] = tl.sec[i]; mEnd[m] = stream.i; mRow[m] = i; mCx[m] = c.cx; mCz[m] = c.cz; m++;
     stats.markers = m;
@@ -230,6 +261,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     pos: done.position, uv: done.uv, col: done.color, idx: done.index,
     markerSec: mSec.subarray(0, m), markerEnd: mEnd.subarray(0, m), markerRow: mRow.subarray(0, m),
     markerCx: mCx.subarray(0, m), markerCz: mCz.subarray(0, m),
+    markerRepeat: mRep.subarray(0, m),
     stats,
   };
 }

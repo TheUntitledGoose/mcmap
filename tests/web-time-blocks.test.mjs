@@ -311,11 +311,14 @@ test('a later claim at one voxel encloses the claim it supersedes, instead of ov
   assert.ok(redOuter(ch(stacked, 1)), 'the outer marker is the break, and it is washed red');
   assert.ok(!redOuter(ch(stacked, 0)), 'the enclosed marker is the place, washed green');
 
-  // The A/B: no ramp means the old same-size overlap.
-  const flat = build(rows, { grow: 1.18, stackGrow: 0 });
-  const fa = boxOf(flat, 0), fb = boxOf(flat, 1);
-  assert.ok(Math.abs(fa.lo[0] - fb.lo[0]) < 1e-6 && Math.abs(fa.hi[0] - fb.hi[0]) < 1e-6,
-    'stackGrow 0 must put both markers on exactly the same shell');
+  // The default is not a ramp at all: one voxel is ONE marker, and it is the claim standing there now.
+  const one = build(rows, { grow: 1.18, stackGrow: 0 });
+  assert.equal(one.stats.markers, 1, 'a voxel claimed twice draws one marker, not two shells');
+  assert.equal(one.stats.deduped, 1, 'and says out loud that it dropped the superseded claim');
+  assert.equal(one.markerRow[0], 1, 'the marker is the NEWER claim, the one true at the playhead');
+  assert.equal(one.markerRepeat[0], 1, 'and it carries that this voxel was claimed twice');
+  assert.ok(redOuter(ch(one, 0)), 'the one marker is the break, washed red');
+  assert.equal(boxOf(one, 0).lo[0], boxOf(stacked, 0).lo[0], 'at one size, the same shell every claim shares');
 
   // Bound: this save has one voxel logged 292 times. A linear ramp would draw a 30 m tower for it.
   const many = [];
@@ -334,6 +337,37 @@ test('a later claim at one voxel encloses the claim it supersedes, instead of ov
     const p = boxOf(deep, i - 1), q = boxOf(deep, i);
     assert.ok(q.hi[0] >= p.hi[0], `depth ${i}: the ramp must never shrink`);
   }
+});
+
+test('a marker stands on the grid: grow=1 is the voxel, and no cube reaches into its neighbour', () => {
+  const boxOf = (b, item) => {
+    const from = item ? b.markerEnd[item - 1] : 0, to = b.markerEnd[item];
+    const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (let k = from; k < to; k++) {
+      const v = b.idx[k] * 3;
+      for (let c = 0; c < 3; c++) { lo[c] = Math.min(lo[c], b.pos[v + c]); hi[c] = Math.max(hi[c], b.pos[v + c]); }
+    }
+    return { lo, hi };
+  };
+  // Two claims two blocks apart, one of them in negative world x where a packed float key used to blur them.
+  const rows = [[-40, 64, -128, 2, 'minecraft:stone', 'minecraft:air', 10],
+    [-38, 64, -128, 2, 'minecraft:stone', 'minecraft:air', 11]];
+  const a = build(rows, { grow: 1 });
+  assert.equal(a.stats.markers, 2, 'two voxels are two markers');
+  assert.equal(a.stats.deduped, 0, 'and neither is dropped for being the other');
+  const want = [[-40, -39], [-38, -37]];
+  for (const item of [0, 1]) {
+    const b = boxOf(a, item);
+    for (const [c, lo, hi] of [[0, want[item][0], want[item][1]], [1, 64, 65], [2, -128, -127]]) {
+      assert.ok(Math.abs(b.lo[c] - lo) < 1e-6 && Math.abs(b.hi[c] - hi) < 1e-6,
+        `marker ${item} axis ${c} is exactly ${lo}..${hi}: ${b.lo[c]}..${b.hi[c]}`);
+    }
+  }
+  // The shell that used to be default (1.09) reaches past the voxel edge into the neighbour's space, which
+  // is where two coplanar top faces at one height started fighting for the same pixels.
+  const shell = build(rows, { grow: 1.18 });
+  const s0 = boxOf(shell, 0);
+  assert.ok(s0.hi[0] > -39 + 0.01, 'and `?timegrow` still says it does, as an opt-in');
 });
 
 test('the builder says which chunk each marker stands in, which is how far the replay reaches', () => {
