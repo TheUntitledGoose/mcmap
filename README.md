@@ -215,6 +215,12 @@ label never leaves the picture: it slides along the frame when its person stands
 disappears instead of half-rendering off the window — the panel row counts why (too small to see, or off
 this view).
 
+Scrubbing back draws what the log claims had happened **by that second**: a block broken at second 92,291 and
+re-skinned at 167,880 still draws the 92,291 block at everything between, a face counts as inside the players'
+own build only once the voxel behind it has been claimed *yet*, and a click answers that block rather than
+today's terrain. What the layer could not draw is said out loud under the count — a name this atlas has no
+model for, a claim buried inside the build at this second — instead of quietly drawing less.
+
 Everyday settings live in the panel (nine rows plus three collapsed groups). Every panel
 row also has a URL parameter, so a view is a link:
 
@@ -234,9 +240,14 @@ row also has a URL parameter, so a view is a link:
                       blocks, and below that it steps down to flat plates), ?timegrow=0 (put the
                       markers flush with their voxel), ?timetiles=0,
                       ?timeterrain=0 (undo the log in the voxels), ?timesharp=12 (replay in a wider
-                      square than the view draws sharp), ?timestack=0 (older claims at one voxel stop
-                      owning it), ?timecull=0 (draw the faces that sit inside the players' own build,
-                      which is what made a wall of placed blocks read as inverted normals),
+                      square than the view draws sharp), ?timestack=1 (nest older claims at one voxel
+                      outside the newest; by default every claim draws, each at its own voxel),
+                      ?timededupe=1 (draw one cube per voxel instead: honest only with the playhead at the
+                      end of the filter, because the newest claim may be a second you have not reached),
+                      ?timecull=1 (default: a face is inside the players' own build only once the voxel
+                      behind it has been claimed as of the second being drawn), ?timecull=2 (the old
+                      whole-filter rule - cheaper, and it hid 118,954 faces of standing blocks plus 1,817
+                      whole claims on the place filter alone), ?timecull=0 (draw every face)
                       ?hover=0, ?timepick=0 (let the outline answer today's mesh again)
 ?bodies=0             stop standing the players back in (it comes on with the time machine)
 ?bodygap=300          the silence, in seconds, that ends a body. Measured on this save: one
@@ -291,7 +302,7 @@ MB kept getting flat tiles after the replay was repriced as blocks). The panel b
 ## Tests and measurement
 
 ```bash
-npm test                # 447 tests: formats, codecs, stores, mesher, lighting, collision,
+npm test                # 450 tests: formats, codecs, stores, mesher, lighting, collision,
                         # pool split, ledger, time machine (incl. what a pick may answer and what one
                         # voxel may draw), region coverage, remembered settings, HTTP endpoints
 npm run test:fast       # the logic layers, a few seconds

@@ -282,14 +282,53 @@ test('a person answers a click before a marker and before far paint, but real gr
 // pick answer "body" while the aimed pixel showed marker paint (`centreChanged:false`, changedBox 476-997 of
 // a 73x129 box), because the marker nearer than the body owns the pixel either way (build/
 // m15_where_mine_newdef.txt vs m15_where_mine.txt, which finds a body-painted framing on the first try).
-test('one voxel draws one block, and the time-machine sentence says where the other claims went', () => {
+test('the time-machine sentence says what happened to repeated claims, and culling answers the second drawn', () => {
   const n = bodyOf('timeNote');
-  assert.match(n, /TLAYER\.deduped/,
-    'a filter that claims one voxel four times draws one cube, and said nothing about the other three');
-  assert.match(n, /one block draws per voxel/, 'the page stopped admitting that claims are dropped');
-  assert.match(n, /\?timestack=1 nests every claim outside the last/, 'the way to see them is not named');
+  assert.match(n, /TLAYER\.maxStack > 1/, 'a voxel claimed four times is not allowed to say nothing about it');
+  assert.match(n, /every claim draws, the newest paints the block/,
+    'the page stopped admitting that older claims are still there under the newest');
+  assert.match(n, /TLAYER\.enclosed/, 'a claim the build hides has to be named, or it reads as a missing block');
+  assert.match(n, /\?timecull=1 culls as of the second being drawn/,
+    'the whole-filter rule hides faces of blocks standing at this second, and says so when it is on');
+  assert.doesNotMatch(n, /one block draws per voxel/,
+    'the sentence that promised one cube per voxel is the bug, not the fix');
+  // Every claim drawing means coplanar cubes at one voxel, so the ray needs a tie-break or a click answers
+  // whichever cube three.js happened to walk first.
+  const hit = bodyOf('timeHitAt');
+  assert.match(hit, /pickMarkerHit\(rc\.intersectObject\(TLAYER\.mesh, false\)\)/,
+    'a dead-heat depth between two claims of one voxel must answer with the newest');
+  // And the two switches have to reach the builder: a setting the builder never sees is a checkbox that
+  // repaints nothing.
+  assert.match(src, /cull: S\.timeCull, dedupe: !!S\.timeDedupe\s*\}/,
+    'the cull rule and the dedupe rule never reached buildTimeBlocks');
+  assert.match(src, /timeCull: Math\.max\(0, Math\.min\(2, num\('timecull', 1\)\)\)/,
+    'face culling has three honest settings, and the default is the time-aware one');
   const t = bodyOf('timeBlockMatOf');
   assert.match(t, /polygonOffset/, 'a flush marker now needs the polygon offset to sit off the world\'s depth');
+});
+
+// Draw order got measured this turn, and it needs two ways to be measured: the flag, switched inside one page
+// so a pixel A/B does not need two browsers whose chunk streams never agree; and the whole hit stack, because
+// a click takes one hit off the ray while the question "is the layer sorted?" needs every hit.
+test('the marker layer\'s depth-write and its whole hit stack are both reachable from a probe', () => {
+  assert.match(src, /markDepth: \(on\) => \{ S\.markDepth = on \? 1 : 0; const m = timeBlockMatOf\(\);/,
+    'the pixel A/B can only flip the flag through the page\'s own material path');
+  const mh = bodyOf('markerHits');
+  assert.match(mh, /rc\.intersectObject\(TLAYER\.mesh, false\)/, 'the stack comes off the same mesh a click uses');
+  assert.match(mh, /if \(!byItem|for \(const h of hits\)/, 'it walks every hit, not just the first');
+  assert.match(mh, /if \(out\.length >= max\) break;/, 'and it is bounded, because a dense buffer can answer hundreds');
+  assert.match(src, /^\s+markerHits,$/m, 'markerHits is not exported, so a probe cannot see the stack');
+});
+
+// Flat tiles have no faces and no per-voxel claims, and a coverage fact belongs to the filter that produced
+// it. Both were carried over from the previous build, so the panel quoted face counts under a picture that
+// draws quads, and kept naming a missing block name after a filter change that no longer mentions it.
+test('a look change and a filter change drop the counters and facts that no longer apply', () => {
+  const rb = bodyOf('timeRebuild');
+  assert.match(rb, /TLAYER\.fact = '';/, 'a coverage fact from the last filter is still on screen');
+  assert.match(rb, /TLAYER\.culled = 0; TLAYER\.enclosed = 0; TLAYER\.deduped = 0;/,
+    'the flat-tile branch kept quoting the block layer\'s face counts');
+  assert.match(rb, /TLAYER\.stacked = 0; TLAYER\.maxStack = 0;/, 'and the repeat counts with them');
 });
 
 test('a change marker tests the world\'s depth but never writes its own, and the people draw after it', () => {

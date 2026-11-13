@@ -80,14 +80,25 @@ const FAKE_CHUNK = { cx: 0, cz: 0 };
  * and the markers that exist are the OLDEST ones - the scrubber reads forward, so cutting the tail would
  * hide the changes a person is watching for.
  *
- * Why a face inside the build is not drawn (the `cull` option, on by default): the world's own mesher throws
- * away a face whose neighbour is solid, and a marker layer that does not is a wall of panels you can see
- * straight through. Measured over the densest placement chunk in the shipped overworld pack
+ * Why a face inside the build is not drawn (the `cull` option: 1 = at the moment of the claim, which is the
+ * default; 2 = anywhere in the filter; 0 = never): the world's own mesher throws away a face whose neighbour
+ * is solid, and a marker layer that does not is a wall of panels you can see straight through. Measured over
+ * the densest placement chunk in the shipped overworld pack
  * (build/dbg-markermass.mjs - the deepslate-brick wall at x -48..-33, z -128..-113 this was reported on):
  * **60% of its 12,432 marker faces sit against another claimed voxel of the same filter**, so three in five
  * faces point into the interior of the thing the players built. Seen through the gaps in the near skin those
  * back-faces read as "the normals are inverted and I see the opposite faces". Culling them is also cheaper:
  * that chunk's cubes drop from 6 faces each to their own outer skin.
+ *
+ * Why "is the other side claimed" is a question about WHEN (build/dbg-prefixskip.mjs, the run that found
+ * this): answered for the whole filter at once, the shipped overworld any-change filter loses 1,006,431 of
+ * 2,109,186 faces - and **442,673 of those were buried by a neighbour whose claim comes LATER than the row
+ * being drawn**. 211,882 markers lost at least one face they should still show, and 20,148 of them lost all
+ * six and drew nothing at all. So a face is inside the build only from the second its other side entered it.
+ * The stale faces that rule keeps are not visible anyway: once the neighbour exists, the camera-near side of
+ * that neighbour covers this face from every viewpoint (the camera sits outside whatever it sees, and an
+ * entry face is never culled), so a stale face costs fill and never paints wrong, while culling it early
+ * leaves a see-through block at every earlier second.
  *
  * Why a model is NOT scaled about the block centre: a cube needs `grow` so it stops being coplanar with the
  * block it describes. An authored model needs no such thing, and cannot survive it - the census allows geometry
@@ -95,17 +106,20 @@ const FAKE_CHUNK = { cx: 0, cz: 0 };
  * voxel, so multiplying that reach by the grow factor put it nearly 3 blocks off the grid. The model's own
  * shape is the claim, so `?timegrow` belongs to cubes.
  *
- * Why one voxel gets ONE marker (the `dedupe` option, on unless the stack ramp is asked for): a voxel this
- * filter claims seven times drew seven cubes, and the ramp that made them nested made the newest one up to
- * 1.69 blocks wide. Measured in the chunk this was reported on (build/dbg-markerfit.mjs), that ramp moved
- * **270 of 1,910 markers off their voxel, up to 0.36 blocks past it**, so a logged claim stood over its
- * neighbour's face - "the faces from the blocks are offset" - and a `light_gray_concrete_powder` claim logged
- * six times came back as a pale column twice as wide as the stone pillar it was standing on. The honest claim
- * is one block per voxel, and the repetition belongs in the ANSWER (how many times, which rows) rather than in
- * the size of the thing. `?timestack=1` restores the ramp, and turns dedupe off so the nesting can be seen.
+ * Why one voxel draws EVERY claim it has (the `dedupe` option, off by default): it used to keep only the
+ * newest claim, on the theory that the newest is the block standing there at the playhead. That is true only
+ * at the END of the filter. Measured over the shipped overworld any-change filter
+ * (build/dbg-prefixskip.mjs 0): of the voxels that had a claim at or before a given playhead, 1,801 of them
+ * drew NOTHING at that second, because the one claim the layer kept happened later. A block the log places,
+ * absent from the picture - "some blocks are being skipped entirely". So every claim draws, and the RAY
+ * decides who owns the pixel: `pickMarkerHit` takes the newest of the coplanar faces, which is the claim
+ * true at the playhead. `?timededupe=1` restores one-marker-per-voxel (cheaper, and honest only once the
+ * playhead is at the end of the filter).
  *
  * Why the ramp and dedupe cannot both be on: the ramp's whole point is that a later claim sits OUTSIDE an
- * earlier one, which needs several markers at one voxel. Dedupe is therefore implied whenever the ramp is off.
+ * earlier one, which needs several markers at one voxel. Dedupe is therefore implied whenever the ramp is on.
+ * Neither is the default: the ramp reaches past the voxel edge (270 of 1,910 markers up to 0.36 blocks into a
+ * neighbour in the reported chunk), and same-size nesting answers the click by buffer order instead.
  *
  * Returns `done()` streams (indexed) plus three parallel per-marker arrays:
  *   markerSec  the row's second, ascending - binary search it with `quadAt`
@@ -120,9 +134,11 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   // 0 restores same-size markers, which is the A/B. `stackTau` is how many claims at one voxel it takes to
   // get most of the way there.
   const { plates = false, maxQuads = 0, lift = 0.004, maxLift = 0.08, grow = 1,
-    stackGrow = 0, stackTau = 3, cull = true, dedupe = true } = opts;
+    stackGrow = 0, stackTau = 3, cull = 1, dedupe = false } = opts;
   const ramp = stackGrow > 0 ? stackGrow : 0;
   const keepLast = ramp > 0 ? false : dedupe;
+  const cullAll = cull === 2 || cull === 'all';
+  const cullAny = !!cull;
   // Strictly increasing in the number of claims already drawn at this voxel, and bounded: the newest claim at
   // a voxel is always the outermost shell, and even a voxel logged 292 times stays inside grow + 2*stackGrow.
   const sizeOf = (depth) => grow + 2 * (ramp > 0 ? ramp * (1 - Math.exp(-depth / stackTau)) : 0);
@@ -139,17 +155,16 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     noCell: 0, noModel: 0, faces: 0, quads: 0, verts: 0, tris: 0, stopped: false, bytes: 0,
     stacked: 0, maxStack: 0, culled: 0, enclosed: 0, deduped: 0, repeats: 0, deepest: 0,
   };
-  // Every voxel this filter claims, before a single face is emitted: a face whose other side is claimed by
-  // this same filter is inside the build, and `?timecull=0` is the A/B that draws it anyway. The same pass
-  // remembers the NEWEST claim at each voxel, which is the one a deduped layer draws.
-  const claimed = cull ? new Set() : null;
+  // When each voxel FIRST entered this filter, as a position in `order`: a face is inside the build only from
+  // that second onward. The same pass remembers the NEWEST claim at each voxel for the opt-in dedupe.
+  const firstClaim = cullAny ? new Map() : null;
   const newest = keepLast ? new Map() : null;
   let kq = 0;
   for (const i of order) {
     const c = cellAt(tl.cellOf(i));
     if (!c || c.cx === undefined || c.cz === undefined) continue;
     const key = vkey(c.cx * 16 + tl.x(i), tl.y(i), c.cz * 16 + tl.z(i));
-    if (claimed) claimed.add(key);
+    if (firstClaim && !firstClaim.has(key)) firstClaim.set(key, kq);
     if (newest) newest.set(key, kq);
     kq++;
   }
@@ -169,13 +184,13 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     if (!c || c.cx === undefined || c.cz === undefined) { stats.noCell++; continue; }
     const bx = c.cx * 16 + tl.x(i), wz = c.cz * 16 + tl.z(i), y = tl.y(i);
     const key = vkey(bx, y, wz);
-    // A voxel claimed more than once by this filter belongs to its newest claim: that is the block standing
-    // there at the playhead, and it is the row a click should answer.
-    if (newest && newest.get(key) !== k) {
-      stats.deduped++;
-      const n = claims0.get(key) ?? 0; claims0.set(key, n + 1);
-      continue;
-    }
+    // How many claims of this voxel came before this one - the repeat count the card answers with, and the
+    // depth the stack ramp scales by when someone asks for a ramp.
+    const depth0 = claims0.get(key) ?? 0;
+    claims0.set(key, depth0 + 1);
+    // One voxel, one block: a claim this filter supersedes draws no geometry of its own. Opt-in, and honest
+    // only at the end of the filter - see the header.
+    if (newest && newest.get(key) !== k) { stats.deduped++; continue; }
     const name = tl.nameOf(i);
     const st = name ? (byName.get(name) ?? 0) - 1 : -1;
     const v0 = stream.n, i0 = stream.i;
@@ -188,9 +203,10 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     const h = hash3(bx, y, wz);
     let hid = 0;
     const hidden = (f) => {
-      if (!claimed) return false;
+      if (!firstClaim) return false;
       const d = FACE_OFF[f];
-      return claimed.has(vkey(bx + d[0], y + d[1], wz + d[2]));
+      const n = firstClaim.get(vkey(bx + d[0], y + d[1], wz + d[2]));
+      return n !== undefined && (cullAll || n <= k);
     };
     if (state.cube?.length) {
       const arm = state.cube[assets.pickArm(state, h)];
@@ -222,7 +238,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
     const wash = ACTION_WASH[tl.action[i]] ?? ACTION_WASH[6];
     // One counter answers both questions about this voxel: how many claims were drawn here before (which
     // sets the lift) and therefore whose turn it is in the stack (which sets how far out it reaches).
-    const depth = ramp > 0 ? (seen0(bx, y, wz) ?? 0) : ((claims0.get(key) ?? 0));
+    const depth = ramp > 0 ? (seen0(bx, y, wz) ?? 0) : depth0;
     // The lift only exists to separate markers that share a voxel. With one marker per voxel there is nothing
     // to separate, and a block lifted 0.08 off its grid square is exactly the "waaaay off grid" complaint:
     // the material's polygon-offset is what keeps a flush marker off the terrain's own depth value.
@@ -276,6 +292,23 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
  * also why a block claimed once can come back with a stack depth of 10 and get scaled like a tenth claim.
  */
 function vkey(x, y, z) { return `${x},${y},${z}`; }
+
+/**
+ * Of the faces a click ray hit, the one that owns the pixel. A voxel logged N times is N cubes of the same
+ * size standing on one 1x1x1, so the ray meets N coplanar faces at a single distance and three.js returns
+ * them in buffer order - oldest claim first. Taking the FIRST of those answers a block that has already left
+ * (measured before the draw-range work: the oldest claim won 36 of 36 shared pixels), and dropping the other
+ * claims to dodge it leaves the earlier seconds with no block at all. So: newest claim wins, buffer order
+ * decides, and `eps` is how close two hits have to be to count as the same pixel.
+ */
+export function pickMarkerHit(hits, eps = 1e-3) {
+  let best = null;
+  for (const h of hits) {
+    if (!best || h.distance < best.distance - eps) best = h;
+    else if (h.distance <= best.distance + eps && h.faceIndex > best.faceIndex) best = h;
+  }
+  return best;
+}
 
 /**
  * Repeat counting for the sub-millimetre lift. Rebuilding this per build (rather than carrying it between

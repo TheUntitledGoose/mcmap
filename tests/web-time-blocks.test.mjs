@@ -14,7 +14,7 @@ import { readPack, decodeTimeline } from '../shared/ledger-pack.mjs';
 import { buildPack } from '../server/ledger-pack.mjs';
 import { stateIdsByName } from '../web/js/ledger-terrain.mjs';
 import {
-  ACTION_WASH, buildTimeBlocks, markerAt, markerOfIndex, resetMarkerLift,
+  ACTION_WASH, buildTimeBlocks, markerAt, markerOfIndex, pickMarkerHit, resetMarkerLift,
 } from '../web/js/ledger-blocks.mjs';
 import { filterRows } from '../web/js/ledger-time.mjs';
 import { fakeLog } from './fake-ledger.mjs';
@@ -134,11 +134,16 @@ test('plates cost a fraction of blocks, and a quad ceiling stops the build inste
   assert.equal(plates.stats.plates, 144);
   assert.ok(plates.stats.quads * 4 < cubes.stats.quads, 'a plate is one face, not six');
   assert.ok(plates.stats.bytes * 4 < cubes.stats.bytes);
-  // The same floor with face culling on (the default): 144*6 = 864 faces, and the 264 side-by-side pairs eat
-  // 528 of them, so a slab of claims costs its skin. Measured, not assumed.
-  const shut = build(rows, { cull: true });
-  assert.equal(shut.stats.culled, 528, 'a 12x12 floor shares 264 side faces, twice');
-  assert.ok(shut.stats.quads * 2 < cubes.stats.quads, 'and the floor is drawn as a floor, not as 864 panels');
+  // The same floor with face culling on: 144*6 = 864 faces. Culling asks a TIME question now - a face is
+  // inside the build only once its other side has been claimed - so of the 264 side-by-side pairs each loses
+  // ONE face, the later claim's face into the block that was already there, and keeps the other. At the
+  // second the first slab was placed its neighbour did not exist, and that kept face is what makes it read
+  // as a block instead of a hole. `?timecull=2` is the old whole-filter rule, which takes both.
+  const shut = build(rows, { cull: 1 });
+  assert.equal(shut.stats.culled, 264, 'one face per shared pair, as of the second each was claimed');
+  const shutAll = build(rows, { cull: 2 });
+  assert.equal(shutAll.stats.culled, 528, 'the whole-filter rule takes both faces of every shared pair');
+  assert.ok(shutAll.stats.quads * 2 < cubes.stats.quads, 'and it draws the floor as a floor, not as 864 panels');
 
   const capped = build(rows, { maxQuads: 300 });
   assert.equal(capped.stats.stopped, true, 'the ceiling must say it stopped');
@@ -172,15 +177,27 @@ test('the panel sentence about what fits is a measured number, not a guess', () 
   assert.equal(b.stats.rows, place.length);
   assert.equal(b.stats.stopped, false, 'the place filter fits, which is why it is the default filter');
   assert.ok(b.stats.markers > 80000, `tens of thousands of block markers, got ${b.stats.markers}`);
-  // 63.4 MB of geometry as six faces per claim; 35.8 MB once the faces that sit inside the players' own
-  // build are dropped (241,091 of 553,726, and 1,864 claims end up entirely inside). Both numbers are the
-  // reason a ceiling exists at all, and the smaller one is why blocks fit where plates used to be forced.
-  assert.ok(b.stats.bytes > 30 * 1024 * 1024, 'block markers are a real allocation, not free');
-  assert.ok(b.stats.bytes < 45 * 1024 * 1024, 'and culling the interior of a build is most of the saving');
-  assert.ok(b.stats.culled > b.stats.faces / 2, `${b.stats.culled} faces sit inside another claim of this filter`);
+  // 63.4 MB of geometry as six faces per claim; 49.4 MB once the faces that were ALREADY inside the players'
+  // own build at each claim's own second are dropped (122,137 of 553,726, and 47 claims end up entirely
+  // inside). All measured by build/dbg-cullmode.mjs, and all the reason a ceiling exists at all.
+  assert.ok(b.stats.bytes > 40 * 1024 * 1024, 'block markers are a real allocation, not free');
+  assert.ok(b.stats.bytes < 55 * 1024 * 1024, 'and culling the inside of a build pays for itself');
+  assert.ok(b.stats.culled > b.stats.faces / 5, `${b.stats.culled} faces were inside another claim already`);
   assert.equal(b.stats.culled + b.stats.faces, 553726, 'culled plus drawn is what six faces per claim would be');
   assert.ok(b.stats.unknown > 0 && b.stats.unknown < b.stats.markers / 50,
     `a few names the atlas cannot draw: ${b.stats.unknown} of ${b.stats.markers}`);
+
+  // The old rule culled against EVERY claim in the filter, future ones included, and the bill for that is
+  // not bytes: it is 118,954 faces of standing blocks and 1,817 blocks the log places that drew nothing at
+  // all, because their neighbour would not be placed for days. Cheaper, and wrong. Measured over the same
+  // filter here so the difference is never a story told from a scratch script again.
+  resetMarkerLift();
+  const oldRule = buildTimeBlocks(tl, P, place, assets, byName,
+    { grow: 1.18, stackGrow: 0.36, cull: 2 });
+  assert.equal(oldRule.stats.culled, 241091, 'the whole-filter rule hid 118,954 more faces');
+  assert.equal(oldRule.stats.faces, 312635, 'and drew that many fewer');
+  assert.equal(oldRule.stats.enclosed - b.stats.enclosed, 1817, 'and swallowed 1,817 whole claims');
+  assert.ok(oldRule.stats.bytes < b.stats.bytes, 'it was cheaper, which is exactly why it was kept');
 
   const anyChange = Array.from({ length: tl.count }, (_, i) => i);
   resetMarkerLift();
@@ -276,7 +293,7 @@ test('a marker is bigger than its block by the grow factor, and grow=1 is flush 
 // Why this exists: a block placed and later broken drew two markers the same size, so they fought for the
 // same pixels. A raycast measured who won - the OLDER placement - which means a click answered a block that
 // had already left, and a person saw green and red occupying one block. The newest claim must own the block.
-test('a later claim at one voxel encloses the claim it supersedes, instead of overlapping it', () => {
+test('a voxel claimed twice draws every claim, and one-cube-per-voxel is the opt-in', () => {
   const boxOf = (b, item) => {
     const from = item ? b.markerEnd[item - 1] : 0;
     const to = b.markerEnd[item];
@@ -311,11 +328,23 @@ test('a later claim at one voxel encloses the claim it supersedes, instead of ov
   assert.ok(redOuter(ch(stacked, 1)), 'the outer marker is the break, and it is washed red');
   assert.ok(!redOuter(ch(stacked, 0)), 'the enclosed marker is the place, washed green');
 
-  // The default is not a ramp at all: one voxel is ONE marker, and it is the claim standing there now.
-  const one = build(rows, { grow: 1.18, stackGrow: 0 });
-  assert.equal(one.stats.markers, 1, 'a voxel claimed twice draws one marker, not two shells');
-  assert.equal(one.stats.deduped, 1, 'and says out loud that it dropped the superseded claim');
-  assert.equal(one.markerRow[0], 1, 'the marker is the NEWER claim, the one true at the playhead');
+  // The default draws BOTH claims, at one size, coplanar. Dropping the older one looked tidy and was a lie
+  // at any playhead before the newest claim: measured over the shipped overworld, 1,801 voxels that stood at
+  // a mid-log second drew NOTHING, because the newest claim kept for their voxel was still in the future
+  // (build/dbg-prefixskip.mjs). The ray sorts the overlap out instead - see pickMarkerHit below.
+  const both = build(rows, { grow: 1.18, stackGrow: 0 });
+  assert.equal(both.stats.markers, 2, 'every claim this filter makes draws');
+  assert.equal(both.stats.deduped, 0, 'and nothing was dropped to make that happen');
+  assert.deepEqual(boxOf(both, 1).lo, boxOf(both, 0).lo, 'coplanar one-block cubes, not a shell around a shell');
+  assert.equal(both.markerRow[1], 1, 'the newer claim is LAST in the buffer, which is what the ray prefers');
+  assert.equal(both.markerRepeat[1], 1, 'and it carries that an earlier claim stands on this voxel');
+
+  // `?timededupe=1` is the old one-cube-per-voxel rule, opt-in, and honest only with the playhead parked at
+  // the end of the filter where the newest claim really is the state of the world.
+  const one = build(rows, { grow: 1.18, stackGrow: 0, dedupe: true });
+  assert.equal(one.stats.markers, 1, 'one marker per voxel, when asked for');
+  assert.equal(one.stats.deduped, 1, 'and it says out loud that it dropped the superseded claim');
+  assert.equal(one.markerRow[0], 1, 'the marker it keeps is the NEWER claim, the one true at the end');
   assert.equal(one.markerRepeat[0], 1, 'and it carries that this voxel was claimed twice');
   assert.ok(redOuter(ch(one, 0)), 'the one marker is the break, washed red');
   assert.equal(boxOf(one, 0).lo[0], boxOf(stacked, 0).lo[0], 'at one size, the same shell every claim shares');
@@ -384,34 +413,70 @@ test('the builder says which chunk each marker stands in, which is how far the r
 // shoulder. The world's own mesher throws away a face whose neighbour is solid; a marker layer that does not
 // draws three in five faces into the inside of the thing the players built, and those back-faces seen through
 // the gaps in the near skin are what a person calls "inverted normals, I see the opposite faces".
-test('a face with another claim of the same filter behind it is inside the build, so it is not drawn', () => {
+test('a face is inside the build only from the second its other side was claimed', () => {
   const wall = [[2, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 10],
     [3, 64, 3, 2, 'minecraft:stone', 'minecraft:air', 20]];
-  const open = build(wall, { cull: false });
-  const shut = build(wall, { cull: true });
+  const open = build(wall, { cull: 0 });
+  const now = build(wall, { cull: 1 });
+  const all = build(wall, { cull: 2 });
   assert.equal(open.stats.markers, 2);
-  assert.equal(shut.stats.markers, 2, 'the wall is still two blocks of claim');
+  assert.equal(now.stats.markers, 2, 'the wall is still two blocks of claim');
   assert.equal(open.stats.faces, 12, 'six faces each when nothing is culled');
-  assert.equal(shut.stats.faces, 10, 'the two faces that met in the middle are gone');
-  assert.equal(shut.stats.culled, 2);
-  assert.equal(shut.stats.tris, open.stats.tris - 4, 'and the geometry went with them: two quads, four triangles');
+  // At second 10 the wall is ONE block, and the face that later sits against its neighbour is the only skin
+  // that block has. Culling it because the filter also claims x=3, which happens in ten more seconds,
+  // draws a hole where the log says a block stands.
+  assert.equal(now.stats.faces, 11, 'the second block hides its own face in the first, never the reverse');
+  assert.equal(now.stats.culled, 1);
+  assert.equal(all.stats.faces, 10, 'the whole-filter rule takes both faces of the seam');
+  assert.equal(all.stats.culled, 2);
+  assert.equal(now.stats.tris, open.stats.tris - 2, 'and the geometry goes with the face that was culled');
 });
 
-test('a claim the build completely hides is skipped, and counted as inside rather than as shapeless', () => {
-  const cube = [];
+test('a coplanar pair of claims answers the ray with the newest, not with whichever three.js saw first', () => {
+  const h = (distance, faceIndex) => ({ distance, faceIndex });
+  assert.equal(pickMarkerHit([]), null, 'no hit is no answer');
+  const near = h(3, 0), far = h(9, 40);
+  assert.equal(pickMarkerHit([far, near]), near, 'a nearer surface still wins outright');
+  // Same voxel, two claims, identical cubes: three.js returns them in an order that depends on nothing a
+  // person can read, so the tie goes to the later buffer position, which is the later claim.
+  const older = h(12, 6), newer = h(12.0002, 900);
+  assert.equal(pickMarkerHit([older, newer]), newer, 'the newest claim answers a dead-heat depth');
+  assert.equal(pickMarkerHit([newer, older]), newer, 'whatever order the hits arrive in');
+  assert.equal(pickMarkerHit([h(12, 900), h(12.5, 6)]).faceIndex, 900, 'a real depth gap still decides it');
+});
+
+test('a claim the build has already closed over draws nothing, and one it closes over later draws everything', () => {
+  // 3x3x3 of claims. Whether the middle block has a face left is a question about WHEN it was claimed:
+  // placed last, all six sides already stand, so it is inside the build and draws nothing (counted as
+  // inside, not as a missing model); placed first, it is the only thing there, and all six of its faces
+  // must draw even though the shell arrives later.
+  const shell = [];
   for (let dx = 0; dx < 3; dx++) {
     for (let dy = 0; dy < 3; dy++) {
-      for (let dz = 0; dz < 3; dz++) cube.push([4 + dx, 64 + dy, 4 + dz, 2, 'minecraft:stone', 'minecraft:air', 10]);
+      for (let dz = 0; dz < 3; dz++) {
+        if (dx === 1 && dy === 1 && dz === 1) continue;
+        shell.push([4 + dx, 64 + dy, 4 + dz, 2, 'minecraft:stone', 'minecraft:air', 10]);
+      }
     }
   }
-  const shut = build(cube, { cull: true });
-  const open = build(cube, { cull: false });
-  assert.equal(open.stats.markers, 27);
-  assert.equal(shut.stats.markers, 26, 'the one block with a claim on all six sides draws nothing');
-  assert.equal(shut.stats.enclosed, 1);
-  assert.equal(shut.stats.noModel, 0, 'a hidden claim is not a missing model');
-  // 3x3x3: 27*6 faces, 54 of them shared pairs -> the skin is 6*9 = 54 faces.
-  assert.equal(shut.stats.faces, 54);
+  const centre = (sec) => [5, 65, 5, 2, 'minecraft:stone', 'minecraft:air', sec];
+  assert.equal(shell.length, 26);
+
+  const last = build([...shell, centre(20)], { cull: 1 });
+  const first = build([centre(5), ...shell], { cull: 1 });
+  assert.equal(last.stats.markers, 26, 'the block that closed the hole has no face of its own left');
+  assert.equal(last.stats.enclosed, 1);
+  assert.equal(last.stats.noModel, 0, 'a hidden claim is not a missing model');
+  assert.equal(first.stats.markers, 27, 'the same voxel claimed BEFORE the shell draws, faces and all');
+  assert.equal(first.stats.enclosed, 0, 'and is not reported as inside anything');
+  // Either way 54 faces go: one per shared pair, the face pointing back at the claim that came first.
+  assert.equal(last.stats.faces, 108);
+  assert.equal(first.stats.faces, 108);
+  assert.equal(last.stats.culled, 54);
+
+  const whole = build([...shell, centre(20)], { cull: 2 });
+  assert.equal(whole.stats.faces, 54, 'the whole-filter rule is the skin of the cube, 6*9');
+  assert.equal(whole.stats.culled, 108, 'every face of a shared pair, whichever end claimed first');
 });
 
 test('a model marker keeps the shape the model authored, whatever the grow factor says', () => {

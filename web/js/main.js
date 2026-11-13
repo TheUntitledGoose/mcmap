@@ -47,7 +47,7 @@ import { decodeTimeline, readPack, tlPackCoord } from '../../shared/ledger-pack.
 // testable without a browser (tests/web-timemachine.test.mjs). This page owns the mesh and the
 // scrubber; the numbers in the readouts come from the tested functions.
 import { actionName, buildTimeQuads, claimName, filterRows, playhead, plainName, quadAt, rowForBlock, standsAt, voxelKey, voxelRows } from './ledger-time.mjs';
-import { buildTimeBlocks, markerOfIndex, resetMarkerLift } from './ledger-blocks.mjs';
+import { buildTimeBlocks, markerOfIndex, pickMarkerHit, resetMarkerLift } from './ledger-blocks.mjs';
 // M15: the people in the log. shared/ghosts.mjs decides where a body is ALLOWED to stand (only rows that
 // player's own hand caused, cut off at a measured silence) and what the floor under their feet is;
 // web/js/ledger-ghosts.js turns that into one body buffer, one route buffer, and the words next to them.
@@ -268,21 +268,31 @@ const S = {
   // leaves 76 of 1,562 markers off their voxel, and every one of them is an authored model whose shape
   // legitimately reaches out, against 353 with the old shell and ramp. URL: ?timegrow=0.09 raises the shell.
   timeGrow: Math.max(0, Math.min(0.5, num('timegrow', 0))),
-  // A voxel this filter claims more than once gets ONE marker: the newest claim, which is the block standing
-  // there at the playhead and the row a click should answer, carrying how many claims it supersedes. The old
-  // default scaled each later claim outward instead, and that is where the giant pale column in the reported
-  // screenshot came from: a `light_gray_concrete_powder` claim logged six times drew a cube 1.69 blocks wide
-  // standing over its neighbours' faces - 270 of 1,910 markers off-grid in that chunk, up to 0.36 blocks past
-  // the voxel (build/dbg-markerfit.mjs). Repetition belongs in the answer, not in the size of the block.
-  // URL: ?timestack=1 restores the ramp, and turns the dedupe off so the nesting can be seen.
+  // A voxel this filter claims more than once used to get ONE marker - the newest claim - on the theory that
+  // the newest is the block standing there at the playhead. That holds only at the END of the filter: the one
+  // claim the layer kept can be in the future, and then the block that did stand there draws nothing. So the
+  // default draws every claim, and the RAY answers with the newest of them (`pickMarkerHit`). The old default
+  // also scaled each later claim outward, which is where the giant pale column in a reported screenshot came
+  // from: a `light_gray_concrete_powder` claim logged six times drew a cube 1.69 blocks wide over its
+  // neighbours' faces - 270 of 1,910 markers off-grid in that chunk (build/dbg-markerfit.mjs).
+  // URL: ?timestack=1 nests every claim outside the last; ?timededupe=1 goes back to one marker per voxel.
   timeStack: num('timestack', 0) ? 1 : 0,
+  // One marker per voxel instead of one per claim: cheaper (289,072 markers against 331,040 on the shipped
+  // overworld any-change filter, 238 MB against 336 MB) and wrong at any second before the newest claim -
+  // measured 1,801 voxels that stood at a mid-log playhead drew nothing at all (build/dbg-cullmode.mjs,
+  // build/dbg-prefixskip.mjs). An opt-in, because once the playhead is at the end it is the same picture.
+  timeDedupe: num('timededupe', 0) ? 1 : 0,
   // A marker face that has another marker of the same filter on the other side of it is INSIDE the thing the
   // players built, and drawing it is what turns a wall of placed blocks into a pile of see-through panels:
   // measured over the densest placement chunk in the shipped overworld pack (build/dbg-markermass.mjs, the
   // deepslate-brick wall at x -48..-33, z -128..-113), 60% of its 12,432 marker faces sit against another
   // claimed voxel, so three in five faces point into the interior and read back through the near skin as
-  // inverted normals. The world's own mesher culls these; this layer now does too. URL: ?timecull=0
-  timeCull: num('timecull', 1) ? 1 : 0,
+  // inverted normals. The world's own mesher culls these; this layer does too - but ASKED AT THE SECOND THE
+  // CLAIM STANDS. The first version asked about the whole filter at once, and over the shipped any-change
+  // filter that buried 442,673 faces behind blocks that had not been placed yet: 211,882 markers lost a face,
+  // 20,148 of them lost all six and drew nothing ("some blocks are skipped entirely, some faces are not drawn
+  // on some sides"). URL: ?timecull=0 turns it off, ?timecull=2 is the whole-filter rule for A/B.
+  timeCull: Math.max(0, Math.min(2, num('timecull', 1))),
   // The detail ring's ceiling while the replay runs, in chunks, 0 = leave the radius alone. Asked for and
   // measured, then set down to 0 because it does not pay: at a 140 m pull-back with the 8-chunk default the
   // page held 361 detail meshes / 12.40 M verts / 92.5 fps settled, and 5,709 of the 27,790 changes drawn
@@ -4044,6 +4054,34 @@ function ledgerAsk(x, y, z) {
  * at what stands there today: a break marks a voxel that is empty now, and a place under a playhead that
  * has taken the block back is empty too.
  */
+/**
+ * Every marker this pixel's ray meets, front to back. This is the diagnostic that answers "is the picture
+ * sorted?": two claims of ONE voxel arrive at one distance (so the picture must decide by claim order, and
+ * the layer must not write depth), while two claims of DIFFERENT voxels arrive at different distances (so
+ * the nearer one owns the pixel, and a layer that writes no depth lets the farther one paint over it).
+ * A click never pays for this - it takes `pickMarkerHit` of the same ray - but a measurement has to see the
+ * whole stack, not the answer.
+ */
+function markerHits(x, y, max = 12) {
+  if (!TLAYER.mesh || !TLAYER.mesh.visible || !TLAYER.tl) return [];
+  camera.updateMatrixWorld();
+  const rc = new THREE.Raycaster();
+  rc.setFromCamera(new THREE.Vector2((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1), camera);
+  rc.far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
+  const hits = rc.intersectObject(TLAYER.mesh, false);
+  const out = [];
+  for (const h of hits) {
+    const item = TLAYER.markerEnd ? markerOfIndex(TLAYER.markerEnd, Math.floor(h.faceIndex / 2) * 6) : -1;
+    const row = item >= 0 ? (TLAYER.quadRow?.[item] ?? -1) : -1;
+    const xyz = row >= 0 ? timeRowWorld(row) : null;
+    out.push({ dist: +h.distance.toFixed(3), item, row: row >= 0 ? row : -1,
+      sec: row >= 0 ? TLAYER.tl.sec?.[row] ?? null : null,
+      voxel: xyz ? [xyz[0], xyz[1], xyz[2]] : null });
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
 function timeRowWorld(row) {
   const tl = TLAYER.tl;
   const c = LEDGER.pack?.cell?.(tl.cellOf(row));
@@ -4066,7 +4104,7 @@ function timeHitAt(x, y) {
   rc.setFromCamera(new THREE.Vector2((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1), camera);
   rc.far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
   const t0 = performance.now();
-  const hit = rc.intersectObject(TLAYER.mesh, false)[0];
+  const hit = pickMarkerHit(rc.intersectObject(TLAYER.mesh, false));
   TLAYER.hitMs = performance.now() - t0;          // 42 ms on a whole-dimension buffer: a click's cost
   if (!hit) return null;
   // One triangle per face of a marker: the geometry is indexed, and a flat tile is one quad = 6 indices.
@@ -4089,6 +4127,41 @@ function timeHitAt(x, y) {
   return { row, item, xy: [x, y], voxel: xyz, sec: TLAYER.tl.sec[row], action: TLAYER.tl.action[row],
     dist: hit.distance,                       // so a body and a marker can be settled by who is nearer
     look: TLAYER.look, point: [+hit.point.x.toFixed(2), +hit.point.y.toFixed(2), +hit.point.z.toFixed(2)] };
+}
+
+/**
+ * What SHAPE the marker under this pixel actually has: its own bounding box in world blocks, and how far
+ * that box leaves the voxel it claims. "The logged blocks are off grid" is a claim about geometry, and the
+ * page has to be able to answer it about the pixel a person is looking at - a Node harness over the shipped
+ * pack cannot say which marker they were pointing at.
+ */
+function timeMarkerBox(x, y) {
+  const t = timeHitAt(x, y);
+  if (!t || !TLAYER.mesh) return t ?? null;
+  const geo = TLAYER.mesh.geometry;
+  const pos = geo.attributes.position.array, idx = geo.index ? geo.index.array : null;
+  const end = TLAYER.markerEnd?.[t.item] ?? 0;
+  const start = t.item > 0 ? (TLAYER.markerEnd[t.item - 1] ?? 0) : 0;
+  if (!idx || end <= start) return { ...t, why: 'this item has no index range' };
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let k = start; k < end; k++) {
+    const p = idx[k] * 3;
+    for (let a = 0; a < 3; a++) {
+      const v = pos[p + a];
+      if (v < lo[a]) lo[a] = v;
+      if (v > hi[a]) hi[a] = v;
+    }
+  }
+  const [bx, by, bz] = t.voxel;
+  const over = Math.max(bx - lo[0], by - lo[1], bz - lo[2],
+    hi[0] - (bx + 1), hi[1] - (by + 1), hi[2] - (bz + 1));
+  return {
+    row: t.row, item: t.item, voxel: t.voxel, sec: t.sec, action: t.action, dist: +t.dist.toFixed(2),
+    name: TLAYER.tl.nameOf?.(t.row) ?? '', look: TLAYER.look, repeat: TLAYER.mRep?.[t.item] ?? null,
+    quads: (end - start) / 6, drawn: t.item < TLAYER.drawn,
+    aabb: [...lo, ...hi].map((v) => +v.toFixed(3)),
+    overVoxel: +over.toFixed(3),                  // >0 means the shape sticks out of its own voxel
+  };
 }
 
 /**
@@ -4753,6 +4826,8 @@ function timeRebuild() {
   const t1 = performance.now();
   const budget = S.timeGeomMb * 1024 * 1024;
   let built = null, look = 'tiles', why = '';
+  // A coverage fact describes the filter that is about to be drawn, so it dies with the old one.
+  TLAYER.fact = '';
   const lookMb = {};
   TLAYER.lookBytes = lookMb;
   if (S.timeLook !== 'tiles' && assets) {
@@ -4761,7 +4836,7 @@ function timeRebuild() {
       resetMarkerLift();
       const b = buildTimeBlocks(TLAYER.tl, LEDGER.pack, got.order, assets, blockNameIds(),
         { plates: lk === 'plates', grow: 1 + 2 * S.timeGrow,
-          stackGrow: S.timeStack ? 0.36 : 0, cull: !!S.timeCull });
+          stackGrow: S.timeStack ? 0.36 : 0, cull: S.timeCull, dedupe: !!S.timeDedupe });
       lookMb[lk] = Math.round(b.stats.bytes / 1048576);
       const lastTried = lk === tries[tries.length - 1];
       if (b.stats.bytes <= budget || lastTried) {
@@ -4798,6 +4873,8 @@ function timeRebuild() {
     TLAYER.stacked = built.stats.stacked; TLAYER.maxStack = built.stats.maxStack;
     TLAYER.culled = built.stats.culled; TLAYER.enclosed = built.stats.enclosed;
     TLAYER.deduped = built.stats.deduped;
+    TLAYER.cullMode = S.timeCull; TLAYER.dedupeMode = !!S.timeDedupe;
+    TLAYER.mRep = built.markerRepeat;
     if (built.stats.unknown) TLAYER.fact = `${built.stats.unknown.toLocaleString()} changes name something this atlas has no model for`;
     geo.setAttribute('position', new THREE.BufferAttribute(built.pos, 3));
     geo.setAttribute('uv', new THREE.BufferAttribute(built.uv, 2));
@@ -4807,7 +4884,11 @@ function timeRebuild() {
   } else {
     const g = buildTimeQuads(TLAYER.tl, LEDGER.pack, got.order, { shrink: S.decalShrink });
     TLAYER.itemEnd = null; TLAYER.markerEnd = null;
-    TLAYER.mCx = null; TLAYER.mCz = null;
+    TLAYER.mCx = null; TLAYER.mCz = null; TLAYER.mRep = null;
+    // Flat tiles have no faces to cull and no per-voxel claims: these counters belong to the block layer, and
+    // a stale one in the panel sentence is a number the picture cannot back up.
+    TLAYER.culled = 0; TLAYER.enclosed = 0; TLAYER.deduped = 0;
+    TLAYER.stacked = 0; TLAYER.maxStack = 0;
     TLAYER.quadSec = g.quadSec;
     TLAYER.quadRow = g.quadRow;
     TLAYER.quads = g.quads; TLAYER.verts = g.verts;
@@ -6222,15 +6303,27 @@ ${TLAYER.look === 'blocks' ? 'drawn as the blocks themselves'
       ? `\nthese rows themselves run ${fmtLedger((TLAYER.tl.timeBaseSec + TLAYER.quadSec[0]) * 1000)} to`
         + ` ${fmtLedger((TLAYER.tl.timeBaseSec + TLAYER.quadSec[TLAYER.quadSec.length - 1]) * 1000)}`
       : '\nthis filter keeps no rows, so there is nothing to scrub')
-    // One voxel, one cube. A block this filter claims twice (place, break, place again) draws its NEWEST
-    // claim only, and the page has to say that out loud: "the log says they placed here three times and I
-    // see one block" is otherwise a bug report. The newest one carries the count, so the click answers with
-    // it, and ?timestack=1 draws every claim nested outside the last.
-    + (TLAYER.deduped
-      ? `\n${TLAYER.deduped.toLocaleString()} of these claims sit on a voxel this filter already claimed, so `
-        + 'one block draws per voxel\nand carries the count: ' + `${TLAYER.maxStack ?? 0} claims deep at `
-        + 'the busiest one (?timestack=1 nests every claim outside the last instead)'
+    // One voxel, several claims. Every claim draws, and the newest paints the pixel - so the sentence has to
+    // say where the rest of them went, because "the log says they placed here eleven times and I see one
+    // block" is otherwise a bug report. The count also rides on the marker itself, which is what the click
+    // card answers with. `?timededupe=1` skips drawing the superseded claims instead.
+    + (TLAYER.maxStack > 1
+      ? `\n${(TLAYER.stacked ?? 0).toLocaleString()} of these voxels sit under an earlier claim of the same `
+        + `filter, ${TLAYER.maxStack} deep at the busiest: every claim draws, the newest paints the block, and `
+        + 'a click says how many times it was logged'
       : '')
+    // A claim with another claim on all six sides has no face left to draw. Under the whole-filter cull rule
+    // that swallowed 20,148 of them at once - a block the log places, missing from the picture.
+    + (TLAYER.enclosed
+      ? `\n${TLAYER.enclosed.toLocaleString()} claims sit inside the players' own build at this second, with `
+        + 'no face of their own left to draw'
+      : '')
+    + (S.timeCull === 2
+      ? '\nfaces inside the build are culled against the WHOLE filter, so a block placed later hides a face '
+        + 'of one placed earlier - ?timecull=1 culls as of the second being drawn'
+      : !S.timeCull
+        ? '\nface culling is off: the inside of the players\' own build is drawn - ?timecull=1 hides it'
+        : '')
     + (TLAYER.fact ? `\n${TLAYER.fact}` : '');
 }
 
@@ -6806,6 +6899,14 @@ window.__world = {
   },
   followState: () => followState(),
   stepRows: (n = 1) => timeStepRows(n | 0),
+  // Land the playhead exactly. A claim about "the highlight answers the wrong second" needs a probe that can
+  // stand the playhead on one row or one wall-clock second and read what the layer then draws.
+  seekRow: (i) => timeSeekRow(i | 0),
+  seekSec: (sec) => { S.timeAt = +sec; return timeApply() ?? TLAYER.drawn; },
+  // The marker layer's own depth-write, switched inside one page so a pixel A/B does not need two browsers
+  // (and two chunk streams that never settle the same way). `?markdepth=1` is the same switch from a URL.
+  markDepth: (on) => { S.markDepth = on ? 1 : 0; const m = timeBlockMatOf();
+    return { markDepth: S.markDepth, depthWrite: !!m.depthWrite, depthTest: !!m.depthTest }; },
   hist: histStats,
   time: () => ({
     on: !!S.time, playing: !!S.timePlay, tl: !!TLAYER.tl, err: TLAYER.err, fact: TLAYER.fact || '',
@@ -6822,8 +6923,9 @@ window.__world = {
     // share a voxel with an earlier one, and how deep the deepest such stack goes
     stacked: TLAYER.stacked ?? 0, maxStack: TLAYER.maxStack ?? 0, stackRamp: !!S.timeStack,
     // faces the layer refused to draw because another claim of this filter sits behind them
-    culledFaces: TLAYER.culled ?? 0, fullyInside: TLAYER.enclosed ?? 0, faceCull: !!S.timeCull,
-    dedupedClaims: TLAYER.deduped ?? 0, grow: S.timeGrow,
+    culledFaces: TLAYER.culled ?? 0, fullyInside: TLAYER.enclosed ?? 0,
+    faceCull: S.timeCull,            // 0 off, 1 as of the second the claim stands (default), 2 whole filter
+    dedupedClaims: TLAYER.deduped ?? 0, dedupeMode: TLAYER.dedupeMode ?? false, grow: S.timeGrow,
     geomMbCap: S.timeGeomMb,
     markerGeoMb: TLAYER.mesh ? +(TLAYER.mesh.geometry.attributes.position.array.byteLength
       / 1048576).toFixed(1) : 0,
@@ -6836,7 +6938,8 @@ window.__world = {
     bytes: TLAYER.mesh ? TLAYER.mesh.geometry.attributes.position.array.byteLength + TLAYER.mesh.geometry.index.array.byteLength : 0,
   }),
   timeLoad, timeRebuild, timeApply, timeGoto, timePermille, timeSeekRow, timeRowAt, setTime, setTimePlay, timeNote,
-  setTimeLook, blockNameIds, askAt, timeHitAt, timeHitProbe, timeRowWorld, timeDrawnAt,
+  markerHits,
+  setTimeLook, blockNameIds, askAt, timeHitAt, timeHitProbe, timeMarkerBox, timeRowWorld, timeDrawnAt,
   hover: () => ({ ...HOVER, setting: !!S.hover, playheadPick: !!S.timePick,
     everyMs: S.hoverMs, clickRayMs: TLAYER.hitMs }),
   pickWorld: (x = innerWidth / 2, y = innerHeight / 2) => pickWorld(x, y),
