@@ -6,6 +6,7 @@ import { AssetIndex, defaultJars } from '../server/asset-index.mjs';
 import { ModelResolver, bakeApply } from '../server/model-resolve.mjs';
 import { FACE_INFO } from '../shared/faces.mjs';
 import { cubeArmCodes, cubeFaceUV, decodeFaceCode, CANON_RING, RING_ORDER } from '../shared/cube-path.mjs';
+import { needJars } from './needs.mjs';
 
 const SERVER_ROOT = process.env.SERVER_ROOT ?? 'DarkRPG';
 const VANILLA_JAR = process.env.VANILLA_JAR ??
@@ -51,7 +52,7 @@ test('full cube: stone bakes weighted variants, each 6 outward faces', () => {
   }
 });
 
-test('mod models may parent off vanilla models (bare parent = minecraft namespace)', () => {
+test('mod models may parent off vanilla models (bare parent = minecraft namespace)', { skip: needJars() }, () => {
   for (const m of ['mythicmetals:block/unobtainium_block', 'darkblades:block/dark_ore']) {
     const mod = R.model(m);
     assert.ok(mod, `${m} missing`);
@@ -154,7 +155,7 @@ test('water falls back to a cube (its model has no elements)', () => {
   assert.deepEqual(q.map(x => x.d).sort(), [0, 1, 2, 3, 4, 5]);
 });
 
-test('modded blockstates resolve to real geometry, not cube fallbacks', () => {
+test('modded blockstates resolve to real geometry, not cube fallbacks', { skip: needJars() }, () => {
   const names = ['darkblades:dark_ore', 'mythicmetals:unobtainium_block'];
   for (const n of names) {
     assert.ok(R.blockstate(n), `${n} has no blockstate in this pack`);

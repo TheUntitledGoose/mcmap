@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { envArgs } from '../shared/envargs.mjs';
 import { WORLDD_FLAGS } from '../server/worldd-flags.mjs';
+import { needPacks, needServer } from './needs.mjs';
 
 const read = (p) => fs.readFileSync(p, 'utf8').replace(/\r\n/g, '\n');
 const DOCKERFILE = read('Dockerfile');
@@ -55,7 +56,7 @@ test('WD_* variables become exactly the flags the server reads, and only those',
   }
 });
 
-test('the image ships the code and the packs the server refuses to run without', () => {
+test('the image ships the code and the packs the server refuses to run without', { skip: needPacks() }, () => {
   for (const dir of ['server/', 'shared/', 'tools/', 'web/']) {
     assert.ok(DOCKERFILE.includes(`COPY ${dir}`), `Dockerfile does not copy ${dir}`);
   }
@@ -100,7 +101,8 @@ test('the health check route exists in the server', () => {
   assert.ok(/['"]\/stats['"]/.test(SERVER), 'the /stats route the image health-checks is gone');
 });
 
-test('worldd boots from the environment with no command line, and refuses a WD_* that is not a flag', async () => {
+test('worldd boots from the environment with no command line, and refuses a WD_* that is not a flag',
+  { skip: needServer() }, async () => {
   const port = 8830 + (process.pid % 60);
   const env = {
     ...process.env,

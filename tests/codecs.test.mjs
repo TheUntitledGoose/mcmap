@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import zlib from 'node:zlib';
 import { ZipFile } from '../server/zip.mjs';
 import { decodePng, encodePngRgba, crc32, pixel } from '../server/png.mjs';
+import { needJars } from './needs.mjs';
 
 const VANILLA = process.env.VANILLA_JAR ?? 'your .minecraft/versions/1.20.1/1.20.1.jar';
 
@@ -52,7 +53,7 @@ test('png: encoder round-trips (all 5 filter types exercised by decoder path)', 
   assert.deepEqual(Buffer.from(back.rgba), rgba);
 });
 
-test('png: 32x32 mod texture decodes', () => {
+test('png: 32x32 mod texture decodes', { skip: needJars() }, () => {
   const z = new ZipFile('DarkRPG/mods/mythicmetals-0.19.7+1.20.1.jar');
   const name = [...z.names()].find(n => /textures\/.*\.png$/.test(n));
   assert.ok(name, 'has textures');
@@ -96,7 +97,7 @@ test('decodes an interlaced PNG and scatters the seven passes correctly', () => 
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) assert.deepEqual(pixel(img, x, y), px(x, y), `pixel ${x},${y}`);
 });
 
-test('decodes real interlaced mod textures', () => {
+test('decodes real interlaced mod textures', { skip: needJars() }, () => {
   const jar = fs.readdirSync('DarkRPG/mods').find(f => /^geode_plus/i.test(f));
   if (!jar) return;                                  // mod jar not present in this checkout
   const z = new ZipFile(`DarkRPG/mods/${jar}`);
