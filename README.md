@@ -13,8 +13,10 @@ Two rules decide the whole design:
 * **The page holds voxel truth, not pre-baked geometry.** That is why X-ray, block
   filters, per-player attribution and lighting are page-side features and not new bakes.
 
-Everything measured in this repo — every number in `HANDOFF.md` — came from a probe or a
-`build/dbg-*.mjs` script that is committed, so a claim can be re-run after a disk incident.
+Everything measured in this repo came from a probe or a `build/dbg-*.mjs` script that is committed, so a
+claim can be re-run after a disk incident. Each probe states its own framing and its own numbers in its
+header: the running measurement log and the milestone plan are kept out of this repository (see “What this
+is not”), so the scripts have to be self-contained.
 
 ---
 
@@ -28,6 +30,23 @@ Everything measured in this repo — every number in `HANDOFF.md` — came from 
   that is not ours to redistribute. `--world <dir>` is a flag, not a constant.
 * **Not an official renderer.** Textures and block models come out of *your own* 1.20.1
   client jar and the save's own mod jars. Nothing Mojang-owned is committed here.
+* **Not the working notes.** The measurement log and the milestone plan live on the working
+  machine and are git-ignored: they name real players and quote a private save's
+  coordinates in plain prose. Every number quoted here is reproducible from a committed
+  probe instead — that is why each `build/q_*.js` header states its framing, its command
+  line and its result.
+* **Not anyone else's personal data.** Untracked and git-ignored: the save (`world/`,
+  `playerdata/*.dat`, `level.dat` with its seed), the server logs (they carry player IP
+  addresses), the mod and Mojang jars, the payload cache, the baked packs, and the fetched
+  skin pack (`build/skins/` — faces belong to the players, and `tools/fetch-skins.mjs`
+  re-downloads them in seconds). The player handles that *do* appear in tests, probes and
+  comments are pseudonyms (`playerA`…`playerG`): `tools/pseudonymise.mjs` rewrites them
+  from a mapping that stays local (`.private/names.json`), and `tests/publish-clean.test.mjs`
+  fails if a real handle, or any of the above, reappears in the tracked set **or anywhere in
+  git history** — a push sends every commit, not just `HEAD`.
+* **`LICENSE` is a placeholder.** It says "the project authors" because only you can put your
+  own name or handle there. It covers this repository's code and nothing else: not Mojang's
+  assets (you bake those from a copy of the game you own), not a world save, not a skin.
 
 ---
 
@@ -317,7 +336,8 @@ row also has a URL parameter, so a view is a link:
 ?lodquality=60        how coarse the far world may get (100 = 16-block columns at the horizon)
 ?lodverts=4e6         the vertex budget the far layer is allowed to spend
 ?lodhide=0            submit baked tiles the coverage clip would kill entirely, instead of skipping
-                      them at the draw call (the skip is measured pixel-identical: see HANDOFF M17)
+                      them at the draw call (the skip is measured pixel-identical: `build/q_lodhidepix.js`
+                      re-runs that A/B, and `build/q_hide.js` says why one tile is or is not skipped)
 ?ledger=1             block-history overlay; ?ledgerwho=, ?ledgercls=, ?ledgermin=
 ?time=1               the time machine; ?timecls=2 (kind), ?timeplay=0 (paused),
                       ?timelook=blocks|plates|tiles, ?timegeommb=384 (the ceiling a block-shaped
@@ -464,15 +484,18 @@ node tools/mprobe.mjs --shot N url          # A/B two URLs by pixel band differe
 
 Visual correctness here is proved numerically: framebuffer A/B, pixel-band diffs, and
 `readPixels` probes in the same sRGB/linear space three.js uses. Screenshots are for
-looking, not for deciding. `HANDOFF.md` "Gotchas" is the list of traps already paid for
-(atlas UV is top-down, GL rows are bottom-origin, index buffers are `geometry.index` and
-not an attribute, empty batch frames are meaningful, byte figures must name their kind).
+looking, not for deciding. The traps already paid for are written where they bite: in the code comments and
+in the header of the probe that found them (atlas UV is top-down, GL rows are bottom-origin, index buffers
+are `geometry.index` and not an attribute, empty batch frames are meaningful, byte figures must name their
+kind).
 
 ---
 
 ## Open work
 
-`PLAN.md` holds the milestone table; `HANDOFF.md` §6 holds what is actually next.
+The milestone plan and the running measurement log are local-only here (see “What this is not”); start from
+this file and the probe scripts, and `node build/q_health.js` for a one-shot check that the server, the
+packs and the page all still answer.
 
 * **M7** modded correctness pass (multipart fences/walls/panes/rails, translucent
   sorting, water/glass edges, tints). Parked until it shows a visible problem.

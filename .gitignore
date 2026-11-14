@@ -43,3 +43,7 @@ PLAN.md
 # the pre-underFar copy of the page, kept once to recover web/js/main.js (commit 3475dd5). Recovery net,
 # not source: the live page is web/js/main.js.
 main.js
+
+# Real player handles for this private save. Never publish this: the code, the probes and the docs
+# use "player A".."player G" instead (tools/pseudonymise.mjs).
+.private/

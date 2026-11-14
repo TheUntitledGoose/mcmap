@@ -16,6 +16,8 @@
     "ledger:export": "python tools/ledger-export.py",
     "bake:ledger": "node server/bake-ledger.mjs",
     "cache:prune": "node tools/cache-prune.mjs",
+    "publish:tree": "node tools/publish.mjs --git",
+    "names:check": "node tools/pseudonymise.mjs --check",
     "bake": "npm run census && npm run pack:assets && npm run bake:shells && npm run bake:lod",
     "bake:ledger:full": "npm run ledger:export && npm run bake:ledger",
     "probe": "node tools/probe.mjs DarkRPG/world",
