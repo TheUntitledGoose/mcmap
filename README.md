@@ -1,5 +1,41 @@
 # worldd — a browser map viewer for a modded Minecraft Java save
 
+> [!IMPORTANT]
+> This entire repo is AI-generated. I have been making projects by hand for my life, but this one is a fully AI repo. If there are any issues, that is to be expected.
+
+Qwen3.8, the author pretty much, is VERY verbose, as such all the settings have incredibly long tooltips and the settings menu is very full of debugging information. I've tried to condense down the settings to only the more so useful settings but it's still very... verbose.
+
+Also as my "test world" I used a friends "DarkRPG" and because of that a lot of terminology refers to it; it's just a world name.
+
+# How to use
+
+The world rendering is more or less optimized, still slower than I'd liked, so it'll take a bit for new chunks to generate a mesh, give it a second or 5. 
+
+Main settings are open and are self-explanatory.
+- Mesh unlit caves is the biggest FPS regulator and it decides how much of the world to mesh. With it on the caves and dark areas are meshed.
+
+## The only other tab you're gonna use
+
+The "who placed this" is a time machine pretty much. The only useful settings are "kind of action", "whose action", "replay which action", and "undo the log".
+- The first 3 are self-explanatory and you can click around to see what they do
+- "undo the log" undo's the meshing of the most recent world where it tries it's best to restore the world to it's initial state before all block placing.
+
+---
+
+> [!CAUTION]
+> AI Slop ahead
+
+### I had pretty much no word or opinion in any further text, the only part I oversaw was the installation, so your mileage may vary. 
+
+
+TL;DR is you need a minecraft world folder to render the world in it's almost entirety for it to extract textures and block data. You also need the .jar file for the Minecraft version to rip it's assets. Something something copyright, i will not share files blah blah.
+
+----
+
+---
+
+---
+
 Point it at a live server root (`world/` plus its `mods/`), bake once, and a whole
 dimension renders in a WebGL2 page: the entire overworld at once, plus the nether, the
 end and any custom dimension folder the save has. Walk it in first person, or fly it in
@@ -17,39 +53,6 @@ Everything measured in this repo came from a probe or a `build/dbg-*.mjs` script
 claim can be re-run after a disk incident. Each probe states its own framing and its own numbers in its
 header: the running measurement log and the milestone plan are kept out of this repository (see “What this
 is not”), so the scripts have to be self-contained.
-
----
-
-## What this is not
-
-* **Not a static site.** The page needs `worldd` (Node) next to the save: chunk payloads,
-  shell/LOD packs, coverage and ledger queries are all served requests. Serving `web/`
-  from nginx alone gets you a blank canvas.
-* **Not a git checkout of your world.** `DarkRPG/` (the save, the mod jars, the crash
-  logs, the copy of the Mojang client jar) is **ignored and untracked**: 3.6 GB of data
-  that is not ours to redistribute. `--world <dir>` is a flag, not a constant.
-* **Not an official renderer.** Textures and block models come out of *your own* 1.20.1
-  client jar and the save's own mod jars. Nothing Mojang-owned is committed here.
-* **Not the working notes.** The measurement log and the milestone plan live on the working
-  machine and are git-ignored: they name real players and quote a private save's
-  coordinates in plain prose. Every number quoted here is reproducible from a committed
-  probe instead — that is why each `build/q_*.js` header states its framing, its command
-  line and its result. Sentences elsewhere in the code and in the probe comments that point
-  at `HANDOFF.md` or `PLAN.md` point at those local notes; the scripts that spliced them
-  (`build/mk_*.cjs`) are kept anyway, because they show how the code and the record changed
-  together.
-* **Not anyone else's personal data.** Untracked and git-ignored: the save (`world/`,
-  `playerdata/*.dat`, `level.dat` with its seed), the server logs (they carry player IP
-  addresses), the mod and Mojang jars, the payload cache, the baked packs, and the fetched
-  skin pack (`build/skins/` — faces belong to the players, and `tools/fetch-skins.mjs`
-  re-downloads them in seconds). The player handles that *do* appear in tests, probes and
-  comments are pseudonyms (`playerA`…`playerG`): `tools/pseudonymise.mjs` rewrites them
-  from a mapping that stays local (`.private/names.json`), and `tests/publish-clean.test.mjs`
-  fails if a real handle, or any of the above, reappears in the tracked set **or anywhere in
-  git history** — a push sends every commit, not just `HEAD`.
-* **`LICENSE` is a placeholder.** It says "the project authors" because only you can put your
-  own name or handle there. It covers this repository's code and nothing else: not Mojang's
-  assets (you bake those from a copy of the game you own), not a world save, not a skin.
 
 ---
 
