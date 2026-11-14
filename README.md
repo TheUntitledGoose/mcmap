@@ -203,8 +203,17 @@ Three things that only go wrong in Portainer, not in `docker compose`:
   block and keep `image:`.
 * **A relative bind source resolves next to the stack, not next to this file.** If `/data/DarkRPG/world`
   is empty inside the container (`docker exec mcmap ls /data/DarkRPG/world` is the ten-second check, and
-  `/stats` reporting `decodes: 0` forever is the symptom), write the host path out in full:
-  `source: /srv/minecraft/DarkRPG`.
+  `/stats` reporting `decodes: 0` forever is the symptom), do not edit the yaml — set the stack's two
+  environment variables to absolute host paths and redeploy:
+
+  | Variable | What it is | Example |
+  |---|---|---|
+  | `MCMAP_SAVE` | the folder containing `world/` | `/srv/mcmap/DarkRPG` |
+  | `MCMAP_PACKS` | a directory holding `assets/ shells/ lods/ ledger/` | `/srv/mcmap/packs` |
+
+  Both fall back to paths beside the compose file, which is why `docker compose up` on the machine that
+  baked everything still needs no arguments. The packs are what the image cannot carry: they are derived
+  and git-ignored, so build the image from the repo and mount the packs.
 
 **The packs are not in git — so get them in one of two ways.** A clone of this repository has
 `build/assets/` and friends as empty keep files: the directories exist so the image build never dies in

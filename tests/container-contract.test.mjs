@@ -102,6 +102,10 @@ test('the stack mounts the save read-only and names the same paths the image def
     const flag = n.slice(3).toLowerCase().replace(/_/g, '-');
     assert.ok(WORLDD_FLAGS.includes(flag), `${n} is not a worldd flag (${flag})`);
   }
+  // Portainer resolves a relative bind source next to its OWN stack directory, so the host paths must
+  // be settable without editing the file: two interpolations, set in the stack's environment table.
+  assert.ok(COMPOSE.includes('${MCMAP_SAVE:'), 'the save path cannot be given as an absolute host path');
+  assert.ok(COMPOSE.includes('${MCMAP_PACKS:'), 'the pack path cannot be given as an absolute host path');
   // The health check must outlast the boot cache sweep, which over a large cache takes minutes.
   const sp = /start_period:\s*(\d+)s/.exec(COMPOSE);
   assert.ok(sp && Number(sp[1]) >= 120, 'healthcheck start_period is shorter than the boot sweep can take');

@@ -12,9 +12,14 @@
 #      image on a machine that holds the save and your own jars, or mount them read-only: see the
 #      `volumes:` block below, whose target paths are exactly the paths the server reads by default.
 #
-# The bind source below is relative (./DarkRPG), which Portainer resolves next to the stack's own
-# files, not next to this yaml. If /data/DarkRPG/world comes up empty in the container, make the
-# source an absolute host path: source: /srv/minecraft/DarkRPG.
+# On Portainer, set the two host paths in the stack's "Environment variables" table rather than editing
+# this file (a relative bind source is resolved next to Portainer's own stack directory, not next to here):
+#
+#   MCMAP_SAVE=/srv/mcmap/DarkRPG      the folder that contains world/
+#   MCMAP_PACKS=/srv/mcmap/packs       assets/ shells/ lods/ ledger/, baked once with npm run bake
+#
+# Both default to paths beside this file, so `docker compose up` on the machine that baked everything
+# still needs no arguments.
 #
 # If the host has no copy of the save, the container still comes up and serves the baked far layers
 # and the action history, but /voxels 404s and the browser shows holes where detail should be.
@@ -59,39 +64,43 @@ services:
       WD_HEARTBEAT: "60"
 
     volumes:
-      # THE SAVE. Read-only: the renderer never writes to a world. Point this at wherever the
-      # folder containing world/ (and playerdata/, region/) lives.
+      # THE SAVE. Read-only: the renderer never writes to a world. Two ways to say where it is:
+      # set MCMAP_SAVE to an ABSOLUTE host path in Portainer's stack "Environment variables" table
+      # (recommended - a relative path is resolved next to Portainer's own stack directory, not next
+      # to this file), or leave it alone and keep a DarkRPG/ folder beside the compose file.
+      #   MCMAP_SAVE=/srv/mcmap/DarkRPG
       - type: bind
-        source: ./DarkRPG
+        source: ${MCMAP_SAVE:-./DarkRPG}
         target: /data/DarkRPG
         read_only: true
       # The payload cache. A named volume survives redeploys; delete it whenever you like.
       - mcmap-cache:/data/cache
 
-      # PACKS, only if the image was built from a clone (then build/assets holds a keep file and nothing
-      # else). Mount each baked pack at the path worldd already reads — that is why no WD_* has to change.
-      # Copy these four directories off the machine that baked them (~168 MB; build/cache is NOT one of
-      # them, it is regenerated per container):
-      #
-      #   - type: bind
-      #     source: /srv/mcmap/packs/assets
-      #     target: /srv/app/build/assets
-      #     read_only: true
-      #   - type: bind
-      #     source: /srv/mcmap/packs/shells
-      #     target: /srv/app/build/shells
-      #     read_only: true
-      #   - type: bind
-      #     source: /srv/mcmap/packs/lods
-      #     target: /srv/app/build/lods
-      #     read_only: true
-      #   - type: bind
-      #     source: /srv/mcmap/packs/ledger
-      #     target: /srv/app/build/ledger
-      #     read_only: true
-      #
-      # A missing asset pack stops the boot, and the log names the path. A missing shell/LOD/ledger pack
-      # does not: the page then has no far layers and no action history, which is a hole you can see.
+      # THE PACKS. The image is built from this repository, so it carries keep files instead of packs:
+      # mount a baked pack tree at the paths worldd already reads, and no WD_* has to change. Point
+      # MCMAP_PACKS at a directory holding assets/, shells/, lods/, ledger/ (about 167 MB once extracted;
+      # build/cache is NOT one of them - it is regenerated per container):
+      #   MCMAP_PACKS=/srv/mcmap/packs
+      # Leave it unset and the mounts land next to the stack, empty, and the boot log says so:
+      #   shell packs: nothing at /srv/app/build/shells — mount a pack (WD_PACKS) or run node server/bake-shells.mjs
+      # A missing ASSET pack stops the boot on purpose; a missing shell/LOD/ledger pack does not, it just
+      # leaves no far layers / no action history, which is a hole you can see rather than a crash.
+      - type: bind
+        source: ${MCMAP_PACKS:-./packs}/assets
+        target: /srv/app/build/assets
+        read_only: true
+      - type: bind
+        source: ${MCMAP_PACKS:-./packs}/shells
+        target: /srv/app/build/shells
+        read_only: true
+      - type: bind
+        source: ${MCMAP_PACKS:-./packs}/lods
+        target: /srv/app/build/lods
+        read_only: true
+      - type: bind
+        source: ${MCMAP_PACKS:-./packs}/ledger
+        target: /srv/app/build/ledger
+        read_only: true
 
     healthcheck:
       # Portainer's compose loader rejects a bare exec array here and wants the first word to say how
