@@ -13,7 +13,6 @@ build/*
 !build/mk_*.cjs
 !build/panel_layout.txt
 !build/spec_*.json
-!build/doc_*.md
 !build/*.mjs
 # The skin pack is derived (tools/fetch-skins.mjs pulls faces from Mojang) and stays out of git, but the
 # DIRECTORY is tracked by a keep file: the image's `COPY build/skins/` must not fail on a machine that has
@@ -33,3 +32,14 @@ DarkRPG/
 
 # deploy/ is what tools/deploy-pack.mjs stages for shipping; derived, and huge if you let it be.
 deploy/
+
+# The working notes. HANDOFF.md and PLAN.md are how every number in this project was produced and what was
+# tried in which order - and they name real players and quote a private save's coordinates, so they stay on
+# this machine and out of anything published. The probe scripts under build/ carry their own context, so a
+# number can still be re-measured without the notes; tools/publish.mjs builds a publishable tree from the
+# tracked files, which is why "tracked" is the thing that decides what leaves this box.
+HANDOFF.md
+PLAN.md
+# the pre-underFar copy of the page, kept once to recover web/js/main.js (commit 3475dd5). Recovery net,
+# not source: the live page is web/js/main.js.
+main.js
