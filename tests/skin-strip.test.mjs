@@ -145,3 +145,36 @@ test('a manifest that changed under a running server is picked up', () => {
   assert.equal(b.strip.columns, 3);                    // two players + white
   writeManifest(MANIFEST);
 });
+
+test('a manifest written on Windows still resolves on Linux, and reports portable paths', () => {
+  // This one cost faces in production: build/skins/manifest.json carried `textures<sep><hash>.png` because
+  // an early run inherited a path.join value. On the Linux server that is a single file name containing a
+  // backslash, so every skin answered "not on disk" and the cast stood tinted - with no error, just a
+  // panel line saying "0 players, without a skin: everyone".
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'skins-sep-'));
+  try {
+    fs.mkdirSync(path.join(d, 'textures'), { recursive: true });
+    fs.writeFileSync(path.join(d, 'textures', 'a.png'), fakeSkin(7));
+    fs.writeFileSync(path.join(d, 'textures', 'b.png'), fakeSkin(9));
+    const nativeA = path.join('textures', 'a.png');   // backslash on Windows, slash on Linux
+    const backA = 'textures' + String.fromCharCode(92) + 'b.png';
+    fs.writeFileSync(path.join(d, 'manifest.json'), JSON.stringify({
+      generated: 1, world: 'x/world', source: 'mojang',
+      skins: [
+        { uuid: 'u1', name: 'One', hash: 'a', texture: nativeA },
+        { uuid: 'u2', name: 'Two', hash: 'b', texture: backA },
+      ],
+    }));
+    const { pack, why } = readSkinPack(d);
+    assert.equal(why, null, why);
+    assert.equal(pack.list.length, 2, `both skins must resolve; missing=${JSON.stringify(pack.missing)}`);
+    assert.deepEqual(pack.missing, []);
+    const BS = String.fromCharCode(92);
+    for (const f of pack.list.map((x) => x.file)) {
+      assert.ok(!f.includes(BS), `the reported path must be portable, got ${f}`);
+    }
+    assert.deepEqual(pack.list.map((x) => x.file), ['textures/a.png', 'textures/b.png']);
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});

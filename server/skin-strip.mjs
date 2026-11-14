@@ -32,7 +32,11 @@ export function readSkinPack(dir) {
   const missing = [];
   for (const s of man.skins || []) {
     if (!s.texture) { if (s.name) missing.push({ name: s.name, why: s.noProfile ? 'no Mojang profile' : 'no texture recorded' }); continue; }
-    const p = path.join(dir, s.texture);
+    // The manifest is portable data, but a pack baked on Windows can arrive with `textures\<hash>.png`.
+    // On Linux that is one file name with a backslash in it, so every skin reads as "not on disk" and the
+    // cast stands tinted with no error anywhere. Split on either separator before resolving.
+    const rel = String(s.texture).split(/[\\/]+/).filter(Boolean);
+    const p = path.join(dir, ...rel);
     if (!fs.existsSync(p)) { missing.push({ name: s.name || s.uuid, why: `${s.texture} is not on disk` }); continue; }
     let png;
     try { png = decodePng(fs.readFileSync(p)); }
@@ -43,7 +47,9 @@ export function readSkinPack(dir) {
     }
     list.push({
       name: s.name || null, uuid: s.uuid || null, slim: !!s.slim, hash: s.hash || null,
-      file: s.texture, w: png.w, h: png.h, rgba: png.rgba,
+      // `file` travels to /skins/strip.json, so it is reported in the separator the manifest should have
+      // used, not the one it happened to arrive with.
+      file: rel.join('/'), w: png.w, h: png.h, rgba: png.rgba,
     });
   }
   return { pack: { generated: man.generated || null, world: man.world || null, source: man.source || null, list, missing }, why: null };

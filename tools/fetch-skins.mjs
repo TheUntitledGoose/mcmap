@@ -139,7 +139,10 @@ async function main() {
   const manifestPath = path.join(OUT, 'manifest.json');
   const prev = (() => { try { return JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch { return { skins: [] }; } })();
   const byUuid = new Map((prev.skins || []).map((s) => [s.uuid, s]));
-  const have = (s) => s && s.texture && fs.existsSync(path.join(OUT, s.texture));
+  // `texture` is portable data: forward slashes always, whatever this machine's separator is, because a
+  // pack made here is served on a Linux box. Re-runs inherit old entries, so normalise on read too.
+  const relOf = (t) => String(t).split(/[\\/]+/).filter(Boolean).join('/');
+  const have = (s) => s && s.texture && fs.existsSync(path.join(OUT, ...relOf(s.texture).split('/')));
 
   // UUIDs the save knows, with any ledger name that resolves to the same id.
   const nameById = new Map();
@@ -188,7 +191,7 @@ async function main() {
           from = 'client-cache';
           if (!clientCacheCopy(hash, dest)) {
             const e = { uuid, name: p.json.name, hash, slim: skin.metadata?.model === 'slim',
-              url: skin.url, texture: old?.texture || null, downloadFailed: true };
+              url: skin.url, texture: old?.texture ? relOf(old.texture) : null, downloadFailed: true };
             byUuid.set(uuid, e); report.failed++; continue;
           }
         } else {
