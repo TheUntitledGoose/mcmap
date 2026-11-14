@@ -71,5 +71,5 @@ console.log('  largest:');
 for (const [n, f] of biggest.slice(0, 6)) console.log(`    ${(n / 1024).toFixed(0).padStart(6)} KB  ${f}`);
 console.log(`
 next:
-  cd "${DEST}" && cp -r <this repo>/node_modules . && npm test     # 505+ tests, no network
+  cd "${DEST}" && cp -r <this repo>/node_modules . && npm test     # 510 here, 387 with honest skips on a clone; no network
   gh repo create mcmap --public --source . --push                  # or your own remote + push`);

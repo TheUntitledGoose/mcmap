@@ -34,7 +34,10 @@ is not”), so the scripts have to be self-contained.
   machine and are git-ignored: they name real players and quote a private save's
   coordinates in plain prose. Every number quoted here is reproducible from a committed
   probe instead — that is why each `build/q_*.js` header states its framing, its command
-  line and its result.
+  line and its result. Sentences elsewhere in the code and in the probe comments that point
+  at `HANDOFF.md` or `PLAN.md` point at those local notes; the scripts that spliced them
+  (`build/mk_*.cjs`) are kept anyway, because they show how the code and the record changed
+  together.
 * **Not anyone else's personal data.** Untracked and git-ignored: the save (`world/`,
   `playerdata/*.dat`, `level.dat` with its seed), the server logs (they carry player IP
   addresses), the mod and Mojang jars, the payload cache, the baked packs, and the fetched
@@ -463,10 +466,10 @@ MB kept getting flat tiles after the replay was repriced as blocks). The panel b
 ## Tests and measurement
 
 ```bash
-npm test                # 505 tests: formats, codecs, stores, mesher, lighting, collision, deployment contract,
-                        # pool split, ledger, time machine (incl. what a pick may answer and what one
-                        # voxel may draw), region coverage, remembered settings, the loading bar's
-                        # promise, HTTP endpoints
+npm test                # 510 tests here: formats, codecs, stores, mesher, lighting, collision, deployment
+                        # contract, pool split, ledger, time machine (incl. what a pick may answer and what
+                        # one voxel may draw), region coverage, remembered settings, the loading bar's
+                        # promise, HTTP endpoints, what may be published
 npm run test:fast       # the logic layers, a few seconds
 node tools/browser-probe.mjs "http://127.0.0.1:8765/?goto=102,119,49&dist=20&res=1&noautores&bar=0&ms=2600&ablod&ablodhide" \
     --wait 14000 --eval-file build/q_fps.js      # fps per state, with three's submitted call/triangle counts
@@ -482,9 +485,19 @@ node tools/browser-probe.mjs "http://127.0.0.1:8765/?goto=-8,126,90&dist=25&time
 node tools/mprobe.mjs --shot N url          # A/B two URLs by pixel band difference
 ```
 
-Visual correctness here is proved numerically: framebuffer A/B, pixel-band diffs, and
-`readPixels` probes in the same sRGB/linear space three.js uses. Screenshots are for
-looking, not for deciding. The traps already paid for are written where they bite: in the code comments and
+The suite has two halves. Formats, policies and the mesher out of synthetic bytes run anywhere. The other
+half asks questions about a real save — "does a body stand on a floor", "does the cache re-serve identical
+bytes", "which faces does the mesher cull for the baked glass rules" — and needs data that is not in git:
+the save, and packs baked from your own 1.20.1 jar. `tests/needs.mjs` decides which half can run, so a fresh
+clone reports a green result with honest skips (measured: 387 tests, 340 pass, 47 skipped, each naming what
+to bake) instead of failures that look like bugs; with a save and baked packs present it is the full 510.
+
+`node tools/publish.mjs --git` builds a publishable tree from exactly what git tracks, after checking that no
+real player handle and none of the un-publishable paths are in the tracked set **or anywhere in history**, and
+gives the result its own single commit.
+
+Visual correctness here is proved numerically: framebuffer A/B, pixel-band diffs, and `readPixels` probes in
+the same sRGB/linear space three.js uses. Screenshots are for looking, not for deciding. The traps already paid for are written where they bite: in the code comments and
 in the header of the probe that found them (atlas UV is top-down, GL rows are bottom-origin, index buffers
 are `geometry.index` and not an attribute, empty batch frames are meaningful, byte figures must name their
 kind).
