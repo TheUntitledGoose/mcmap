@@ -36,6 +36,9 @@ services:
       WD_LODS: /srv/app/build/lods
       WD_LEDGER: /srv/app/build/ledger
       WD_ASSETS: /srv/app/build/assets
+      # Skins are the one optional pack: no build/skins in the image and the cast stands tinted, which is
+      # a visible answer in the panel rather than a broken one.
+      WD_SKINS: /srv/app/build/skins
       # A request slower than this is logged with its route, so you can see what is slow from the
       # container log instead of the browser.
       WD_SLOW_MS: "400"

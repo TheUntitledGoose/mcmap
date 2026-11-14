@@ -5,18 +5,30 @@
 // gaps). This file only answers "given those bodies, what do I hand the GPU, and what do I write next to
 // them". Two rules hold it honest:
 //
-//   - A body is a STAND-IN. There are no player skins in this build: the client jar holds no per-player
-//     skin and the viewer does not go to the network for one. So the figure is a blocky silhouette in
-//     the player's colour, and every label says what the evidence was.
+//   - The figure is the Minecraft player model, in the exact sizes the model is built in: head 8x8x8,
+//     torso 8x12x4, arms 4x12x4 (3 wide for a slim skin), legs 4x12x4, stacked to 32 px = 2.0 blocks
+//     (shared/skinlayout.mjs). That is NOT the 0.6 x 1.8 the walking physics uses, and both numbers are
+//     right: the hitbox is shorter than the model because the head pokes above it.
+//   - A skin is data the SERVER has, never something the page fetches from the internet. tools/fetch-skins.mjs
+//     asks Mojang once, on a machine with network, and writes build/skins/. The page reads /skins/.
+//     A player with no entry there still stands: same geometry, their own colour instead of a texture.
 //   - The hedge travels with the body. `seat` ('ground' / 'float' / 'unknown' / 'near') says how much of
 //     the feet position was inferred, and `bodyLabel` puts that in the text next to the body rather than
 //     in a tooltip nobody opens.
 import { bodiesAt, seatOf, trackOf, nearestVisit, RUN_GAP_SEC } from '../../shared/ghosts.mjs';
-import { C_FULL, C_PASS } from '../../shared/player.mjs';
+import { C_FULL, C_PASS, BODY as HITBOX } from '../../shared/player.mjs';
+import { bodyMesh, modelBox, PX, MODEL_H } from '../../shared/skinlayout.mjs';
 
-/** A player is 1.8 blocks tall and 0.6 wide in Minecraft; the silhouette keeps both. */
-export const BODY_H = 1.8;
-export const BODY_W = 0.6;
+/**
+ * The physics answer, unchanged: what a walking body occupies and what a ray must clear. 0.6 x 1.8, with
+ * the eye at 1.62. Kept as the name `BODY_H`/`BODY_W` because the sight probe (`BODY_SEE`) and the click
+ * box are all keyed to it.
+ */
+export const BODY_H = HITBOX.h;
+export const BODY_W = HITBOX.w;
+
+/** What the DRAWN figure is: 32 texture pixels of model, feet at the block above the floor. */
+export { MODEL_H, modelBox };
 
 /**
  * Deterministic colour per timeline player index, in LINEAR rgb (three.js vertex colours are linear
@@ -163,28 +175,48 @@ const box = (pos, col, x0, y0, z0, x1, y1, z1, rgb) => {
  * One buffer for every body on screen, in world block coordinates like every other ledger layer.
  * `per` records the triangle range of each body so the page can say which body a ray hit without
  * raycasting six meshes.
+ *
+ * `skinOf(player)` returns `{column, slim}` (that person's slot in the server's skin strip) or null. A
+ * null answer is NOT a different figure: the body is cut from the same twelve boxes and its UVs point at
+ * the strip's white end column, so the vertex colours below paint it instead of a texture. One geometry
+ * kind, one draw call per body either way, and "this player has no skin" stays a material answer rather
+ * than a second code path that can drift.
+ *
+ * `columns` is the width of the skin strip in 64-px cells, including that white cell, because a UV is only
+ * meaningful against the texture it is going to sample.
  */
-export function bodyGeom(bodies, { h = BODY_H, w = BODY_W } = {}) {
-  const pos = [], col = [];
+export function bodyGeom(bodies, { skinOf = null, overlay = true, columns = 1, whiteColumn = 0 } = {}) {
+  const pos = [], col = [], uv = [];
   const per = [];
   for (const b of bodies) {
     if (b.absent) continue;
+    const skin = skinOf ? skinOf(b.player) : null;
+    const m = bodyMesh({
+      slim: !!skin?.slim, overlay,
+      column: skin ? skin.column : whiteColumn,
+      texW: 64 * columns, texH: 64,
+    });
     const start = pos.length / 3;
     const tint = tintOf(b.player);
     const dark = tint.map((v) => v * 0.55);
     const light = tint.map((v) => Math.min(1, v * 1.25 + 0.05));
     const x = b.x + 0.5, z = b.z + 0.5, fy = b.y;           // feet on the block above the floor
-    const half = w / 2;
-    box(pos, col, x - half, fy, z - half, x - 0.05, fy + 0.8 * h / 1.8, z + half, dark);   // leg L
-    box(pos, col, x + 0.05, fy, z - half, x + half, fy + 0.8 * h / 1.8, z + half, dark);   // leg R
-    box(pos, col, x - half, fy + 0.8 * h / 1.8, z - 0.21, x + half, fy + 1.35 * h / 1.8, z + 0.21, tint); // torso
-    box(pos, col, x - half - 0.18, fy + 0.82 * h / 1.8, z - 0.16, x - half, fy + 1.33 * h / 1.8, z + 0.16, tint);
-    box(pos, col, x + half, fy + 0.82 * h / 1.8, z - 0.16, x + half + 0.18, fy + 1.33 * h / 1.8, z + 0.16, tint);
-    box(pos, col, x - 0.26, fy + 1.35 * h / 1.8, z - 0.26, x + 0.26, fy + h, z + 0.26, light); // head
-    per.push({ player: b.player, from: start, to: pos.length / 3, x, y: fy, z });
+    for (let i = 0; i < m.pos.length; i += 3) {
+      pos.push(x + m.pos[i], fy + m.pos[i + 1], z + m.pos[i + 2]);
+      if (skin) { col.push(1, 1, 1); continue; }   // the texture IS the colour: multiply by white
+      // Same shading the stand-in had, read off the model instead of off a made-up box: legs dark, torso
+      // and arms the player's colour, head light.
+      const ypx = m.pos[i + 1] * PX;
+      const c = ypx >= 24 ? light : ypx >= 12 ? tint : dark;
+      col.push(c[0], c[1], c[2]);
+    }
+    for (let i = 0; i < m.uv.length; i += 2) uv.push(m.uv[i], m.uv[i + 1]);
+    // `slim` travels with the body because the box around a person, and the tag over their head, have to
+    // fit the model that is actually drawn: 16px across with 4px arms, 14px with the 3px slim arms.
+    per.push({ player: b.player, from: start, to: pos.length / 3, x, y: fy, z, skinned: !!skin, slim: !!skin?.slim });
   }
   return {
-    pos: new Float32Array(pos), col: new Float32Array(col),
+    pos: new Float32Array(pos), col: new Float32Array(col), uv: new Float32Array(uv),
     verts: pos.length / 3, tris: pos.length / 9, per,
   };
 }

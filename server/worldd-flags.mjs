@@ -9,6 +9,6 @@
  */
 export const WORLDD_FLAGS = [
   'world', 'assets', 'cache', 'web', 'vendor', 'ledger', 'port', 'host',
-  'packs', 'lods', 'cache-max-gb', 'cache-keep-h', 'cache-sweep', 'cache-reconcile',
+  'packs', 'lods', 'skins', 'cache-max-gb', 'cache-keep-h', 'cache-sweep', 'cache-reconcile',
   'slow-ms', 'heartbeat',
 ];

@@ -42,18 +42,25 @@ COPY build/assets/ ./build/assets/
 COPY build/shells/ ./build/shells/
 COPY build/lods/ ./build/lods/
 COPY build/ledger/ ./build/ledger/
+# Player skins, if this build machine fetched them (tools/fetch-skins.mjs writes build/skins/). Optional in
+# a way the packs above are not: with no manifest the server says so on /meta and the cast stands in its
+# own band colours. The directory is tracked by an empty keep file so this COPY never fails on a clone.
+COPY build/skins/ ./build/skins/
 
 # Preflight, with the sentence that tells you what to do rather than a stack of missing paths. The
 # packs are derived data and git-ignored: a clone of this repo has no build/assets at all, and a
 # container that starts without them serves a world with holes where the far layers should be.
 RUN node -e "const fs=require('fs');const need=['build/assets/atlas.json','build/assets/geometry.bin','build/assets/atlas.png'];const miss=need.filter(f=>!fs.existsSync(f));if(miss.length){console.error('image is missing '+miss.join(', '));console.error('the packs are derived, not committed: run \'npm run bake\' (and \'npm run bake:ledger\' for the history) on a machine holding the save and the game jars, then build again');process.exit(1)}" \
  && node -e "const fs=require('fs');const d=['build/shells','build/lods','build/ledger'];for(const p of d){if(!fs.existsSync(p)){console.error('missing '+p+': bake it before building the image');process.exit(1)}const n=fs.readdirSync(p).filter(f=>fs.statSync(p+'/'+f).isFile()).length;if(!n){console.error(p+' is empty: bake it before building the image');process.exit(1)}console.log('pack '+p+': '+n+' files')}"
+# The skin pack is the one derived input that may legitimately be absent, so this reports instead of failing.
+RUN node -e "const fs=require('fs');const f='build/skins/manifest.json';const n=fs.existsSync(f)?JSON.parse(fs.readFileSync(f,'utf8')).skins.length:0;console.log(n?('pack build/skins: '+n+' players'):('pack build/skins: none (optional: the cast stands tinted; tools/fetch-skins.mjs fetches the pack once)'))"
 
 # The save is the one thing that must be told to the container. Everything else has a path inside
 # the image. WD_* variables are translated to worldd's own flags (shared/envargs.mjs): they show up
 # in Portainer's environment table, where a baked-in command line does not.
 ENV WD_WORLD=/data/DarkRPG/world \
     WD_CACHE=/data/cache \
+    WD_SKINS=/srv/app/build/skins \
     WD_CACHE_MAX_GB=6 \
     WD_HOST=0.0.0.0 \
     WD_PORT=8765

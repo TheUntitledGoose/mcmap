@@ -15,6 +15,12 @@ build/*
 !build/spec_*.json
 !build/doc_*.md
 !build/*.mjs
+# The skin pack is derived (tools/fetch-skins.mjs pulls faces from Mojang) and stays out of git, but the
+# DIRECTORY is tracked by a keep file: the image's `COPY build/skins/` must not fail on a machine that has
+# not fetched skins, because the pack is optional and its absence is a normal answer.
+!build/skins/
+build/skins/*
+!build/skins/.keep
 .cache/
 *.log
 .DS_Store

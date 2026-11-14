@@ -1,0 +1,14 @@
+const w = __world; const raf = () => new Promise((r) => requestAnimationFrame(r));
+const say = (k, v) => console.log(`P ${k} ${JSON.stringify(v)}`);
+for (let i = 0; i < 40; i++) await raf();
+const g = w.ghosts();
+const b = g.bodies.find((x) => x.x != null);
+say('body', b && [b.x, b.y, b.z]);
+say('projBody', w.project(b.x + 0.5, b.y, b.z + 0.5));
+say('projCrown', w.project(b.x + 0.5, b.y + 2.04, b.z + 0.5));
+say('projOrigin', w.project(0, 0, 0));
+say('inner', { w: innerWidth, h: innerHeight, dpr: devicePixelRatio });
+const gr = await w.grab();
+say('grab', { w: gr.w, h: gr.h, dpr: gr.dpr, len: gr.buf.length });
+say('hitCentre', w.ghostHit(Math.round(innerWidth / 2), Math.round(innerHeight / 2)));
+say('stateKeys', Object.keys(w.state || {}).slice(0, 40));

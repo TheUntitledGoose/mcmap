@@ -359,11 +359,16 @@ test('a change marker sorts itself against the world, and each person answers fo
   // What makes the sorted layer safe for people is that THEY answer per body, not as a layer.
   assert.match(bodyOf('ghostMats'), /ghostThruMat = new THREE\.MeshBasicMaterial/, 'the second body material went away');
   assert.match(bodyOf('ghostMats'), /ghostThruMat\.depthTest = false;/);
-  assert.match(bodyOf('ghostCut'), /new THREE\.Mesh\(geo, \[bodyMat, thruMat\]\)/,
+  assert.match(bodyOf('ghostCut'), /new THREE\.Mesh\(geo, \[bodyMat, thruMat, skinMat, skinThruMat\]\)/,
     'the people went back to one material for the whole layer');
   assert.match(bodyOf('ghostCut'), /geo\.groups = g\.per\.map/, 'and back to one draw range for the whole layer');
-  assert.match(bodyOf('ghostDepth'), /q\.materialIndex = b && b\.seen !== 'wall' \? 1 : 0;/,
-    'nobody decides per-body depth any more');
+  assert.match(bodyOf('ghostCut'), /skinned: !!q\.skinned/, 'the group must carry the skinned-ness its UVs were baked with');
+  assert.match(bodyOf('ghostDepth'),
+    /q\.materialIndex = \(q\.skinned \? 2 : 0\) \+ \(b && b\.seen !== 'wall' \? 1 : 0\);/,
+    'nobody decides per-body depth any more: the index answers skinned AND behind-a-wall. The skinned half '
+    + 'comes from the group, not the body object: a white vertex colour is what makes a TEXTURED body read '
+    + 'as skin, so pointing triangles baked with skin UVs at the untextured tinted material draws a white '
+    + 'silhouette - which is exactly what this assertion now refuses');
   assert.match(bodyOf('ghostTakesPixel'), /bodySeenAnswer\(body\)/,
     'the click stopped asking the same voxel question the picture asked');
   assert.match(src, /bodySeen: num\('bodyseen', 1\) \? 1 : 0,/, 'the shared rule needs its A/B switch');
@@ -418,8 +423,11 @@ test('the outline answers the same body the click answers, and hands its box bac
     'the outline re-invented its own pixel rule instead of using the click\'s');
   assert.match(hv, /from: 'body'/, 'a body pixel is reported as whatever the world pick found');
   const hp = bodyOf('hoverPass');
-  assert.match(hp, /g\.scale\.set\(BODY_W \+ 0\.12, BODY_H, BODY_W \+ 0\.12\);/,
-    'the outline is a 1x1x1 box around a block, not around a 0.6 x 1.8 person');
+  assert.match(hp, /g\.scale\.set\(bx\.w \+ 0\.12, bx\.h, bx\.w \+ 0\.12\);/,
+    'the outline is a 1x1x1 box around a block, not around the person as drawn');
+  assert.match(hp, /const bx = modelBox\(/,
+    'the outline went back to the physics hitbox (0.6 x 1.8). The drawn figure is 16px across with 4px '
+    + 'arms, 14px with the slim 3px arms, and half a pixel of jacket stands proud of either');
   assert.match(hp, /g\.scale\.set\(1, 1, 1\);/,
     'a body outline leaves an enlarged box behind for the next voxel it highlights');
   assert.match(hp, /HOVER\.why = `\$\{lab\.name\} stands here/,
@@ -543,15 +551,17 @@ test('the marker layer sorts itself, shows only its outside, and crosses a plant
 test('a person is drawn or hidden by the same voxel answer the click uses, per body', () => {
   assert.match(src, /bodySeen: num\('bodyseen', 1\) \? 1 : 0,/);
   const cut = bodyOf('ghostCut'), dep = bodyOf('ghostDepth'), px = bodyOf('ghostTakesPixel');
-  assert.match(cut, /new THREE\.Mesh\(geo, \[bodyMat, thruMat\]\)/,
-    'one mesh, two materials: a layer-wide switch cannot hide one person and show another');
+  assert.match(cut, /new THREE\.Mesh\(geo, \[bodyMat, thruMat, skinMat, skinThruMat\]\)/,
+    'one mesh, four materials: a layer-wide switch cannot hide one person and show another');
   assert.match(cut, /geo\.groups = g\.per\.map/, 'one draw group PER body, since sight is per body');
   assert.match(dep, /bodyWall\(cellAt, b, eye\)/, 'the picture asks the shared voxel question');
   assert.match(dep, /GHOST\.seenBy = new Map\(\)/,
     'the answer is keyed by WHO: a seat re-cut builds new body objects, and an answer left on the old ones '
     + 'reads as never-asked - which is how a body can look fine and refuse the click');
   assert.match(dep, /GHOST\.seenBy\.set\(b\.player, b\.seen\)/);
-  assert.match(dep, /q\.materialIndex = b && b\.seen !== 'wall' \? 1 : 0;/);
+  assert.match(dep,
+    /q\.materialIndex = \(q\.skinned \? 2 : 0\) \+ \(b && b\.seen !== 'wall' \? 1 : 0\);/,
+    'the material answer is two questions multiplied: do these triangles carry a skin, and is ground between');
   assert.match(px, /bodySeenAnswer\(body\)/, 'the click asks the SAME question, not a distance contest');
   assert.match(px, /if \(GHOST\.hitSeen === 'wall'\) return false;/,
     'all-or-nothing: a body the voxels hide is drawn with depth on, so the click must not promise it');
@@ -660,4 +670,56 @@ test('a baked tile is skipped only when the clip would kill every fragment it dr
   assert.match(src, /hiddenTiles: lodHidden, hiddenVerts: lodHiddenVerts/,
     'a saved draw call that is not countable is a screenshot argument again');
   assert.match(src, /lodHideWhy/, 'a tile that is NOT skipped has to be explainable: which patches, which box');
+});
+
+test('the cast is dressed from one strip, not one texture per player', () => {
+  // The pack is composed by the server and fetched as ONE texture + ONE description. Six materials for six
+  // players was the easy version and it does not scale: the people layer is one mesh with draw groups, and
+  // a per-player material means a per-player texture bind in the same frame.
+  assert.match(src, /fetch\('\/skins\/strip\.json'\)/, 'the page stopped asking the server for the strip');
+  assert.match(src, /i\.src = '\/skins\/strip\.png'/, 'and for its pixels');
+  assert.doesNotMatch(src, /sessionserver|minecraft\.net|textures\.minecraft/,
+    'the browser must never contact Mojang: the pack is fetched once by tools/fetch-skins.mjs');
+  // Top-down, like the block atlas, with no filtering: a skin is a pixel grid and its cells are adjacent,
+  // so mipmaps would bleed one player into the next at any zoom-out.
+  assert.match(src, /t\.magFilter = THREE\.NearestFilter;/);
+  assert.match(src, /t\.generateMipmaps = false;/);
+  assert.match(src, /t\.colorSpace = THREE\.SRGBColorSpace;/);
+  assert.match(src, /t\.flipY = false;/, 'the skin UVs are top-down; a flipped upload mirrors the cast');
+  assert.match(src, /alphaTest: SKIN_ALPHA/, 'a jacket is alpha-TESTED, not blended: below the threshold '
+    + 'the texel does not exist, which is also why the inside of a coat is never drawn');
+  assert.match(src, /assignSkins/, 'names are matched to columns by the shared, tested matcher');
+  assert.match(bodyOf('ghostCut'), /geo\.setAttribute\('uv', new THREE\.BufferAttribute\(g\.uv, 2\)\)/,
+    'the strip needs somewhere to be sampled from');
+  assert.match(bodyOf('ghostCut'), /skinOf: S\.bodySkin \? skinOf : null/,
+    'the switch that turns skins off must not change the geometry path');
+  assert.match(bodyOf('skinMatch'), /assignSkins\(names, SKINS\.json\.cells\.filter\(\(c\) => !c\.white\)\)/,
+    'the white fallback column is not a player and must not be matchable');
+  // The sizes the request was about: 8x8x8 head, 8x12x4 torso, 4x12x4 limbs (3 wide when slim), 32px tall.
+  assert.match(src, /import \{ assignSkins \} from '\.\.\/\.\.\/shared\/skinlayout\.mjs';/,
+    'the model sizes live in shared/, where a test can read them without a browser');
+  assert.match(bodyOf('ghostDepth'), /GHOST\.shown\[q\.body\]/,
+    'the depth answer is still per body, not per layer');
+});
+
+
+
+test('a skin switch that only writes state is not a switch', () => {
+  // The people layer decides skinned-vs-tinted per TRIANGLE (the material index picks
+  // tinted/skinned x respect-wall/through-wall), so changing the setting has to re-cut the bodies. A probe
+  // that toggled through a door which only wrote S.bodySkin measured 0 changed pixels on a person, and very
+  // nearly concluded the strip was not being worn.
+  const rowOf = (key) => {
+    const at = src.indexOf(`key: '${key}'`);
+    assert.ok(at > 0, `the ${key} panel row is gone`);
+    return src.slice(at, at + 700);
+  };
+  for (const [key, field] of [['bodyskin', 'bodySkin'], ['bodyovers', 'bodyOvers']]) {
+    const line = src.split(String.fromCharCode(10)).find((l) => l.trim().startsWith(`${key}: (on) =>`));
+    assert.ok(line, `__world.${key} is gone`);
+    assert.ok(line.includes(`S.${field} = on ? 1 : 0; ghostSync(true)`),
+      `__world.${key} only wrote state: ${line.trim()}`);
+    assert.ok(rowOf(key).includes(`set: (v) => { S.${field} = v ? 1 : 0; ghostSync(true)`),
+      `the ${key} panel row must re-cut the bodies too`);
+  }
 });

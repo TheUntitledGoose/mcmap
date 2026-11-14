@@ -25,7 +25,7 @@ const PORT = +arg('port', 8899);
 
 // Exactly the COPY lines of the Dockerfile, plus the vendored runtime it serves.
 const COPY_DIRS = ['server', 'shared', 'tools', 'web'];
-const COPY_PACKS = ['build/assets', 'build/shells', 'build/lods', 'build/ledger'];
+const COPY_PACKS = ['build/assets', 'build/shells', 'build/lods', 'build/ledger', 'build/skins'];
 const COPY_FILES = ['package.json', 'package-lock.json', 'Dockerfile', 'compose.yaml', '.dockerignore'];
 
 const say = (m) => console.log(m);
@@ -70,13 +70,27 @@ Object.assign(env, {
   WD_HEARTBEAT: '0',
 });
 
+// The port has to be this run's port. An earlier sim that never exited keeps answering, the new child dies
+// on EADDRINUSE, and every probe below then reports on SOME OTHER tree - which is how a staged run once
+// "proved" /skins/strip.json was a 404 while the staged tree served it fine.
+const base = `http://127.0.0.1:${PORT}`;
+try {
+  const r = await fetch(`${base}/stats`);
+  throw new Error(`port ${PORT} is already answered by something else (status ${r.status}): kill that process,`
+    + ` or run with --port <free>`);
+} catch (e) {
+  if (!(e.cause && /ECONNREFUSED|EADDRNOTAVAIL|ENOTFOUND/.test(String(e.cause.code || e.cause.message)))) {
+    if (e.message.startsWith(`port ${PORT}`)) throw e;
+    // anything else (a refused connection is the wanted answer) is fine
+  }
+}
+
 say(`boot: node server/worldd.mjs (no flags), cwd=${STAGE}`);
 const child = spawn(process.execPath, ['server/worldd.mjs'], { cwd: STAGE, env, stdio: ['ignore', 'pipe', 'pipe'] });
 let log = '';
 child.stdout.on('data', (b) => { log += b; });
 child.stderr.on('data', (b) => { log += b; });
 
-const base = `http://127.0.0.1:${PORT}`;
 async function waitReady(ms) {
   for (let t = 0; t < ms; t += 250) {
     try { const r = await fetch(`${base}/meta`); if (r.ok) return await r.json(); } catch { /* not up */ }
@@ -120,6 +134,28 @@ try {
   check(vox.status === 200 && (await vox.arrayBuffer()).byteLength > 64,
     '/voxels did not return payload: is the save readable from the staged cwd?');
 
+  // Skins are the optional pack, so both answers are correct - but each has to be the RIGHT one, and the
+  // strip has to arrive as one PNG the page can upload, not as six files it has to stitch itself.
+  const haveSkins = fs.existsSync(path.join(STAGE, 'build/skins/manifest.json'));
+  const sj = await fetch(`${base}/skins/strip.json`);
+  const sjBuf = Buffer.from(await sj.arrayBuffer());
+  if (haveSkins) {
+    check(sj.status === 200, `/skins/strip.json -> ${sj.status} although build/skins/manifest.json is staged`);
+    const j = JSON.parse(sjBuf.toString('utf8'));
+    check(j.columns >= 2 && j.white === j.columns - 1, `strip.json says columns=${j.columns} white=${j.white}`);
+    const sp = await fetch(`${base}/skins/strip.png`);
+    const spBuf = Buffer.from(await sp.arrayBuffer());
+    const png = spBuf.length > 8 && spBuf.readUInt32BE(0) === 0x89504e47;
+    check(sp.status === 200 && png, `/skins/strip.png -> ${sp.status}, PNG signature: ${png}`);
+    const w = spBuf.readUInt32BE(16), h = spBuf.readUInt32BE(20);
+    check(w === j.columns * j.cell && h === j.cell, `strip PNG is ${w}x${h}, expected ${j.columns * j.cell}x${j.cell}`);
+    say(`/skins/strip.{json,png}   ${j.columns} columns of ${j.cell}px, white at ${j.white}, PNG ${w}x${h}, `
+      + `no skin for ${(j.missing || []).map((m) => m.name).join(' ') || 'nobody'}`);
+  } else {
+    check(sj.status === 404, `/skins/strip.json -> ${sj.status} with no pack staged; expected a 404 that says so`);
+    say('/skins/strip.json        no pack staged (optional): the cast stands tinted');
+  }
+
   // Unknown WD_* must be refused, and that refusal must not look like a successful boot.
   const bad = spawn(process.execPath, ['server/worldd.mjs'], { cwd: STAGE, env: { ...env, WD_NOT_A_FLAG: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
   let err = '', code = null;
@@ -144,5 +180,14 @@ if (fails.length) {
   process.exit(1);
 }
 say(`\nOK: the staged tree serves the app, the packs and the save with the image's environment alone.`);
-if (process.argv.includes("--clean")) { fs.rmSync(STAGE, { recursive: true, force: true }); say("staged tree removed (--clean)"); }
+if (process.argv.includes("--clean")) {
+  // Windows can still be holding a handle in the tree a beat after the child exits (a log file, an index
+  // pass). An OK run must not end in a stack trace: say where the tree is and let the next run sweep it.
+  let gone = false;
+  for (let i = 0; i < 3 && !gone; i++) {
+    try { fs.rmSync(STAGE, { recursive: true, force: true }); gone = true; }
+    catch (e) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400); }
+  }
+  say(gone ? 'staged tree removed (--clean)' : `--clean could not remove ${STAGE} (something still holds it); delete it later`);
+}
 else say(`staged tree left at ${STAGE} (delete it when done, or pass --clean)`);

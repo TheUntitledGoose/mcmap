@@ -57,7 +57,9 @@ import { buildTimeBlocks, markerOfIndex, pickMarkerHit, resetMarkerLift } from '
 import { nearestVisit, presenceOf, RUN_GAP_SEC } from '../../shared/ghosts.mjs';
 import {
   absentText, BODY_H, BODY_W, bodyGeom, bodyLabel, bodiesHere, bodyWall, historyNear, occupancyOf, trackGeom,
+  MODEL_H, modelBox,
 } from './ledger-ghosts.js';
+import { assignSkins } from '../../shared/skinlayout.mjs';
 
 
 const $ = (id) => document.getElementById(id);
@@ -319,6 +321,8 @@ const S = {
   // may stand at all is measured and tested in shared/ghosts.mjs; this number only says whether to draw
   // one. URL: ?bodies=0
   bodies: num('bodies', 1) ? 1 : 0,
+  bodySkin: num('bodyskin', 1) ? 1 : 0,            // 0: the cast keeps its band colours even with a pack
+  bodyOvers: num('bodyovers', 1) ? 1 : 0,          // hats, jackets, sleeves: the model's second layer
   // Silence that ends a body, in seconds. Measured on this save (build/dbg-gaps.mjs): one player's hand
   // actions sit 1 s apart at p50 and 5-20 s at p90, but across a silence over 300 s the hand has already
   // moved a median 52-155 blocks (p90 over 1,100) - so five minutes of nothing is not the same person
@@ -4600,10 +4604,16 @@ function hoverPass(now) {
   HOVER.standWhy = h.standWhy ?? '';
   HOVER.body = h.body ? h.body.player : null;
   if (h.body) {
-    // Outline the person, not the block under them: BODY_W x BODY_H is what the body geometry draws.
+    // Outline the person AS DRAWN, not the physics hitbox: a slim model is 14px across and its second
+    // layer stands half a pixel proud of that, so a fixed 0.6 x 1.8 box sat inside the shoulders and
+    // stopped short of the hat. BODY_W / BODY_H stay what collision and the sight probe use.
     g.visible = true;
-    g.scale.set(BODY_W + 0.12, BODY_H, BODY_W + 0.12);
-    g.position.set(h.body.x + 0.5, h.body.y + BODY_H / 2, h.body.z + 0.5);
+    const hk = S.bodySkin ? skinOf(h.body.player) : null;
+    const bx = modelBox(!!(hk && hk.slim), !!S.bodyOvers);
+    g.scale.set(bx.w + 0.12, bx.h, bx.w + 0.12);
+    // (top + bottom) / 2, not h / 2: the second layer stands proud of the SOLES as well as the crown, so
+    // the figure's own centre sits a few thousandths of a block below half its height above the floor.
+    g.position.set(h.body.x + 0.5, h.body.y + (bx.top + bx.bottom) / 2, h.body.z + 0.5);
     const lab = bodyLabel(TLAYER.tl, h.body, ghostNames());
     HOVER.why = `${lab.name} stands here (${h.body.seat} at y ${h.body.y}) - ${lab.sub}`;
     // The colour policy is unchanged: green when a drawn change sits on that same voxel.
@@ -5374,25 +5384,118 @@ function ghostClear() {
   GHOST.tags = []; GHOST.tagsShown = 0;
 }
 
+// A skin's second layer (hat, jacket, sleeves) is mostly transparent texels, so it needs an alpha test:
+// below it the texel does not exist at all, which is also what stops a jacket's inside being drawn.
+const SKIN_ALPHA = 0.5;
+// The cast's skins as ONE strip texture: 64x64 texels per player, left to right, last column solid white.
+// One upload and one material pair for the whole group rather than one per player, and nothing is fetched
+// from Mojang by the browser: the pack came from tools/fetch-skins.mjs once and server/skin-strip.mjs
+// composed it. No pack is a normal state - the people then stand tinted by their own band colours.
+const SKINS = {
+  json: null, tex: null, why: 'not asked for',
+  byIndex: null, namesSig: '', worn: [], matched: 0, unmatched: null,
+};
+
+async function skinsLoad() {
+  if (SKINS.json || SKINS.why === 'loading') return SKINS.json;
+  SKINS.why = 'loading';
+  try {
+    const j = await fetch('/skins/strip.json').then((r) => (r.ok ? r.json() : Promise.reject(new Error('strip.json ' + r.status))));
+    const img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => rej(new Error('strip.png would not decode'));
+      i.src = '/skins/strip.png';
+    });
+    const t = new THREE.Texture(img);
+    t.magFilter = THREE.NearestFilter;             // skin pixels are the art; do not smear them
+    t.minFilter = THREE.NearestFilter;
+    t.generateMipmaps = false;                     // 64x64 cells side by side: mipmaps bleed one player into the next
+    t.colorSpace = THREE.SRGBColorSpace;           // the same space the block atlas is declared in
+    t.flipY = false;                               // these UVs are top-down, like the atlas's
+    t.needsUpdate = true;
+    SKINS.json = j; SKINS.tex = t;
+    skinMatch();                                   // the ledger's player table may already be known
+    if (S.bodies) ghostSync(true);                 // the bodies drawn before the strip arrived get dressed
+    return j;
+  } catch (e) {
+    SKINS.why = 'no skins: ' + e.message;          // and the people stay tinted: nothing about the world changes
+    return null;
+  }
+}
+
+// Which strip column each player index wears, and whether that person is a slim model. The authority on
+// who a player byte means is the ledger's player table (the same list the name tags and the "who" menu use),
+// which is global to the save: the timeline's own name table names the OBJECT a row acted on - chest,
+// creeper, water - and matching skins against it is how you end up dressing a player in "oak_planks".
+function skinMatch() {
+  if (!SKINS.json) return null;
+  // NOT tl.names: that table names the OBJECT a row acted on (chest, creeper, water). The player table from
+  // /ledger/meta is what says who a player byte is, and it is the same list the name tags use.
+  const names = ghostNames().map((p) => (p ? p.name : null));
+  const sig = names.join(String.fromCharCode(0));
+  if (SKINS.byIndex && SKINS.namesSig === sig) return SKINS.byIndex;
+  const a = assignSkins(names, SKINS.json.cells.filter((c) => !c.white));
+  SKINS.byIndex = a.byIndex; SKINS.namesSig = sig;
+  SKINS.worn = a.list;                                  // which columns someone here actually wears
+  SKINS.matched = a.list.length; SKINS.unmatched = a.unmatched;
+  SKINS.why = `${names.filter(Boolean).length} players in this dimension's log`;
+  return a.byIndex;
+}
+
+function skinOf(i) { return SKINS.byIndex ? SKINS.byIndex[i] || null : null; }
+
+// What the page can say about the pack without being asked twice: whether it arrived, how many of THIS
+// dimension's names matched a column, and who is standing on the white column instead.
+function skinDiag() {
+  return {
+    // Once the strip is on, "loading" is a lie: say what it is, and let `why` carry the failure.
+    on: !!S.bodySkin, loaded: !!SKINS.json, why: SKINS.json ? 'loaded' : SKINS.why,
+    columns: SKINS.json ? SKINS.json.columns : 0, white: SKINS.json ? SKINS.json.white : -1,
+    cell: SKINS.json ? SKINS.json.cell : 0,
+    matched: SKINS.matched,
+    worn: (SKINS.worn || []).map((c) => c.name),
+    without: SKINS.unmatched ? SKINS.unmatched.peopleWithNoSkin : [],
+    skinned: (GHOST.per || []).filter((p) => p.skinned).length,
+    bodies: (GHOST.per || []).length,
+  };
+}
+
+
 let ghostBodyMat = null, ghostThruMat = null, ghostLineMat = null;
+let ghostSkinMat = null, ghostSkinThruMat = null;
 function ghostMats() {
   if (!ghostBodyMat) {
     // Flat unlit colour, because these are claims about evidence rather than objects in the world: a body
     // that picked up the world's lighting would read as a block the mesher drew.
-    ghostBodyMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false, side: THREE.DoubleSide });
+    // Front side only, like the game draws a player: the model is closed boxes, so the inside of a jacket
+    // is not something you are meant to see - and the alpha-tested holes in a skin's second layer show it.
+    ghostBodyMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false });
     // The same paint with no depth test, for the bodies the page's OWN voxels say the eye can reach. A
     // change marker is an annotation over a block; a person standing in it is the fact. Putting the choice
     // on the body (two draw groups, one per answer) is what lets the marker layer sort itself.
-    ghostThruMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false, side: THREE.DoubleSide });
+    ghostThruMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false });
+    ghostSkinMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false, alphaTest: SKIN_ALPHA });
+    ghostSkinThruMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false, alphaTest: SKIN_ALPHA });
     ghostLineMat = new THREE.LineBasicMaterial({ vertexColors: true, fog: false, transparent: true, opacity: 0.9 });
+  }
+  // The strip arrives some frames after these materials exist. Assigning the map rather than building new
+  // materials keeps one material object per role for the session: three's program cache, and every group's
+  // materialIndex, go on pointing at the same thing.
+  for (const m of [ghostSkinMat, ghostSkinThruMat]) {
+    if (m.map !== SKINS.tex) { m.map = SKINS.tex; m.needsUpdate = true; }
   }
   // A person inside a house is inside it, so bodies obey walls by default; ?bodythrough=1 is a finder at
   // whole-world scale, and the note names which mode is on. The flat ledger overlays get the opposite
   // default because they ARE map paint.
   ghostBodyMat.depthTest = !S.bodyThrough;
   ghostThruMat.depthTest = false;
+  ghostSkinMat.depthTest = !S.bodyThrough;
+  ghostSkinThruMat.depthTest = false;
   ghostLineMat.depthTest = !S.bodyThrough;
-  return [ghostBodyMat, ghostThruMat, ghostLineMat];
+  // Four body materials: (tinted, skinned) x (respects walls, through them). Which one a person gets is a
+  // materialIndex, not a rebuild. Index 4 is the route line's, on a different object entirely.
+  return [ghostBodyMat, ghostThruMat, ghostSkinMat, ghostSkinThruMat, ghostLineMat];
 }
 
 /**
@@ -5425,8 +5528,12 @@ function ghostDepth() {
   let thru = 0;
   for (const q of geo.groups) {
     const b = GHOST.shown[q.body];
-    q.materialIndex = b && b.seen !== 'wall' ? 1 : 0;
-    if (q.materialIndex) thru++;
+    // (skinned ? 2 : 0) picks the pair, (wall ? 0 : 1) the half of it. A body behind a wall still writes
+    // depth either way: only its own hiding is soft, never the world's. The skinned half comes from the
+    // GROUP, not the body: the UVs in these triangles were baked by the cut that made the group, and the
+    // material has to be the one that reads them.
+    q.materialIndex = (q.skinned ? 2 : 0) + (b && b.seen !== 'wall' ? 1 : 0);
+    if (q.materialIndex & 1) thru++;
   }
   GHOST.seenDrawn = thru;
   return thru;
@@ -5484,13 +5591,20 @@ function ghostSync(force = false) {
 function ghostCut(list) {
   const t0 = performance.now();
   const standing = list.filter((b) => !b.absent);
-  const g = bodyGeom(standing);
+  skinMatch();                                      // who wears which column, if names are known
+  const g = bodyGeom(standing, {
+    overlay: S.bodyOvers,
+    skinOf: S.bodySkin ? skinOf : null,
+    // the STRIP's geometry, not the matcher's: texW is cell x columns so a face lands in its own cell, and
+    // the fallback is the strip's last column - not column 0, which is somebody's actual face.
+    columns: SKINS.json ? SKINS.json.columns : 1, whiteColumn: SKINS.json ? SKINS.json.white : 0,
+  });
   GHOST.per = g.per;
   GHOST.shown = standing;
-  const [bodyMat, thruMat, lineMat] = ghostMats();
+  const [bodyMat, thruMat, skinMat, skinThruMat, lineMat] = ghostMats();
   if (!GHOST.mesh) {
     const geo = new THREE.BufferGeometry();
-    const mesh = new THREE.Mesh(geo, [bodyMat, thruMat]);
+    const mesh = new THREE.Mesh(geo, [bodyMat, thruMat, skinMat, skinThruMat]);
     mesh.name = 'ledger-people';
     mesh.renderOrder = 903;                       // AFTER the change markers (902), which by default only test
     // depth and never write it: a marker is an annotation around a block, so a person standing in that block
@@ -5507,10 +5621,16 @@ function ghostCut(list) {
   const geo = GHOST.mesh.geometry;
   geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
   geo.setAttribute('color', new THREE.BufferAttribute(g.col, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(g.uv, 2));   // which texel of which player's cell
   geo.setDrawRange(0, g.verts);                   // a soup: the count is corners, not indices
   // One draw group per person, so "who may draw through what" is a per-body answer rather than a property
   // of the whole layer. `ghostDepth` re-points these at the two materials whenever the eye moves.
-  geo.groups = g.per.map((q, i) => ({ start: q.from, count: q.to - q.from, materialIndex: 0, body: i }));
+  // `skinned` travels with the group because it is a fact about the TRIANGLES in it: the cut chose their
+  // UVs (this player's cell, or the strip's white column) at that moment. Deciding the material later from
+  // the body object instead is how every skinned body drew as a white silhouette - the tinted material, no
+  // texture, and vertex colours deliberately white so a texture could be the colour.
+  geo.groups = g.per.map((q, i) => ({ start: q.from, count: q.to - q.from, materialIndex: 0, body: i,
+    skinned: !!q.skinned }));
   GHOST.seenSig = '';
   ghostDepth();
   const tg = S.bodyTracks
@@ -5588,7 +5708,11 @@ function ghostPlace() {
   let shown = 0, small = 0;
   GHOST.tagOff = 0; GHOST.tagClamped = 0;     // how many labels fell off this view, and how many had to slide
   for (const { el, b } of GHOST.tags) {
-    const top = GHOST.v1.set(b.x + 0.5, b.y + BODY_H + 0.35, b.z + 0.5).project(camera);
+    // Over the hat, not over the hitbox: a drawn figure is 2.06 blocks tall once the second layer is on,
+    // and a tag placed at 1.8 lands in the middle of somebody's face.
+    const bk = S.bodySkin ? skinOf(b.player) : null;
+    const bh = modelBox(!!(bk && bk.slim), !!S.bodyOvers).top;
+    const top = GHOST.v1.set(b.x + 0.5, b.y + bh + 0.35, b.z + 0.5).project(camera);
     const px = (top.x * 0.5 + 0.5) * innerWidth, py = (-top.y * 0.5 + 0.5) * innerHeight;
     if (top.z > 1 || px < -60 || py < -40 || px > innerWidth + 60 || py > innerHeight + 40) {
       el.style.display = 'none'; GHOST.tagOff++; continue;   // behind the camera, or off the edge
@@ -6086,6 +6210,16 @@ function peopleNote() {
         : 'With the caves toggle off that rock is not drawn, so a person in a hole looks like a name tag over '
           + 'bare ground: the "caves" row in the panel, or ?caves=1.'));
   }
+  // Skins are the one part of a body that is not inferred, so the note says who actually has one: a name
+  // with no Mojang profile is a hole in the pack, and a reader should not have to click a panel to learn it.
+  if (SKINS.json) {
+    const no = (SKINS.unmatched && SKINS.unmatched.peopleWithNoSkin) || [];
+    out.push(`Their skins come from one ${SKINS.json.columns}-column strip (built ${SKINS.json.generated.slice(0, 10)}): `
+      + `${SKINS.matched} of the ${ghostNames().filter(Boolean).length} players in the log wear their own skin, `
+      + (no.length ? `${no.length} stand on the strip's white column because the pack has no skin for them (${no.join(', ')}). `
+        : 'every player the log names has one. ')
+      + (S.bodySkin ? '' : '(the skins row is off, so all of them stand tinted.)'));
+  } else if (S.bodySkin) out.push(`No skin pack: ${SKINS.why}. tools/fetch-skins.mjs fetches it once; until then the cast stands in band colours.`);
   out.push(S.bodyThrough ? 'a body answers a click through anything (bodythrough).'
     : S.bodyPick ? 'a person answers a click before a change marker does; the real ground in front of them still answers first (?bodypick=0 to put the nearest thing back, ?bodywall=0 to let far paint hide them too).'
       : 'the nearest drawn thing answers the click, change markers included.');
@@ -7373,6 +7507,7 @@ window.__world = {
       ? { player: b.player, absent: b.absent, age: b.age, acted: b.acted }
       : { player: b.player, row: b.row, sec: b.sec, age: b.age, action: b.action, block: b.block,
         x: b.x, y: b.y, z: b.z, floor: b.floor, seat: b.seat, above: b.above, down: b.down, visit: b.visit,
+        skinned: !!(S.bodySkin && skinOf(b.player)), slim: !!(skinOf(b.player) && skinOf(b.player).slim),
         seen: GHOST.seenBy?.get(b.player) ?? b.seen ?? null })),
     presence: GHOST.presence ? {
       gap: GHOST.presence.gap, handRows: GHOST.presence.handRows, visits: GHOST.presence.visits,
@@ -7394,7 +7529,10 @@ window.__world = {
     buildMs: +GHOST.buildMs.toFixed(1), syncMs: +GHOST.syncMs.toFixed(3), cutMs: +GHOST.cutMs.toFixed(2),
     syncs: GHOST.syncs, cuts: GHOST.cuts, tagMs: +GHOST.tagMs.toFixed(3),
     hitMs: +GHOST.hitMs.toFixed(3), hitWhy: GHOST.hitWhy, hitDist: +GHOST.hitDist.toFixed(2),
+    skins: skinDiag(),
   }),
+  // A missing skin is a fact about the log, not a bug in the page, so it has to be askable.
+  skins: () => skinDiag(),
   // Probes need to be able to put the playhead somewhere and ask for the answer in the same call.
   ghostApply: (sec = null) => { if (sec !== null) S.timeAt = +sec; return ghostSync(true); },
   ghostReload: () => ghostPresence(),
@@ -7430,8 +7568,12 @@ window.__world = {
   // The baked layer's draw-call skip, switched inside one page so a frame A/B does not need two
   // browsers (and two chunk streams that never settle the same way). `?lodhide=0` is the URL form.
   lodHide: (on) => { S.lodHide = on ? 1 : 0; return { lodHide: S.lodHide }; },
+  // The cast's two skin switches, switched inside one page for the same reason: a skin A/B has to compare the
+  // same body, in the same world, in the same browser - and the page's own jitter is then measurable.
+  bodyskin: (on) => { S.bodySkin = on ? 1 : 0; ghostSync(true); return { bodySkin: S.bodySkin, skins: skinDiag() }; },
+  bodyovers: (on) => { S.bodyOvers = on ? 1 : 0; ghostSync(true); return { bodyOvers: S.bodyOvers, skins: skinDiag() }; },
   progress: () => PROGRESS.snapshot(),
-    markSide: (on) => { S.markSide = on ? 1 : 0; const m = timeBlockMatOf();
+  markSide: (on) => { S.markSide = on ? 1 : 0; const m = timeBlockMatOf();
     return { markSide: S.markSide, side: m.side, front: THREE.FrontSide, double: THREE.DoubleSide }; },
   hist: histStats,
   time: () => ({
@@ -7594,7 +7736,9 @@ window.__world = {
     yaw: +rig.yaw.toFixed(3),
   }),
   keys: rig.keys, stepKeys,
-  // world -> screen pixels, for checking that a drag moves the scene the way the cursor does
+  // world -> screen pixels (CSS px, the space grab() and ghostHit() speak), for checking that a drag moves
+  // the scene the way the cursor does - and for asking what pixels a claim covers instead of diffing a whole
+  // frame that is busy streaming world in
   project: (x, y, z) => { const v = new THREE.Vector3(x, y, z).project(camera);
     return [+((v.x * 0.5 + 0.5) * innerWidth).toFixed(1), +((1 - (v.y * 0.5 + 0.5)) * innerHeight).toFixed(1), +v.z.toFixed(3)]; },
   camera,
@@ -8263,6 +8407,17 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
         fmt: () => (GHOST.lines && GHOST.lines.visible ? `${(GHOST.lines.geometry.drawRange.count / 2) | 0} segments` : 'off'),
         get: () => !!S.bodyTracks, set: (v) => { S.bodyTracks = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
         hint: 'A line through the hand actions of the visit each standing body is in, thinned to 96 points and\nalways ending where that player left. It is a straight-line JOIN of evidence, not a walked path, and it is\ndrawn only for a body that stands now: an absent player has no route to draw, and a route that runs across\na gap claims a person walked somewhere the log never saw them. URL: ?bodytracks=0' },
+      { key: 'bodyskin', label: 'wear the fetched skins', kind: 'check',
+        fmt: () => (SKINS.json
+          ? `${SKINS.matched} of ${ghostNames().filter(Boolean).length} logged players have a skin, `
+            + `${SKINS.json.columns} columns of ${SKINS.json.cell}px`
+          : SKINS.why),
+        get: () => !!S.bodySkin, set: (v) => { S.bodySkin = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
+        hint: 'The cast in the skins they actually wear: the pack is fetched ONCE by tools/fetch-skins.mjs (it asks\nMojang who a playerdata UUID belongs to, and stops rather than inventing a face for a name with no profile),\nthen server/skin-strip.mjs composes it into ONE 64px-per-player strip whose last column is solid white.\nOne texture, one material pair, and the people without a skin stand on that white column in their band colours.\nOff keeps the band colours for everybody. The browser never contacts Mojang. URL: ?bodyskin=0' },
+      { key: 'bodyovers', label: 'hats, jackets, sleeves', kind: 'check',
+        fmt: () => (S.bodyOvers ? 'the second layer, 0.5px proud' : 'base layer only'),
+        get: () => !!S.bodyOvers, set: (v) => { S.bodyOvers = v ? 1 : 0; ghostSync(true); if (panel) panel.refresh(); },
+        hint: 'A Minecraft skin carries TWO layers per part: the base, and an overlay 0.5px proud of it - hat,\njacket, sleeves. The overlay is mostly transparent texels, so it is alpha-tested rather than blended:\na texel below the threshold does not exist at all, which is also why the inside of a jacket is never drawn.\nIt doubles the body geometry (36 quads to 72), which is nothing beside a world of millions. URL: ?bodyovers=0' },
       { key: 'bodytags', label: 'name and hedge over each body', kind: 'check',
         fmt: () => (GHOST.tags.length
           ? `${GHOST.tagsShown} shown, ${GHOST.tagsSmall} too small, ${GHOST.tagOff} off this view`
@@ -8620,6 +8775,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     // visits never scrub. But a URL that asks for the layer gets it, filters included, before the
     // first frame is worth comparing against.
     if (S.time) timeLoad();
+    if (S.bodies) skinsLoad();                     // dressing is optional; the bodies are cut either way
     // Walking is turned on after the panel exists (its rows report the mode) and after the spawn
     // point and the ?goto target are known, so ?view=walk&goto=x,y,z lands the eye on that place at
     // head height rather than aiming at it from 40 blocks away.

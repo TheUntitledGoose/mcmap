@@ -36,6 +36,7 @@ import { LOD_CELL } from '../shared/lod-format.mjs';
 import { summarizeLodDir } from './lod-pack.mjs';
 import { LedgerService } from './ledger-service.mjs';
 import { envArgs } from '../shared/envargs.mjs';
+import { skinStripFor, stripJson, stripPng } from './skin-strip.mjs';
 import { WORLDD_FLAGS } from './worldd-flags.mjs';
 
 // Every flag the server reads lives in server/worldd-flags.mjs, so an environment variable that
@@ -96,6 +97,11 @@ const PACKS = arg('packs', 'build/shells');
 // Baked coarse LOD tiles (server/bake-lod.mjs): the far world as pre-made vertex streams. Missing,
 // and the browser keeps meshing its far layers live, which is the behaviour before this existed.
 const LODS = arg('lods', 'build/lods');
+// Player skins, fetched once by tools/fetch-skins.mjs and composed into one strip by server/skin-strip.mjs.
+// Optional by design: with no pack the people stand in their own colour, as they always did. This is the
+// only place skins are read - the browser is never pointed at Mojang - and one strip means one texture
+// upload and one material for the whole cast instead of one per player.
+const SKINS = arg('skins', 'build/skins');
 // Counted once at startup: the browser's /meta answer for "is there a baked far layer?".
 const lodSummary = LODS === 'none' ? { dims: 0, tiles: 0, cells: [] } : summarizeLodDir(LODS);
 const stamp = atlasStamp(fs.statSync(path.join(ASSETS, 'atlas.json')), atlas.states.length);
@@ -140,6 +146,26 @@ if (CACHE !== 'none' && num('cache-reconcile', 1) !== 0) {
   setTimeout(() => {
     svc.sweepCacheBudget().catch((e) => console.log('  cache: reconcile failed: ' + (e.message ?? e)));
   }, 5000).unref();
+}
+
+// The skin pack, read once and re-read only when the manifest moves. Decoding six 64x64 PNGs per request
+// would be silly, and a pack that changed under a running server (someone ran tools/fetch-skins.mjs) has
+// to be picked up without a restart, so the key is the manifest's mtime.
+let skinCache = null;
+function skinsNow() {
+  if (SKINS === 'none') return null;
+  const r = skinStripFor(SKINS);
+  if (!r.pack) return null;
+  if (!skinCache || skinCache.mtime !== r.mtime) skinCache = r;
+  return skinCache;
+}
+function skinsSummary() {
+  const s = skinsNow();
+  if (!s) return { available: false, why: SKINS === 'none' ? 'skins disabled' : `no pack under ${SKINS}: run tools/fetch-skins.mjs` };
+  return {
+    available: true, generated: s.pack.generated, players: s.pack.list.length,
+    without: s.pack.missing.map((m) => m.name),
+  };
 }
 
 function levelSummary() {
@@ -265,12 +291,21 @@ const server = http.createServer(async (req, res) => {
         inflight: INFLIGHT.size, byPath }), 'application/json');
       return;
     }
+    if (u.pathname === '/skins/strip.json' || u.pathname === '/skins/strip.png') {
+      const s = skinsNow();
+      if (!s) return send(req, res, 404, '{"error":"no skin pack"}', 'application/json');
+      if (u.pathname.endsWith('.png')) {
+        return send(req, res, 200, stripPng(s.strip), 'image/png', { 'Cache-Control': 'no-cache' });
+      }
+      return send(req, res, 200, JSON.stringify(stripJson(s.strip, s.pack)), 'application/json; charset=utf-8');
+    }
     if (u.pathname === '/meta') {
       return send(req, res, 200, JSON.stringify({
         world: WORLD, level: levelSummary(), dims: svc.dimList(),
         assets: { states: atlas.states.length, textures: atlas.textures.length, atlasSize: atlas.atlasSize, geometry: atlas.geometry },
         stats: svc.stats,
-        packed: { shells: fs.existsSync(PACKS), lod: lodSummary, ledger: ledger.ready },
+        packed: { shells: fs.existsSync(PACKS), lod: lodSummary, ledger: ledger.ready,
+          skins: skinsSummary() },
         coverage: { ttlMs: svc.coverageTtlMs },
       }), 'application/json; charset=utf-8');
     }
@@ -375,6 +410,8 @@ const server = http.createServer(async (req, res) => {
       return send(req, res, 200, JSON.stringify(body), 'application/json; charset=utf-8');
     }
     if (u.pathname.startsWith('/assets/')) return serveFile(res, req, path.join(ASSETS, u.pathname.slice(8)));
+    // the skin manifest and the individual PNGs, for poking at; the page only asks for the strip
+    if (u.pathname.startsWith('/skins/')) return serveFile(res, req, path.join(SKINS, u.pathname.slice(7)));
     if (u.pathname.startsWith('/shared/')) return serveFile(res, req, path.join('shared', u.pathname.slice(8)));
     // three is served straight out of node_modules; the build/ dir is self-contained (its
     // three.module.js imports ./three.core.js by relative path).
@@ -394,6 +431,12 @@ server.listen(PORT, HOST, () => {
   }
   console.log(`shell packs: ${fs.existsSync(PACKS) ? PACKS : 'none baked - run node server/bake-shells.mjs'}`);
   console.log(`lod tiles: ${lodSummary.tiles ? `${LODS} (${lodSummary.tiles} tiles, ${lodSummary.dims} dimensions)` : 'none baked - run node server/bake-lod.mjs'}`);
+  {
+    const sk = skinsSummary();
+    console.log(sk.available
+      ? `   skins: ${SKINS} (${sk.players} players${sk.without.length ? `, without a skin: ${sk.without.join(' ')}` : ''})`
+      : `   skins: ${sk.why}`);
+  }
   console.log(`  world  ${WORLD}  (${svc.dims.size} dimensions)`);
   for (const d of svc.dimList()) {
     console.log(`  ${d.id.padEnd(24)} regions=${String(d.regions).padStart(4)} chunks<=${d.chunksUpperBound}` +

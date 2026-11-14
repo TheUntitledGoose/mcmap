@@ -3,6 +3,8 @@
 // What these tests guard is the part a screenshot cannot: that a body lands in the WORLD rather than in
 // the chunk-local grid, that per-body triangle ranges are the ranges a ray hit is resolved with, that a
 // float is labelled as a float, and that a history list never leaks another player's rows.
+// The geometry tests also pin the model sizes the request was about (8x8x8 head, 8x12x4 torso, 4x12x4
+// limbs, 3px arms when slim), because "it looks like Minecraft" is not a number a later pass can keep.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildPack } from '../server/ledger-pack.mjs';
@@ -11,7 +13,7 @@ import { presenceOf } from '../shared/ghosts.mjs';
 import { C_FULL, C_PASS, C_UNKNOWN } from '../shared/player.mjs';
 import {
   bodiesHere, bodyGeom, bodyWall, trackGeom, bodyLabel, absentText, historyNear, tintOf, solidFn, occupancyOf,
-  BODY_H, BODY_W,
+  BODY_H, BODY_W, MODEL_H, modelBox,
 } from '../web/js/ledger-ghosts.js';
 import { fakeLog } from './fake-ledger.mjs';
 
@@ -74,20 +76,139 @@ test('one buffer holds every standing body, and each body keeps the triangle ran
   }
   assert.equal(at, g.verts, 'and the last range ends where the buffer does');
   // The shape check runs over ONE body's own triangle range: the other two stand elsewhere in the world.
-  const b0 = g.per[0], feet = b0.y, head = b0.y + BODY_H;
-  assert.ok(head - feet > 1.7 && head - feet < 1.9, `a 1.8 block person, got ${head - feet}`);
+  // The figure is the MINECRAFT model, in pixel units (16 px = 1 block): legs 12, torso 12, head 8, so 32 px
+  // = 2.0 blocks to the crown, and the second layer stands half a pixel proud of that. The physics hitbox
+  // (0.6 x 1.8, shared/player.mjs) is a different question and stays what collision and sight use.
+  const b0 = g.per[0], feet = b0.y, mb = modelBox(false, true);
+  assert.ok(Math.abs(mb.h - 33 / 16) < 1e-9, '32px of model, half a pixel proud above and below');
+  assert.ok(Math.abs(mb.top - 32.5 / 16) < 1e-9 && Math.abs(mb.bottom + 0.5 / 16) < 1e-9,
+    'the second layer is inflated on all six sides, so it overhangs the soles too');
+  const halfW = modelBox(false, true).w / 2;              // 8px torso + two 4px arms, +1px of jacket
+  assert.ok(Math.abs(halfW - 17 / 32) < 1e-9, `arms reach ${halfW} blocks either side of the centre`);
   let seen = 0;
   for (let i = b0.from; i < b0.to; i++) {
     const o = i * 3;
-    assert.ok(Math.abs(g.pos[o] - b0.x) <= BODY_W / 2 + 0.2, 'arms stay within a body width of the torso');
-    assert.ok(Math.abs(g.pos[o + 2] - b0.z) <= BODY_W / 2 + 0.1, 'and in z');
+    assert.ok(Math.abs(g.pos[o] - b0.x) <= halfW + 1e-6, 'arms stay inside the model width');
+    // 8px of head is deeper than the 4px torso, and the jacket stands half a pixel proud of both.
+    assert.ok(Math.abs(g.pos[o + 2] - b0.z) <= 9 / 32 + 1e-6, 'nothing reaches past the head, plus its half pixel');
     // 1e-3, not exact: the buffer is Float32, so the crown of the head lands 3e-6 above the ideal.
-    assert.ok(g.pos[o + 1] >= feet - 1e-3 && g.pos[o + 1] <= head + 1e-3, 'nothing floats above the head');
+    assert.ok(g.pos[o + 1] >= feet + mb.bottom - 1e-3 && g.pos[o + 1] <= feet + mb.top + 1e-3,
+      'nothing floats above the crown, and the jacket overhangs the soles by exactly its half pixel');
     seen++;
   }
   assert.equal(seen, b0.to - b0.from, 'every vertex of that range was checked');
   assert.deepEqual(tintOf(0), tintOf(0), 'a player keeps its colour across calls');
   assert.notDeepEqual(tintOf(0), tintOf(1), 'and two players do not share one');
+});
+
+test('the model is the Minecraft figure: 8x8x8 head, 8x12x4 torso, 4x12x4 limbs, in world blocks', () => {
+  // The sizes the request was about, asserted as CORNER POSITIONS rather than vertex counts: a box's eight
+  // corners are where a size claim is either true or false, and overlapping ranges (an arm touches the
+  // torso's top ring) make "how many verts fall in this box" answer a question nobody asked.
+  // No second layer here: a hat inflates every face by half a pixel and hides the numbers it should be
+  // checked against - the overlay's own inflation is asserted separately.
+  const rows = [[1, 40, 64, 40, 2, 1, T(100), 'minecraft:stone', '', HAND]];
+  const { tl, presence, cellOf } = rig(rows);
+  const bodies = bodiesHere(tl, presence, 100, { cellOf });
+  const g = bodyGeom(bodies, { overlay: 0 });
+  assert.equal(g.per.length, 1);
+  const b = g.per[0];
+  const pts = [];
+  for (let k = b.from; k < b.to; k++) pts.push([g.pos[k * 3] - b.x, g.pos[k * 3 + 1] - b.y, g.pos[k * 3 + 2] - b.z]);
+  const px = (n) => n / 16;
+  const has = (x, y, z) => pts.some((p) => Math.abs(p[0] - px(x)) < 1e-6 && Math.abs(p[1] - px(y)) < 1e-6
+    && Math.abs(p[2] - px(z)) < 1e-6);
+  const corners = ([x0, x1, y0, y1, z0, z1]) => {
+    for (const x of [x0, x1]) for (const y of [y0, y1]) for (const z of [z0, z1]) {
+      assert.ok(has(x, y, z), `no corner at ${x},${y},${z} px - the box is not ${x1 - x0}x${y1 - y0}x${z1 - z0}`);
+    }
+  };
+  // head 8 wide, 8 deep, 8 tall, sitting on the torso at y=24
+  corners([-4, 4, 24, 32, -4, 4]);
+  // torso 8 wide, 12 tall, 4 deep
+  corners([-4, 4, 12, 24, -2, 2]);
+  // arms 4 wide, 12 tall, 4 deep, hanging OUTSIDE the torso; legs the same size but side by side UNDER it.
+  // That is the vanilla arrangement and it is why the figure is 16px across while its legs span only 8:
+  // an arm at x=0 would be an arm through the middle of the body.
+  corners([-8, -4, 12, 24, -2, 2]);
+  corners([4, 8, 12, 24, -2, 2]);
+  corners([-4, 0, 0, 12, -2, 2]);
+  corners([0, 4, 0, 12, -2, 2]);
+  // And nothing outside the figure: the whole soup stays inside 16px wide, 8px deep, 32px tall.
+  let loX = Infinity, hiX = -Infinity, loY = Infinity, hiY = -Infinity, loZ = Infinity, hiZ = -Infinity;
+  for (const p of pts) {
+    loX = Math.min(loX, p[0]); hiX = Math.max(hiX, p[0]);
+    loY = Math.min(loY, p[1]); hiY = Math.max(hiY, p[1]);
+    loZ = Math.min(loZ, p[2]); hiZ = Math.max(hiZ, p[2]);
+  }
+  assert.ok(Math.abs(hiX - px(8)) < 1e-6 && Math.abs(loX + px(8)) < 1e-6, '16px across, arms included');
+  assert.ok(Math.abs(hiZ - px(4)) < 1e-6 && Math.abs(loZ + px(4)) < 1e-6, '8px deep, at the head');
+  assert.ok(Math.abs(loY) < 1e-6, 'feet ON the floor block, not in it');
+  assert.ok(Math.abs(hiY - px(32)) < 1e-6, 'crown 32px = 2.0 blocks up');
+  assert.ok(Math.abs(modelBox(false, false).w - 1) < 1e-9 && Math.abs(modelBox(false, false).h - 2) < 1e-9,
+    'and the box the page draws an outline with agrees with the geometry');
+  // UVs exist for every corner and stay inside the single-cell texture.
+  assert.equal(g.uv.length, g.verts * 2, 'a texel coordinate per corner');
+  for (let k = 0; k < g.uv.length; k += 2) {
+    assert.ok(g.uv[k] >= 0 && g.uv[k] <= 1, 'u inside the strip');
+    assert.ok(g.uv[k + 1] >= 0 && g.uv[k + 1] <= 1, 'v inside the strip');
+  }
+});
+
+test('a slim model has 3px arms, and a skinned body samples its own column of the strip', () => {
+  const rows = [];
+  for (let p = 1; p <= 2; p++) rows.push([1, 40 + 100 * p, 64, 40, 2, p, T(100), 'minecraft:stone', '', HAND]);
+  const { tl, presence, cellOf } = rig(rows);
+  const bodies = bodiesHere(tl, presence, 100, { cellOf });
+  // Player 1 wears column 1 and is slim; player 2 has no skin and lands on the white column (2 of 3).
+  const opts = {
+    overlay: 1, columns: 3, whiteColumn: 2,
+    skinOf: (p) => (p === bodies[0].player ? { column: 1, slim: true } : null),
+  };
+  const g = bodyGeom(bodies, opts);
+  assert.equal(g.per[0].skinned, true, 'the first body has a skin');
+  assert.equal(g.per[1].skinned, false, 'and the second does not');
+  assert.equal(g.per[0].slim, true);
+  // Classic: torso+arms = 8+4+4 = 16px. Slim: 8+3+3 = 14px. Measured off the geometry.
+  const span = (e) => {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = e.from; i < e.to; i++) {
+      const x = g.pos[i * 3] - e.x;
+      if (x < lo) lo = x;
+      if (x > hi) hi = x;
+    }
+    return hi - lo;
+  };
+  assert.ok(Math.abs(span(g.per[0]) - 15 / 16) < 1e-5, `slim figure is 14px + 1px of jacket, got ${span(g.per[0]) * 16}`);
+  assert.ok(Math.abs(span(g.per[1]) - 17 / 16) < 1e-5, `classic figure is 16px + 1px, got ${span(g.per[1]) * 16}`);
+  // A skinned body's texel coordinates live in ITS column, and an unskinned one's in the white column.
+  const inCol = (e, col) => {
+    let bad = 0;
+    for (let i = e.from * 2; i < e.to * 2; i += 2) {
+      const px = g.uv[i] * 3 * 64;                    // texel coordinate across the whole strip
+      // <= and >= at the cell edge are allowed on purpose: the rightmost texel column of an arm ends
+      // exactly on the cell boundary, and a vertex sitting on that boundary reads as either side.
+      if (px < col * 64 - 1e-6 || px > (col + 1) * 64 + 1e-6) bad++;
+    }
+    return bad;
+  };
+  assert.equal(inCol(g.per[0], 1), 0, 'the skinned body never samples another player');
+  assert.equal(inCol(g.per[1], 2), 0, 'the skinless body sits on the white column');
+  // A skinned body is tinted white, so the texture is the colour; a skinless one keeps its band colours.
+  const c0 = g.col[g.per[0].from * 3];
+  assert.equal(c0, 1, 'white for a textured body');
+  assert.ok(g.col[g.per[1].from * 3] !== 1 || g.col[g.per[1].from * 3 + 1] !== 1,
+    'the fallback body is tinted, because its strip cell is blank paper');
+});
+
+test('the second layer costs geometry and buys the hat: 36 quads base, 72 with it', () => {
+  const rows = [[1, 40, 64, 40, 2, 1, T(100), 'minecraft:stone', '', HAND]];
+  const { tl, presence, cellOf } = rig(rows);
+  const bodies = bodiesHere(tl, presence, 100, { cellOf });
+  const base = bodyGeom(bodies, { overlay: 0 });
+  const full = bodyGeom(bodies, { overlay: 1 });
+  assert.equal(base.per[0].to - base.per[0].from, 6 * 6 * 6, 'six boxes, six faces, two triangles a face');
+  assert.equal(full.per[0].to - full.per[0].from, 2 * 6 * 6 * 6, 'and the same again, standing proud');
 });
 
 test('the label says who, what they did, how long ago, and how much of the feet position is a guess', () => {

@@ -112,6 +112,7 @@ loop. That is the long-lived entry point; `npm run serve` is the dev one.
 | source | `server/ shared/ web/ tools/` | ~1.3 MB |
 | baked far view | `build/assets build/shells build/lods` | ~157 MB |
 | block history (optional) | `build/ledger/*.ledpack` + `meta.json` | ~2.5 MB (skip `actions.bin`, 32 MB, it is a build input) |
+| player skins (optional) | `build/skins/` | ~0.2 MB; fetched once by `node tools/fetch-skins.mjs`, never by the browser |
 | the save itself | `world/` (only `region/`, `DIM*/region/`, `dimensions/*/region/`, `level.dat`, `data/`, `poi/` are read) | 2.6 GB for this overworld |
 | payload cache | `build/cache` | do **not** ship; it rebuilds itself |
 
@@ -140,6 +141,7 @@ screen can actually show and edit:
 | `WD_CACHE_MAX_GB` | `--cache-max-gb` | `6` |
 | `WD_HOST` / `WD_PORT` | `--host` / `--port` | `0.0.0.0` / `8765` |
 | `WD_PACKS` / `WD_LODS` / `WD_LEDGER` / `WD_ASSETS` | `--packs` … | `/srv/app/build/…` |
+| `WD_SKINS` | `--skins` | `/srv/app/build/skins` (`none` turns the pack off) |
 | `WD_SLOW_MS` / `WD_HEARTBEAT` | `--slow-ms` / `--heartbeat` | `400` / `60` |
 
 Any `WD_*` that is not one of those flags **stops the boot with exit 2** and prints the real flag
@@ -172,6 +174,9 @@ the far view should be and no error. Bake first, on a machine holding the save a
 ```bash
 npm run bake          # census, assets, shells, LOD rungs
 npm run bake:ledger   # block history, if you want the time machine
+node tools/fetch-skins.mjs  # the cast's skins, if you want them: one Mojang call per
+                      # playerdata UUID, and it stops rather than inventing a face for a
+                      # name with no profile (the strip's white cell does that honestly)
 docker build -t mcmap .
 ```
 
@@ -348,6 +353,12 @@ row also has a URL parameter, so a view is a link:
                       at the chest hides a person standing behind a half-wall. Whoever has a clear way in
                       draws with depth off and answers the click; whoever does not, hides. 3 of the 4 people
                       at the meadow party pass, 1 stands behind ground and hides (build/q_ghostseen.js)
+?bodyskin=0           stop wearing the fetched skins: the cast goes back to band colours. The pack is
+                      fetched ONCE by `tools/fetch-skins.mjs` and composed by the server into ONE strip
+                      (a 64px cell per player, last cell solid white), so one texture dresses everybody
+                      and a player with no skin stands on white rather than in a guess
+?bodyovers=0          stop the model's second layer (hat, jacket, sleeves). It is alpha-tested, not
+                      blended, which is also why the inside of a jacket is never drawn
 ?markdepth=0          stop a change marker writing depth, so the overlay paints in BUFFER/log order instead
                       of depth order. That was the default, and it is what "draw order is fucked up" was: a
                       claim farther from the eye won the pixel over a nearer one just by being written later
@@ -432,7 +443,7 @@ MB kept getting flat tiles after the replay was repriced as blocks). The panel b
 ## Tests and measurement
 
 ```bash
-npm test                # 475 tests: formats, codecs, stores, mesher, lighting, collision, deployment contract,
+npm test                # 505 tests: formats, codecs, stores, mesher, lighting, collision, deployment contract,
                         # pool split, ledger, time machine (incl. what a pick may answer and what one
                         # voxel may draw), region coverage, remembered settings, the loading bar's
                         # promise, HTTP endpoints
@@ -442,6 +453,12 @@ node tools/browser-probe.mjs "http://127.0.0.1:8765/?goto=102,119,49&dist=20&res
 node build/parse_fps.cjs <log>                   # the per-state table, machine-read
 node tools/browser-probe.mjs "http://127.0.0.1:8765/?goto=102,119,49&dist=1200&res=1&noautores&bar=0&idle" \
     --wait 14000 --eval-file build/q_lodhidepix.js   # pixel A/B of the baked-tile skip, after the view settles
+node tools/browser-probe.mjs "http://127.0.0.1:8765/?goto=-8,126,90&dist=25&time=1&timecls=0&res=1&noautores&bar=0&idle&tsec=1638&box=18&abovers" \
+    --wait 20000 --eval-file build/q_skinpix.js  # skin vs tint, and jacket vs none, on the pixels each BODY covers
+node tools/browser-probe.mjs "http://127.0.0.1:8765/?goto=-8,126,90&dist=10&time=1&timecls=0&res=1&noautores&bar=0&idle&tsec=1638" \
+    --wait 18000 --eval-file build/q_skinuv.js   # the people mesh's own groups, materials, UV range, and the strip texels
+node tools/browser-probe.mjs "http://127.0.0.1:8765/?goto=-8,126,90&dist=25&time=1&timecls=0&res=1&noautores&bar=0&gsec=1638&gat=-8,126,90" \
+    --wait 16000 --eval-file build/q_m15shot.js --post 3000 --shot 700x460 --out build/shot_skins_party.png
 node tools/mprobe.mjs --shot N url          # A/B two URLs by pixel band difference
 ```
 
