@@ -6,7 +6,7 @@
  *   <root>/<slug>/save/world/...                        the save, read-only
  *   <root>/<slug>/packs/{assets,shells,lods,ledger,skins,embed}
  *
- * That is the shape `tools/world-push.mjs` installs and the shape ONE bind mount covers, so adding a
+ * That is the layout one world push installs, and the shape ONE bind mount covers, so adding a
  * world is dropping a folder: no compose edit, no stack redeploy, no new mount. The folder name is the
  * slug - what `?world=` says, what the payload cache directory is called, and what the page's dropdown
  * offers. A world whose packs are missing is still listed, with the reason it cannot render yet.

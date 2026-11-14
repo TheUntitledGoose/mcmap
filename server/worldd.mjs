@@ -561,17 +561,17 @@ server.listen(PORT, HOST, () => {
       + ` · skins ${sk.available ? `${sk.players} players${sk.without.length ? ` (without: ${sk.without.join(' ')})` : ''}` : 'none'}`);
     if (!packHere(b.paths.shells)) {
       console.log(REG.multi
-        ? `         shells: nothing at ${b.paths.shells ?? '(no packs dir)'} — bake it into the bundle or push it (tools/world-push.mjs)`
+        ? `         shells: nothing at ${b.paths.shells ?? `the packs folder of world '${b.slug}'`} — bake it (node server/bake-shells.mjs) or drop a pack there`
         : `         shells: nothing at ${b.paths.shells} — mount a pack (WD_PACKS) or run node server/bake-shells.mjs`);
     }
     if (!b.lodSummary.tiles) {
       console.log(REG.multi
-        ? `         lods: nothing at ${b.paths.lods ?? '(no packs dir)'} — bake it into the bundle or push it (tools/world-push.mjs)`
+        ? `         lods: nothing at ${b.paths.lods ?? `the packs folder of world '${b.slug}'`} — bake it (node server/bake-lod.mjs) or drop a pack there`
         : `         lods: nothing at ${b.paths.lods} — mount a pack (WD_LODS) or run node server/bake-lod.mjs`);
     }
     if (!packHere(b.paths.ledger)) {
       console.log(REG.multi
-        ? `         ledger: nothing at ${b.paths.ledger ?? '(no packs dir)'} — bake it into the bundle or push it (tools/world-push.mjs)`
+        ? `         ledger: nothing at ${b.paths.ledger ?? `the packs folder of world '${b.slug}'`} — bake it (npm run bake:ledger) or drop a pack there`
         : `         ledger: nothing at ${b.paths.ledger} — mount a pack (WD_LEDGER) or run npm run bake:ledger`);
     }
     if (!sk.available) console.log(`         skins: ${sk.why ?? 'none'} — tools/fetch-skins.mjs fetches them once, never the browser`);

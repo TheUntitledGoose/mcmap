@@ -38,9 +38,9 @@ export const SLUG_OK = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 export function slugOk(s) { return SLUG_OK.test(String(s ?? '')); }
 
 /**
- * Where the save is inside a world directory. Three shapes are accepted, because the second is what a
- * bundle written by `tools/world-push.mjs` looks like and the third is what someone drops in when they
- * just copy a world folder:
+ * Where the save is inside a world directory. Three shapes are accepted, because the second is the
+ * layout one push installs (and the one the README documents) and the third is what someone drops in
+ * when they just copy a world folder:
  *
  *   <dir>/save/world/level.dat      (the layout the plan and the push tool use)
  *   <dir>/world/level.dat           (a bare save folder named by its slug)

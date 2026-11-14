@@ -63,6 +63,13 @@ PLAN.md
 # not source: the live page is web/js/main.js.
 main.js
 
+# Dev-only deployment tooling. It names my box (an ssh target, a remote path, my upload endpoint) and it
+# is a convenience, not part of the viewer: a clone deploys with the compose stack and the pack mounts
+# documented in README. Kept out of git so "tracked" stays the thing that decides what leaves this box -
+# and its test goes with it, because a test that imports a file a clone does not have is a red suite.
+tools/world-push.mjs
+tests/world-push.test.mjs
+
 # Real player handles for this private save. Never publish this: the code, the probes and the docs
 # use "player A".."player G" instead (tools/pseudonymise.mjs).
 .private/

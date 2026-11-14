@@ -52,7 +52,7 @@ const mkWorld = (slug, o) => mkWorldAt(tmp, slug, o);
 
 test('a worlds root is a folder of slugs, and the shape of each save inside it is not fixed', () => {
   const root = at('shapes');
-  mkWorldAt(root, 'a', { shape: 'save' });            // <slug>/save/world/level.dat     (what world-push installs)
+  mkWorldAt(root, 'a', { shape: 'save' });            // <slug>/save/world/level.dat     (the documented layout)
   mkWorldAt(root, 'b', { shape: 'world' });           // <slug>/world/level.dat          (a bare save folder)
   mkWorldAt(root, 'c', { shape: 'direct' });          // <slug>/level.dat                (the folder IS the world)
   const found = discoverWorlds(root);
