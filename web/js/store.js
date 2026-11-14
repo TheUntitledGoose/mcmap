@@ -4,6 +4,7 @@
 // payload, and meshes are derived from it. That is what makes x-ray / filter / log-overlay
 // features possible later without re-fetching the world.
 import { openBatch } from './payload.js';
+import { withWorld } from './world-param.js';
 import { combineLight, lightLevels } from '../../shared/light.mjs';
 
 const key = (cx, cz) => `${cx},${cz}`;
@@ -125,7 +126,9 @@ export class ChunkStore {
       if (this.pending.has(id)) continue;
       this.pending.add(id);
       this.busy++;
-      const url = `/voxels?dim=${encodeURIComponent(this.dim)}&cx0=${t.tx}&cz0=${t.ty}&w=${t.w}&h=${t.h}`;
+      // The save this tab means travels on the URL: a box can hold several, and a tile request that
+      // named nothing would be answered by whichever one the server defaults to.
+      const url = withWorld(`/voxels?dim=${encodeURIComponent(this.dim)}&cx0=${t.tx}&cz0=${t.ty}&w=${t.w}&h=${t.h}`);
       fetch(url)
         .then((r) => (r.ok ? r.arrayBuffer() : null))
         .then((ab) => { if (ab) this.#ingest(t, ab); })

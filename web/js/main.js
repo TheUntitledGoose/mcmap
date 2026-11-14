@@ -18,6 +18,7 @@ import { recordCut, cutPrice, decideCut, mayTakeThread } from '../../shared/cutp
 import { meshKeyTool } from './mesh-key.js';
 import { parkPasses, indexedMatch } from './mesh-bytes.js';
 import { createProgress } from './loading.js';
+import { setWorldSlug, worldSlug, withWorld, worldHref, worldOptions } from './world-param.js';
 import { mountPanel } from './ui.js';
 import { HEIGHT_BIAS } from '../../shared/chunk-format.mjs';
 import { layerAlpha, stackOver, over, dmax } from '../../shared/composite.mjs';
@@ -66,6 +67,11 @@ import { assignSkins } from '../../shared/skinlayout.mjs';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
+// Which save this tab means, taken off the address bar before a single request goes out. Every URL the
+// page builds names it (web/js/world-param.js), because a request that names nothing gets the server's
+// default - and a panel from one save over terrain from another is exactly the wrong answer M18 exists
+// to make impossible.
+setWorldSlug(params.get('world'));
 const num = (name, def) => {
   const v = params.get(name);
   return v === null || v === '' || !Number.isFinite(+v) ? def : +v;   // +null is 0, so test first
@@ -580,6 +586,10 @@ setReadouts(params.has('debug') || params.get('view') === 'flat' ? 1 : 0);
 // away every slider value) - and the dropdown that did it sat inside a pointer-events:none HUD, so
 // it could not even be clicked. That is why "I can't switch dimensions" was true.
 let meta = null;
+// Set when the address bar named a save this server does not have. The page still boots - on whatever
+// default the server offers - but says this in the corner, because a silent substitution is how you end
+// up measuring the wrong save.
+let WORLD_NOTE = '';
 let dimGen = 0;                                  // bumped on every switch; in-flight meshes carry the old one
 const currentDim = () => hud.dim.value || 'minecraft:overworld';
 function dimExtent(id = currentDim()) {
@@ -1087,9 +1097,9 @@ let assetSource = null;     // {json, geo} as fetched, for handing to the mesh w
 
 async function loadAssets() {
   const [json, geo, blob] = await Promise.all([
-    fetch('/assets/atlas.json').then((r) => r.json()),
-    fetch('/assets/geometry.bin').then((r) => r.arrayBuffer()),
-    fetch('/assets/atlas.png').then((r) => r.blob()),
+    fetch(withWorld('/assets/atlas.json')).then((r) => r.json()),
+    fetch(withWorld('/assets/geometry.bin')).then((r) => r.arrayBuffer()),
+    fetch(withWorld('/assets/atlas.png')).then((r) => r.blob()),
   ]);
   assets = new Assets(json, geo);
   // The mesh workers get the same two blobs, so keep the raw copies around for them.
@@ -2625,7 +2635,7 @@ async function loadOverview(dim) {
   overview = null;
   if (!S.overview) return;
   try {
-    const r = await fetch(`/overview?dim=${encodeURIComponent(dim)}`);
+    const r = await fetch(withWorld(`/overview?dim=${encodeURIComponent(dim)}`));
     if (!r.ok) return;                    // not baked yet: the chunk skin carries the far view
     const ab = await r.arrayBuffer();
     if (gen !== dimGen) return;           // dimension changed while this was in flight
@@ -3055,7 +3065,7 @@ async function lodIndexLoad(store) {
   lodIndexPending = true;
   lodIndexError = '';
   try {
-    const r = await fetch(`/lodindex?dim=${encodeURIComponent(store.dim)}`);
+    const r = await fetch(withWorld(`/lodindex?dim=${encodeURIComponent(store.dim)}`));
     if (!r.ok) throw new Error(`http ${r.status}`);
     const j = await r.json();
     if (!Array.isArray(j.tiles)) throw new Error('no tiles field');
@@ -3972,7 +3982,7 @@ function pinMat() {
 // arrive later is a control that silently offers one choice.
 async function ledgerMetaLoad() {
   try {
-    LEDGER.meta = await fetch('/ledger/meta').then((r) => r.json());
+    LEDGER.meta = await fetch(withWorld('/ledger/meta')).then((r) => r.json());
   } catch (e) {
     LEDGER.meta = { available: false, why: `/ledger/meta: ${e.message}` };
   }
@@ -3996,7 +4006,7 @@ async function ledgerLoad() {
   const t0 = performance.now();
   let buf;
   try {
-    const res = await fetch(`/ledger/cells?dim=${encodeURIComponent(dim)}`);
+    const res = await fetch(withWorld(`/ledger/cells?dim=${encodeURIComponent(dim)}`));
     if (!res.ok) { LEDGER.err = `/ledger/cells: HTTP ${res.status}`; return null; }
     buf = await res.arrayBuffer();
   } catch (e) { LEDGER.err = `/ledger/cells: ${e.message}`; return null; }
@@ -4158,7 +4168,7 @@ function ledgerAsk(x, y, z) {
   const url = `/ledger/rows?dim=${encodeURIComponent(currentDim())}&cx=${cx}&cz=${cz}`
     + `&cls=${S.ledgerCls}&player=${S.ledgerWho}&limit=${S.ledgerRows}&near=${bx},${by},${bz}`;
   LEDGER.asks++;
-  return fetch(url).then((r) => {
+  return fetch(withWorld(url)).then((r) => {
     if (!r.ok) { showLedger(`/ledger/rows: HTTP ${r.status}`); return null; }
     return r.json();
   }).then((out) => {
@@ -4990,7 +5000,7 @@ async function timeLoadBody() {
   const t0 = performance.now();
   let buf;
   try {
-    const res = await fetch(`/ledger/timeline?dim=${encodeURIComponent(dim)}`);
+    const res = await fetch(withWorld(`/ledger/timeline?dim=${encodeURIComponent(dim)}`));
     if (!res.ok) { TLAYER.err = `/ledger/timeline: HTTP ${res.status}`; return null; }
     buf = await res.arrayBuffer();
   } catch (e) { TLAYER.err = `/ledger/timeline: ${e.message}`; return null; }
@@ -5402,12 +5412,12 @@ async function skinsLoad() {
   if (SKINS.json || SKINS.why === 'loading') return SKINS.json;
   SKINS.why = 'loading';
   try {
-    const j = await fetch('/skins/strip.json').then((r) => (r.ok ? r.json() : Promise.reject(new Error('strip.json ' + r.status))));
+    const j = await fetch(withWorld('/skins/strip.json')).then((r) => (r.ok ? r.json() : Promise.reject(new Error('strip.json ' + r.status))));
     const img = await new Promise((res, rej) => {
       const i = new Image();
       i.onload = () => res(i);
       i.onerror = () => rej(new Error('strip.png would not decode'));
-      i.src = '/skins/strip.png';
+      i.src = withWorld('/skins/strip.png');
     });
     const t = new THREE.Texture(img);
     t.magFilter = THREE.NearestFilter;             // skin pixels are the art; do not smear them
@@ -7844,6 +7854,12 @@ window.__world = {
   switchDim,
   dims: () => (meta?.dims ?? []).map((d) => d.id),
   dim: () => currentDim(),
+  worlds: () => meta?.worlds ?? [],
+  world: () => worldSlug(),
+  worldNote: () => WORLD_NOTE,
+  worldsHere: () => (meta?.worlds ?? []).filter((w) => !w.problem).map((w) => w.slug),
+  switchWorld,
+  worldHref: (s) => worldHref(s, location.search),
   ground: groundDiag,
   groundReload: () => groundLoad(currentDim()),
   groundAsk: (cx, cz) => ({ has: GROUND.has(cx, cz), known: !!GROUND.reader }),
@@ -8011,7 +8027,7 @@ async function groundLoad(id = currentDim()) {
   GROUND.inflight++;
   const t0 = performance.now();
   try {
-    const r = await fetch(`/regions?dim=${encodeURIComponent(id)}`);
+    const r = await fetch(withWorld(`/regions?dim=${encodeURIComponent(id)}`));
     if (!r.ok) throw new Error(`status ${r.status}`);
     const wire = await r.json();
     if (gen !== GROUND.gen) return null;   // an answer about a dimension we already left
@@ -8102,6 +8118,16 @@ const dimLabel = (id) => DIM_LABEL[id]
 // that did it sat inside the HUD, which is pointer-events:none, so it never even responded to a
 // click. Everything dimension-scoped is dropped here: chunk payloads, their meshes, the heightmap
 // skin and its patches, and the in-flight worker jobs (guarded by dimGen).
+/**
+ * Another save on this server. A navigation, deliberately: a save means a different asset pack (and so
+ * different state ids under the voxels), different far packs, different payload cache. Live-swapping
+ * that under a running camera is how a tab ends up drawing one save's overlay over another's terrain.
+ */
+function switchWorld(slug) {
+  if (!slug || slug === worldSlug()) return;
+  location.href = worldHref(slug, location.search);
+}
+
 function switchDim(id) {
   // A new dimension has new numbers. The old world's counts would hold the bar at some panic that stopped
   // being true the moment the switch started.
@@ -8185,6 +8211,7 @@ const PRESETS = {
 // are not phrases anyone who did not write the mesher should have to decode. Each control keeps its
 // URL name in the tooltip, so a number from HANDOFF.md is still findable.
 function buildPanel() {
+  const worldChoices = worldOptions(meta?.worlds ?? []);
   const dims = (meta?.dims ?? []).map((d) => {
     const e = d.chunkExtent;
     const km = e ? ` (${(Math.max(e.maxX - e.minX + 1, e.maxZ - e.minZ + 1) * CH / 1000).toFixed(0)} km)` : '';
@@ -8198,8 +8225,22 @@ function buildPanel() {
   // tuning knobs left the panel altogether (see HANDOFF.md for their URL names). The zoom slider is
   // gone: the wheel, or a drag on empty sky, already does it.
   const items = [
+      ...(worldChoices.options.length > 1 || worldChoices.broken.length ? [{
+        key: 'world', label: 'save', kind: 'select', nostore: true, options: worldChoices.options,
+        hint: 'Which save on this server this tab is looking at. Every request this page makes names it, '
+          + 'so a save that is not here is refused rather than answered with whichever one booted first. '
+          + 'Choosing one reloads the tab: a save has its own textures, packs and payload cache, and '
+          + 'nothing about the running page carries over except the URL framing. The row below it picks '
+          + 'a dimension inside that save.'
+          + (worldChoices.broken.length
+            ? ` - ${worldChoices.broken.length} more on this box cannot render yet `
+              + `(${worldChoices.broken.map((w) => w.slug).join(', ')}); /meta says why.` : '')
+          + ' URL: ?world=',
+        get: () => worldSlug() || meta?.slug || '', set: (v) => switchWorld(v),
+      }] : []),
       { key: 'dim', label: 'world', kind: 'select', options: dims,
-        hint: 'Which world to look at. Switching keeps every setting and drops nothing but the loaded chunks.',
+        hint: 'Which world (dimension) inside this save to look at. Switching keeps every setting and '
+          + 'drops nothing but the loaded chunks. For a different save use the row above.',
         get: () => currentDim(), set: (v) => switchDim(v) },
       { key: 'walk', label: 'walk around (V)', kind: 'check', live: false,
         fmt: (v) => (v ? `on - ${Math.round(walk.reach)} m` : 'off - orbit'),
@@ -8721,7 +8762,17 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
 (async () => {
   try {
     bootStage('this world');
-    meta = await fetch('/meta').then((r) => r.json());
+    const metaRes = await fetch(withWorld('/meta'));
+    if (!metaRes.ok) {
+      WORLD_NOTE = await metaRes.text();
+      console.error(WORLD_NOTE);
+      setWorldSlug('');                          // ask as "whatever this box defaults to"
+      const again = await fetch('/meta');
+      if (!again.ok) throw new Error(await again.text());
+      meta = await again.json();
+    } else meta = await metaRes.json();
+    // From here on, every request says this save's name - including when the address bar did not.
+    setWorldSlug(meta.slug ?? '');
     if (meta.level?.spawn) SPAWN = meta.level.spawn;
     hud.dim.innerHTML = (meta.dims ?? [])
       .map((d) => `<option value="${d.id}">${dimLabel(d.id)}</option>`).join('');
@@ -8786,7 +8837,9 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     requestAnimationFrame(frame);
     // The pill is quiet unless something is wrong or something is arriving. What the save contains
     // is a fact for ?debug=1, not a caption over the world.
-    hud.msg.textContent = '';
+    hud.msg.textContent = WORLD_NOTE
+      ? `that link names a save this server does not have - showing '${meta.slug}'.` : '';
+    if (WORLD_NOTE) hud.msg.classList.add('err');
     hud.dim.addEventListener('change', () => switchDim(hud.dim.value));
   } catch (e) {
     bootError = e;

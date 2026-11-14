@@ -676,8 +676,10 @@ test('the cast is dressed from one strip, not one texture per player', () => {
   // The pack is composed by the server and fetched as ONE texture + ONE description. Six materials for six
   // players was the easy version and it does not scale: the people layer is one mesh with draw groups, and
   // a per-player material means a per-player texture bind in the same frame.
-  assert.match(src, /fetch\('\/skins\/strip\.json'\)/, 'the page stopped asking the server for the strip');
-  assert.match(src, /i\.src = '\/skins\/strip\.png'/, 'and for its pixels');
+  assert.match(src, /fetch\(withWorld\('\/skins\/strip\.json'\)\)/,
+    'the page stopped asking the server for the strip - and says which save\'s strip it wants');
+  assert.match(src, /i\.src = withWorld\('\/skins\/strip\.png'\)/,
+    'and for its pixels (an <img> src is a request too: a save has its own cast)');
   assert.doesNotMatch(src, /sessionserver|minecraft\.net|textures\.minecraft/,
     'the browser must never contact Mojang: the pack is fetched once by tools/fetch-skins.mjs');
   // Top-down, like the block atlas, with no filtering: a skin is a pixel grid and its cells are adjacent,

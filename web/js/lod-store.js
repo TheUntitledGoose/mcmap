@@ -14,6 +14,7 @@
 //
 // Deliberately DOM-free and three-free so a Node test can exercise the real fetch/decode/hold path.
 import { openLodTile, policyMismatch, LOD_CELL, lodCellDir } from '../../shared/lod-format.mjs';
+import { withWorld } from './world-param.js';
 
 const key = (cell, rx, rz) => `${cell},${rx},${rz}`;
 const posKey = (rx, rz) => `${rx},${rz}`;
@@ -225,7 +226,7 @@ export class LodStore {
   }
 
   url(cell, rx, rz) {
-    return `/lod?dim=${encodeURIComponent(this.dim)}&cell=${cell}&rx=${rx}&rz=${rz}`;
+    return withWorld(`/lod?dim=${encodeURIComponent(this.dim)}&cell=${cell}&rx=${rx}&rz=${rz}`);
   }
 
   pump() {

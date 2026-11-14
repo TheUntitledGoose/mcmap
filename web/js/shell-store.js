@@ -4,6 +4,7 @@
 // here". At ~1 KB per chunk the browser can hold the whole 34x50 region grid of this save as
 // silhouette, which is impossible with ~100 KB payloads.
 import { openShellBatch } from './payload.js';
+import { withWorld } from './world-param.js';
 
 const key = (cx, cz) => `${cx},${cz}`;
 
@@ -101,7 +102,7 @@ export class ShellStore {
       if (this.pending.has(id)) continue;
       this.pending.add(id);
       this.busy++;
-      const url = `/shells?dim=${encodeURIComponent(this.dim)}&cx0=${t.tx}&cz0=${t.ty}&w=${t.w}&h=${t.h}`;
+      const url = withWorld(`/shells?dim=${encodeURIComponent(this.dim)}&cx0=${t.tx}&cz0=${t.ty}&w=${t.w}&h=${t.h}`);
       fetch(url)
         .then((r) => (r.ok ? r.arrayBuffer() : null))
         .then((ab) => { if (ab) this.#ingest(t, ab); })
