@@ -290,6 +290,72 @@ It boots the staged tree from that tree as its only cwd and hits every route the
 pack path that no longer matches the code, or a relative path that only works from the repo root,
 fails there instead of three days later as a hole in the far view.
 
+### More than one save on one box
+
+`--worlds <root>` (env `WD_WORLDS`) instead of `--world`: a folder whose children are saves. The folder
+name is the save's slug, and the slug is what the browser asks with.
+
+```text
+/srv/mcmap/worlds/
+  darkrpg/
+    save/world/level.dat        (also accepted: world/level.dat, or level.dat at the top)
+    packs/assets/atlas.json     the atlas THIS save's payloads are written in
+    packs/{shells,lods,ledger,skins,embed}/
+  skyblock/
+    ...
+```
+
+In the stack that is one read-only mount of the root and two variables, and adding a save is a folder
+drop rather than a compose edit:
+
+```yaml
+WD_WORLDS: /data/worlds
+WD_WORLD_DEFAULT: darkrpg
+# - type: bind
+#   source: ${MCMAP_WORLDS:-./worlds}
+#   target: /data/worlds
+#   read_only: true
+```
+
+A save in that folder that will not open does not take the box down and is not hidden: it is listed with
+its reason, so "where is my other save" has an answer in `/meta` and in the panel instead of only in the
+container log.
+
+**Why each save carries its own packs.** A chunk payload is written as state ids, and those ids are the
+order that save's `assets/atlas.json` lists its states in. Two saves with the same mod set share a state
+table, and both call their biggest dimension folder `region/`, so before this existed one save could be
+answered with another save's payloads and the answer would look plausible. So the pack is part of the
+save's identity, and so is the payload cache directory:
+
+```text
+build/cache/<slug>.<hash of path+seed>/<state table>/<lit|nolight>/<dimension>/<cx>_<cz>.bin
+```
+
+One cache volume can hold several saves without crossover. The boot sweep is told which saves are live
+(`--keep-worlds a,b`), because a box that hosts several must not delete the payloads of the one that is
+warming up. Two `worldd` processes should not share one cache volume while naming different worlds —
+each sweep deletes what the other just wrote.
+
+**`?world=<slug>`.** Every data request the page builds names the save: `/voxels`, `/shells`, `/lod`,
+`/overview`, `/lodindex`, `/regions`, `/assets/…`, `/skins/…`, `/ledger/…`. A slug this box does not have
+is refused by name on a data route, listing the ones it does have:
+
+```text
+unknown world 'nope'; this server serves: darkrpg, skyblock. Omit world= for 'darkrpg'.
+```
+
+The page route is the one place that answers with the default save for an unknown slug, and it says so on
+screen rather than quietly substituting:
+
+```text
+that link names a save this server does not have - showing 'darkrpg'.
+```
+
+Switching save is a navigation, not a live swap. A save has its own atlas, packs, cache and dimension
+list; swapping those under a running camera invites one save's panel over another save's terrain, which
+is a bug that would take a week to notice. The save is not remembered in a cookie either, so two tabs on
+two saves cannot leak each other's choice.
+
 ### What a link to it looks like
 
 A chat bot (Discord, Slack, Telegram) does not run the page. It fetches the HTML, reads `<meta>` tags,

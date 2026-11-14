@@ -73,6 +73,17 @@ services:
         source: ${MCMAP_SAVE:-./DarkRPG}
         target: /data/DarkRPG
         read_only: true
+      # More than one save on this box: mount the whole worlds root and name it, instead of WD_WORLD.
+      # Each child folder is a save, named by that folder, and carries its own packs/ beside its save/
+      # because a chunk payload is written in the state ids of THAT save's atlas. Adding a save is then
+      # a folder drop, not a compose edit. (README, "More than one save on one box".)
+      #   WD_WORLDS: /data/worlds
+      #   WD_WORLD_DEFAULT: darkrpg
+      # and beside the save mount:
+      #   - type: bind
+      #     source: ${MCMAP_WORLDS:-./worlds}
+      #     target: /data/worlds
+      #     read_only: true
       # The payload cache. A named volume survives redeploys; delete it whenever you like.
       - mcmap-cache:/data/cache
 

@@ -80,6 +80,9 @@ export function openWorldsRoot({ root, defaultSlug = '', cache = null, cacheMaxG
     // same folder name gets a different directory.
     const b = openWorld({
       slug: w.slug, dir: w.dir, cache, cacheMaxGb, worldTag: w.slug,
+      // The tag came from the folder this save was dropped into, not from a flag: the boot log has to say
+      // that, or an operator reading "from --world-tag darkrpg" goes hunting for a line in the stack.
+      worldTagFrom: 'the folder name in the --worlds root',
       // `|| dir/packs/assets` even when absent, so the "no asset pack" sentence names the place this
       // world's pack should be rather than a generic build/assets.
       paths: { ...w.packs, assets: w.packs.assets || path.join(w.dir, 'packs', 'assets'),

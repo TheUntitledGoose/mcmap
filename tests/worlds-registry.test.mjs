@@ -97,6 +97,10 @@ test('two worlds with the same atlas share a state table and must not share one 
   assert.equal(a.tableTag, b.tableTag, 'same atlas, so the state-table tag says they match');
   assert.notEqual(a.worldTag, b.worldTag, 'the slug is what tells them apart');
   assert.ok(a.worldTag.startsWith('one.'), `a slug-named tag should still read as the slug, got ${a.worldTag}`);
+  // The boot log explains where a cache directory name came from. For a --worlds folder that answer is
+  // "the folder it was dropped in": saying `--world-tag one` would send an operator hunting for a flag
+  // that nobody typed.
+  assert.match(a.svc.worldTagFrom, /folder name in the --worlds root/, 'and the log says where the tag came from');
   assert.notEqual(a.svc.cachePath('minecraft:overworld', 5, 7), b.svc.cachePath('minecraft:overworld', 5, 7),
     'chunk 5,7 decoded for one world must not be readable as the other world\'s answer');
 });
@@ -177,6 +181,8 @@ test('one --world save stays exactly the shape it always was', () => {
     cache: null,
   });
   assert.ok(!b.problem, 'opened');
+  assert.equal(b.svc.worldTagFrom, 'the world directory and its seed',
+    'a single save still explains its tag the old way');
   const reg = new WorldRegistry({ bundles: [b], defaultSlug: '' });
   assert.equal(reg.multi, false, 'a single unnamed world is not a multi-world box');
   assert.equal(reg.resolve(null).slug, '', 'a request with no world= gets it');

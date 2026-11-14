@@ -119,7 +119,7 @@ export function worldLabel(worldDir, slug = '') {
  * `{ slug, problem }` - a sentence that names the pack and the verb that would have made it exist.
  */
 export function openWorld({ slug = '', dir = '', paths, cache = null, cacheMaxGb = 2,
-  worldTag = '', coverageTtlMs, log = () => {} } = {}) {
+  worldTag = '', worldTagFrom = '', coverageTtlMs, log = () => {} } = {}) {
   const off = (v) => (v === 'none' || !v ? null : v);
   const P = {
     world: paths.world,
@@ -172,6 +172,7 @@ export function openWorld({ slug = '', dir = '', paths, cache = null, cacheMaxGb
     lodDir: P.lods,
     stamp,
     worldTag,
+    ...(worldTagFrom ? { worldTagFrom } : {}),
     cacheMaxGb,
     ...(coverageTtlMs ? { coverageTtlMs } : {}),
   });

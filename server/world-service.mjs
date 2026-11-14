@@ -147,7 +147,11 @@ export class WorldService {
       // worldTagFor sanitizes, so this only fires on something deliberately hostile in --world-tag.
       throw new Error(`world tag '${this.worldTag}' is not a usable directory name (from --world-tag '${opts.worldTag}')`);
     }
-    this.worldTagFrom = opts.worldTag ? `--world-tag ${opts.worldTag}` : 'the world directory and its seed';
+    // What to print in the boot log about where this cache directory name came from. A caller that chose
+    // the tag for its own reason (a --worlds folder, say) says so, because "from --world-tag probe" is a
+    // lie about a flag nobody typed.
+    this.worldTagFrom = opts.worldTagFrom
+      || (opts.worldTag ? `--world-tag ${opts.worldTag}` : 'the world directory and its seed');
     this.regions = new Map();          // path -> { rgn, mtime } for open files, { rgn: null, seenAt } for misses
     this.order = [];                  // eviction list: open region files only, oldest first
     this.missingTtlMs = +(opts.missingTtlMs ?? 300000);
