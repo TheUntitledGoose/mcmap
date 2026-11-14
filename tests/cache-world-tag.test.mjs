@@ -51,8 +51,15 @@ test('every tag the function can produce is one legal directory name', () => {
     `an override escaped the cache directory: ${t}`);
 });
 
-test('--world-tag names the cache, and a name with nothing legal in it still yields a name', () => {
-  assert.equal(worldTagFor({ dir: '/anything/at/all', override: 'darkrpg' }), 'darkrpg');
+test('--world-tag names the cache, and the seed still says which save that name stands for', () => {
+  const named = worldTagFor({ dir: '/anything/at/all', override: 'darkrpg' });
+  assert.ok(named.startsWith('darkrpg.'), `a named tag should still read as the name, got ${named}`);
+  assert.equal(worldTagFor({ dir: '/anything/at/all', override: 'darkrpg', seed: '42' }),
+    worldTagFor({ dir: '/elsewhere/entirely', override: 'darkrpg', seed: '42' }),
+    'the name and seed travel together, so a cache volume can move between boxes');
+  assert.notEqual(named, worldTagFor({ dir: '/anything/at/all', override: 'darkrpg', seed: '77' }),
+    'the same slug over a different save must not inherit that save\'s payloads - rsync and tar keep mtimes, '
+    + 'so the per-chunk staleness check cannot see the swap');
   assert.notEqual(worldTagFor({ dir: '/x', override: 'world one' }), worldTagFor({ dir: '/x', override: 'world-two' }));
   assert.ok(isWorldTag(worldTagFor({ dir: '/x', override: '\u30b9\u30d1\u30a4\u30b7' })));
 });

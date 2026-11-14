@@ -52,17 +52,19 @@ export function tagHash(s) {
 }
 
 /**
- * The tag for one save. `override` (from `--world-tag`) wins outright and is sanitized rather than
- * hashed: with M18's world dropdown, a person names the world, and the cache directory should say that
- * name. Two spellings of one name then share one cache, which is the point; two different names cannot
- * collide. A name that sanitizes to nothing falls back to a hash of the name and the seed.
+ * The tag for one save. `override` (from `--world-tag`, and the slug in the `--worlds` layout) wins as
+ * the *name*, and is sanitized rather than trusted: with M18's world dropdown a person names the world,
+ * and the cache directory should carry that name. The seed still rides along in the hash, so the same
+ * name over a different save is a different directory - the thing that would otherwise let a copied
+ * cache (rsync and tar both keep mtimes, so the per-chunk staleness check cannot see the swap) answer
+ * for a save that is not there any more. Two spellings of one name share one cache, which is the point.
  */
 export function worldTagFor({ dir = '', seed = '', override = '' } = {}) {
   const o = String(override ?? '').trim();
   if (o) {
     const clean = o.toLowerCase().replace(NOT_NAME, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 48);
-    const h = tagHash(`${o}|${seed}`);
-    return clean || h;
+    const h = tagHash(`${clean}|${seed}`);
+    return clean ? `${clean}.${h}` : h;
   }
   const d = String(dir ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
   return `${dirLabel(d)}.${tagHash(`${d}|${seed}`)}`;

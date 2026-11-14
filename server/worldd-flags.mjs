@@ -9,6 +9,9 @@
  */
 export const WORLDD_FLAGS = [
   'world', 'assets', 'cache', 'web', 'vendor', 'ledger', 'port', 'host',
+  // M18: a folder of worlds (WD_WORLDS) instead of one save, and which of them a request gets when it
+  // does not name one. See server/world-registry.mjs; the page asks with ?world=<slug>.
+  'worlds', 'world-default',
   'packs', 'lods', 'skins', 'cache-max-gb', 'cache-keep-h', 'cache-sweep', 'cache-reconcile',
   'slow-ms', 'heartbeat',
   // which save the payload cache belongs to, when the directory and its seed are not answer enough

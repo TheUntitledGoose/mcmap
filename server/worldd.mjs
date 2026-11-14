@@ -40,6 +40,8 @@ import { envArgs } from '../shared/envargs.mjs';
 import { skinStripFor, stripJson, stripPng } from './skin-strip.mjs';
 import { urlBase, pageUrl, embedTags, pngSize, fillEmbed } from '../shared/embed.mjs';
 import { WORLDD_FLAGS } from './worldd-flags.mjs';
+import { openWorld, embedImageFor, packHere } from './world-bundle.mjs';
+import { openWorldsRoot, WorldRegistry } from './world-registry.mjs';
 
 // Every flag the server reads lives in server/worldd-flags.mjs, so an environment variable that
 // does not name one of them is an error instead of a suggestion. tests/container-contract.test.mjs
@@ -67,6 +69,11 @@ const num = (name, dflt) => {
   return Number.isFinite(n) ? n : dflt;
 };
 const WORLD = arg('world', 'DarkRPG/world');
+// M18: a folder of worlds instead of one save. `<root>/<slug>/{save,packs}`; the slug is what `?world=`
+// says and what the payload cache directory is called. Left empty (the default, and every container
+// deployed so far) and this process is exactly what it always was: one save, no `world=` needed.
+const WORLDS = arg('worlds', '');
+const WORLD_DEFAULT = arg('world-default', '');
 const ASSETS = arg('assets', 'build/assets');
 const CACHE = arg('cache', 'build/cache');
 const WEB = arg('web', 'web');
@@ -83,23 +90,10 @@ const lanAddrs = () => Object.values(os.networkInterfaces()).flat()
   .filter((i) => i && i.family === 'IPv4' && !i.internal && !i.address.startsWith('169.254.'))
   .map((i) => i.address);
 
-const atlasPath = path.join(ASSETS, 'atlas.json');
-if (!fs.existsSync(atlasPath)) {
-  // The asset pack is derived (server/pack-assets.mjs, out of your own 1.20.1 jar) and is not in git, so
-  // "absent" is the normal state of a fresh clone or a fresh container. In a container this is the whole
-  // user-visible surface: one exit line, then a restart loop. So name both ways to fix it and the variable
-  // that a mount would set, instead of printing a path with no verb attached to it.
-  console.error(`worldd: no ${atlasPath}`);
-  console.error(`  bake it:   node server/pack-assets.mjs build/census.json ${ASSETS}`);
-  console.error(`             (needs the save and your own 1.20.1 client jar on this machine)`);
-  console.error(`  or mount a baked pack and point the server at it:  --assets <dir>   /   WD_ASSETS=<dir>`);
-  process.exit(1);
-}
-const atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
-const stateIds = buildStateIds(atlas.states.map(s => s.k));
-// The shell builder needs to know which states are full cubes, so a column topped by a flower or
-// a sign reports the block under it. Same classification the browser mesher uses.
-const stateCls = classifyStates(atlas.states, atlas.textures);
+// The asset pack, the state table and the classification tables are opened per world, in
+// server/world-bundle.mjs - see `openWorld` below. What used to be here was a module-scope `atlas`,
+// `stateIds` and `stateCls`, which is exactly the shape that made one process one save.
+
 // Shell packs (server/bake-shells.mjs) turn the far view into a file read. Missing, or baked against
 // a different atlas, and the service derives shells from chunk payloads the slow way.
 const PACKS = arg('packs', 'build/shells');
@@ -123,37 +117,50 @@ const EMBED_URL = arg('embed-url', '');
 const EMBED_TITLE = arg('embed-title', '');
 const EMBED_DESC = arg('embed-desc', '');
 const EMBED_IMAGE = arg('embed-image', '');
-// Counted once at startup: the browser's /meta answer for "is there a baked far layer?".
-const lodSummary = LODS === 'none' ? { dims: 0, tiles: 0, cells: [] } : summarizeLodDir(LODS);
-const stamp = atlasStamp(fs.statSync(path.join(ASSETS, 'atlas.json')), atlas.states.length);
-const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
-  isCubeState: (id) => stateCls.cube[id - 1] === 1,
-  worldTag: WORLD_TAG,
-  // A far column needs two different answers: which block may *paint* it, and which one can hold a
-  // surface up. They are not the same - water holds a lake skin up but must not paint it blue, and a
-  // rose does not hold anything up at all. Both come from the packed atlas, not from block names.
-  isPaintState: (id) => stateCls.cube[id - 1] === 1 && stateCls.opaque[id - 1] === 1,
-  isSolidState: (id) => stateCls.cube[id - 1] === 1,
-  isFilmState: (id) => stateCls.film[id - 1] === 1,
-  packDir: PACKS,
-  lodDir: LODS === 'none' ? null : LODS,
-  stamp,
-  // The payload cache is saved CPU, not data: the whole world re-decodes in ~25 min. Left alone it
-  // grew to 36 GB of unreachable generations, so it gets a byte budget and a startup sweep.
-  // 8 GB was chosen for a dedicated box; this machine also holds a 3.44 GB save and the packs, and the
-  // cache reached 2.1 GB / 628k files without ever crossing that budget. 2 GB holds roughly the whole
-  // overworld at one light generation (284k chunks x ~3.7 KB), which is what a sweep has to refill.
-  cacheMaxGb: num('cache-max-gb', 2),
-});
+/**
+ * One world, from the flags - the shape every deployment has used so far - or every world under a
+ * `--worlds` root. Either way the result is a WorldRegistry of `world-bundle.mjs` objects, and every
+ * route below resolves which one a request means instead of reading module-scope singletons.
+ */
+const NOCACHE = CACHE === 'none' ? null : CACHE;
+const CACHE_MAX_GB = num('cache-max-gb', 2);
+const DEFAULT_CARD = path.join(WEB, 'img', 'embed.png');
 
-// M12: the block-history index. Optional by design - a world without a ledger (or before
-// tools/ledger-export.py has been run) just answers meta with `available: false`.
-const ledger = new LedgerService(LEDGER);
+const REG = (WORLDS === '' || WORLDS === 'none')
+  ? new WorldRegistry({
+    bundles: [openWorld({
+      slug: '', dir: path.dirname(path.resolve(WORLD)),
+      paths: { world: WORLD, assets: ASSETS, shells: PACKS, lods: LODS, ledger: LEDGER,
+        skins: SKINS, embed: null, defaultEmbed: DEFAULT_CARD },
+      cache: NOCACHE, cacheMaxGb: CACHE_MAX_GB, worldTag: WORLD_TAG,
+    })],
+    defaultSlug: '',
+  })
+  : openWorldsRoot({
+    root: WORLDS, defaultSlug: WORLD_DEFAULT, cache: NOCACHE, cacheMaxGb: CACHE_MAX_GB,
+    defaultEmbed: DEFAULT_CARD,
+  }).registry;
+
+// A world that will not open is reported and skipped, not fatal - unless it is the only one and it is
+// the save the operator named, in which case there is nothing else on this box to serve and the boot
+// ends with the sentence that says what to bake or mount.
+for (const p of REG.problems) console.error(`worldd: ${p}`);
+const DEF = REG.default;
+if (!DEF || DEF.problem) {
+  console.error(`worldd: ${DEF ? DEF.problem : 'no world to serve'}`);
+  process.exit(1);
+}
+
 
 // `--cache-sweep 0` keeps old generations on purpose (comparing two atlas stamps side by side).
-if (CACHE !== 'none' && num('cache-sweep', 1) !== 0) {
-  const r = pruneCache(CACHE, {
-    keepTags: [String(svc.tableTag)], keepWorlds: [svc.worldTag], keepHours: num('cache-keep-h', 24),
+// The keep lists cover every world this process opens: a payload tree belonging to a world that is no
+// longer on disk is dead weight, and one belonging to a world that IS here is never touched.
+if (NOCACHE && num('cache-sweep', 1) !== 0) {
+  const live = [...REG.bySlug.values()].filter((b) => !b.problem);
+  const r = pruneCache(NOCACHE, {
+    keepTags: live.map((b) => String(b.svc.tableTag)),
+    keepWorlds: live.map((b) => b.svc.worldTag),
+    keepHours: num('cache-keep-h', 24),
     log: (m) => console.log('  cache: ' + m),
   });
   if (r.files) console.log('  cache: swept ' + r.files + ' unreachable files, ' + (r.bytes / 1e9).toFixed(2) + ' GB');
@@ -164,49 +171,19 @@ if (CACHE !== 'none' && num('cache-sweep', 1) !== 0) {
 // which is how a busy pan could freeze the server for over a minute (build/dbg-cachewalk.mjs timed that
 // walk at 98 s for 665 427 files). `--cache-reconcile 0` skips it; tools/cache-prune.mjs is the offline
 // version of the same job.
-if (CACHE !== 'none' && num('cache-reconcile', 1) !== 0) {
+if (NOCACHE && num('cache-reconcile', 1) !== 0) {
   setTimeout(() => {
-    svc.sweepCacheBudget().catch((e) => console.log('  cache: reconcile failed: ' + (e.message ?? e)));
+    for (const b of REG.bySlug.values()) {
+      if (b.problem) continue;
+      b.svc.sweepCacheBudget().catch((e) => console.log('  cache: reconcile failed: ' + (e.message ?? e)));
+    }
   }, 5000).unref();
 }
 
-// The skin pack, read once and re-read only when the manifest moves. Decoding six 64x64 PNGs per request
-// would be silly, and a pack that changed under a running server (someone ran tools/fetch-skins.mjs) has
-// to be picked up without a restart, so the key is the manifest's mtime.
-let skinCache = null;
-function skinsNow() {
-  if (SKINS === 'none') return null;
-  const r = skinStripFor(SKINS);
-  if (!r.pack) return null;
-  if (!skinCache || skinCache.mtime !== r.mtime) skinCache = r;
-  return skinCache;
-}
-function skinsSummary() {
-  const s = skinsNow();
-  if (!s) return { available: false, why: SKINS === 'none' ? 'skins disabled' : `no pack under ${SKINS}: run tools/fetch-skins.mjs` };
-  return {
-    available: true, generated: s.pack.generated, players: s.pack.list.length,
-    without: s.pack.missing.map((m) => m.name),
-  };
-}
+// The skin pack and level.dat are read per world, by the bundle (`W.skins()`, `W.level()`,
+// `W.skinSummary()`): a second save has its own cast and its own version, and one module-scope memo
+// would answer for both. What stays here is the encoding of the strip for the wire (stripJson/stripPng).
 
-function levelSummary() {
-  try {
-    const dat = zlib.gunzipSync(fs.readFileSync(path.join(WORLD, 'level.dat')));
-    const d = readNbt(dat).value.Data;
-    return {
-      name: String(d.LevelName ?? ''),
-      // Version.Id is the protocol number - 3465 for 1.20.1 - and /meta used to print it as "version",
-      // which reads like a very old Minecraft. Version.Name is the thing a person calls it; the number
-      // is still there, under the name it actually has.
-      version: String(d.Version?.Name ?? d.version?.Name ?? ''),
-      protocol: Number(d.Version?.Id ?? 0),
-      dataVersion: Number(d.DataVersion ?? 0),
-      spawn: [Number(d.SpawnX ?? 0), Number(d.SpawnY ?? 0), Number(d.SpawnZ ?? 0)],
-      gameType: Number(d.GameType ?? -1), hardcore: Number(d.hardcore ?? 0), difficulty: String(d.difficulty ?? ''),
-    };
-  } catch (e) { return { error: String(e.message ?? e) }; }
-}
 
 /*
  * The card a chat link becomes.
@@ -218,51 +195,31 @@ function levelSummary() {
  * no rebuild: the same "mount a pack, not an image" rule as the shells and the skins.
  */
 const EMBED_MARK = '<!--embed-->';
-let levelCache = null;
-const levelOnce = () => (levelCache ??= levelSummary());
 
 /**
- * What to call this save. LevelName is often literally "world" - it is here - which names a folder
- * rather than a server, so the card asks the directory the save lives in instead: /data/DarkRPG/world
- * is DarkRPG, which is what anybody pointing at it would say.
+ * The card, per world. A deployment's own picture wins over the drawn default (`embedImageFor`), the
+ * title names the save this request is about, and the description is assembled from what that world
+ * actually has - never from a bounding box, because a bounding box is a rectangle and a world is not.
  */
-function worldLabel() {
-  const nm = String(levelOnce().name || '').trim();
-  if (nm && !/^world\d*$/i.test(nm)) return nm;
-  const dir = path.resolve(WORLD);
-  const base = path.basename(dir);
-  return /^world\d*$/i.test(base) ? path.basename(path.dirname(dir)) : base;
-}
+function embedImageFile(W) { return embedImageFor(W.paths, EMBED_IMAGE); }
 
-function embedImageFile() {
-  // A named file, then a card in the image's own build dir, then a card in the mounted pack, then the
-  // drawn default that ships with the code. The middle two are the ones a deployment uses: a picture of
-  // its own world is data it mounts, not something that has to be baked into an image and rebuilt.
-  const cand = [EMBED_IMAGE, path.join('build', 'embed.png'),
-    path.join('build', 'embed', 'embed.png'), path.join(WEB, 'img', 'embed.png')].filter(Boolean);
-  for (const f of cand) if (fs.existsSync(f)) return f;
-  return null;
-}
-
-function embedTitle() {
+function embedTitle(W) {
   if (EMBED_TITLE) return EMBED_TITLE;
-  return `${worldLabel()}: the whole save in a browser tab`;
+  return `${W.label}: the whole save in a browser tab`;
 }
 
-// Honest, and assembled from what the boot already knows: no invented "284,239 chunks" from a bounding
-// box, because a bounding box is a rectangle and a world is not.
-function embedDescription() {
+function embedDescription(W) {
   if (EMBED_DESC) return EMBED_DESC;
-  const lv = levelOnce();
-  const dims = svc.dimList();
-  const rows = ledger.ready ? (ledger.loadMeta()?.totalRows ?? 0) : 0;
+  const lv = W.level();
+  const dims = W.svc.dimList();
+  const rows = W.ledger.ready ? (W.ledger.loadMeta()?.totalRows ?? 0) : 0;
   const save = `${lv.version ? `Minecraft ${lv.version} ` : ''}save, ${dims.length} dimension${dims.length === 1 ? '' : 's'}`;
   const what = 'streamed into a browser tab \u2014 pan the whole world, walk it in first person';
   const when = rows ? `, and step back through ${Number(rows).toLocaleString('en-US')} logged block changes` : '';
   return `${save}: ${what}${when}.`;
 }
 
-function embedHead(req, u) {
+function embedHead(req, u, W) {
   const at = {
     override: EMBED_URL,
     forwardedHost: req.headers['x-forwarded-host'], host: req.headers.host,
@@ -276,9 +233,9 @@ function embedHead(req, u) {
     path: u.pathname === '/index.html' ? '/' : u.pathname,
     search: u.search || '',
   });
-  const file = embedImageFile();
+  const file = embedImageFile(W);
   return embedTags({
-    title: embedTitle(), description: embedDescription(), url,
+    title: embedTitle(W), description: embedDescription(W), url,
     image: file ? `${urlBase(at)}/embed.png` : null,
     size: file ? pngSize(fs.readFileSync(file)) : null,
   });
@@ -286,10 +243,10 @@ function embedHead(req, u) {
 
 /** The page, with this request's card written into it. */
 let embedWarned = -1;
-function embedPage(req, u) {
+function embedPage(req, u, W) {
   const file = path.join(WEB, 'index.html');
   const html = fs.readFileSync(file, 'utf8');
-  const r = fillEmbed(html, EMBED_MARK, embedHead(req, u));
+  const r = fillEmbed(html, EMBED_MARK, embedHead(req, u, W));
   if (!r.filled && embedWarned !== r.marks) {
     embedWarned = r.marks;
     console.log(`worldd: ${file} carries ${r.marks} \`${EMBED_MARK}\` marker(s), expected exactly 1 - ` +
@@ -338,9 +295,13 @@ function send(req, res, code, body, type, extra = {}) {
   res.end(body);
 }
 
-function serveFile(res, req, file) {
+function serveFile(res, req, file, allow = []) {
   const p = path.resolve(file);
-  if (!p.startsWith(path.resolve(process.cwd()))) return send(req, res, 404, 'outside repo', 'text/plain');
+  // The repo rule is what stops `/assets/../../../etc/passwd`. A world's packs are NOT inside the repo
+  // in the multi-world layout (`/data/worlds/<slug>/packs/...`), so the roots this process was told
+  // about are allowed as well - and only those, still resolved, still containment-checked.
+  const inside = (r) => r && (p === path.resolve(r) || p.startsWith(path.resolve(r) + path.sep));
+  if (!inside(process.cwd()) && !allow.some(inside)) return send(req, res, 404, 'outside the served roots', 'text/plain');
   if (!fs.existsSync(p) || fs.statSync(p).isDirectory()) return send(req, res, 404, 'not found', 'text/plain');
   const body = fs.readFileSync(p);
   const type = MIME[path.extname(p).toLowerCase()] ?? 'application/octet-stream';
@@ -363,12 +324,15 @@ let reqSeq = 0;
 // Just enough of the query to replay the request; the asset and vendor paths carry nothing useful.
 function reqTag(u) {
   const q = u.searchParams, p = u.pathname;
+  // Which world this request is about, when the request said so: a slow line that names the save is the
+  // difference between "the server is slow" and "that save is cold".
+  const ws = q.get('world') ? ` world=${q.get('world')}` : '';
   if (p === '/voxels' || p === '/shells') {
-    return `${p} ${q.get('dim') ?? '-'} ${q.get('cx0')},${q.get('cz0')} ${q.get('w')}x${q.get('h')}`;
+    return `${p} ${q.get('dim') ?? '-'} ${q.get('cx0')},${q.get('cz0')} ${q.get('w')}x${q.get('h')}${ws}`;
   }
-  if (p === '/lod') return `${p} ${q.get('dim') ?? '-'} cell=${q.get('cell')} ${q.get('rx')},${q.get('rz')}`;
-  if (p === '/voxel' || p === '/shell') return `${p} ${q.get('dim') ?? '-'} ${q.get('cx')},${q.get('cz')}`;
-  return p;
+  if (p === '/lod') return `${p} ${q.get('dim') ?? '-'} cell=${q.get('cell')} ${q.get('rx')},${q.get('rz')}${ws}`;
+  if (p === '/voxel' || p === '/shell') return `${p} ${q.get('dim') ?? '-'} ${q.get('cx')},${q.get('cz')}${ws}`;
+  return p + ws;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -396,6 +360,18 @@ const server = http.createServer(async (req, res) => {
   res.on('finish', count);
   res.on('close', count);
   try {
+    // Which save does this request mean? `?world=<slug>` in a multi-world process, the one save otherwise.
+    // An unknown slug is a 404 that names what does exist: answering it with the default world would put
+    // a different save on screen than the one the person asked for, with nothing on screen saying so.
+    const W0 = REG.resolve(q.get('world'));
+    // A *page* request with an unknown slug still gets the page, on the default world: the browser can
+    // then say "that world is not on this box - these are" inside the map instead of as a wall of text,
+    // and the person can pick one. Every data route still refuses, because answering a data request
+    // with a different save than was asked for is the failure this whole arrangement exists to prevent.
+    const W = W0 ?? ((u.pathname === '/' || u.pathname === '/index.html') ? REG.default : null);
+    if (!W) return send(req, res, 404, REG.whyMiss(q.get('world')), 'text/plain');
+    if (W.problem) return send(req, res, 503, `${W.slug || W.paths.world}: ${W.problem}`, 'text/plain');
+    const svc = W.svc, ledger = W.ledger;
     // Where the time actually goes: a decode is 25 ms of work hidden behind a 0.1 ms file read, and
     // a regionOpen means the payload cache did not absorb the request.
     if (u.pathname === '/stats') {
@@ -404,13 +380,15 @@ const server = http.createServer(async (req, res) => {
         byPath[p] = { n: e.n, ms: +e.ms.toFixed(0), max: +e.max.toFixed(0), slow: e.slow,
           kb: +(e.bytes / 1024).toFixed(0) };
       }
-      send(req, res, 200, JSON.stringify({ ...svc.stats, worldTag: svc.worldTag, tableTag: String(svc.tableTag),
+      send(req, res, 200, JSON.stringify({ ...svc.stats, slug: W.slug, label: W.label,
+        worldTag: svc.worldTag, tableTag: String(svc.tableTag),
         packsOpen: svc.packs.size,
+        worlds: REG.list().map((x) => x.slug ?? ''),
         inflight: INFLIGHT.size, byPath }), 'application/json');
       return;
     }
     if (u.pathname === '/skins/strip.json' || u.pathname === '/skins/strip.png') {
-      const s = skinsNow();
+      const s = W.skins();
       if (!s) return send(req, res, 404, '{"error":"no skin pack"}', 'application/json');
       if (u.pathname.endsWith('.png')) {
         return send(req, res, 200, stripPng(s.strip), 'image/png', { 'Cache-Control': 'no-cache' });
@@ -419,11 +397,17 @@ const server = http.createServer(async (req, res) => {
     }
     if (u.pathname === '/meta') {
       return send(req, res, 200, JSON.stringify({
-        world: WORLD, label: worldLabel(), worldTag: svc.worldTag, level: levelSummary(), dims: svc.dimList(),
-        assets: { states: atlas.states.length, textures: atlas.textures.length, atlasSize: atlas.atlasSize, geometry: atlas.geometry },
+        world: W.paths.world, slug: W.slug, label: W.label, worldTag: svc.worldTag,
+        level: W.level(), dims: svc.dimList(),
+        // M18: what this box offers. The page turns this into a World choice, and a world that failed to
+        // open is listed with its problem rather than hidden - so "where is my other save" is answerable
+        // from the browser instead of from the container log.
+        worlds: REG.list(), defaultWorld: REG.defaultSlug || '',
+        assets: { states: W.atlas.states.length, textures: W.atlas.textures.length,
+          atlasSize: W.atlas.atlasSize, geometry: W.atlas.geometry },
         stats: svc.stats,
-        packed: { shells: fs.existsSync(PACKS), lod: lodSummary, ledger: ledger.ready,
-          skins: skinsSummary() },
+        packed: { shells: !!W.paths.shells && fs.existsSync(W.paths.shells), lod: W.lodSummary,
+          ledger: ledger.ready, skins: W.skinSummary() },
         coverage: { ttlMs: svc.coverageTtlMs },
       }), 'application/json; charset=utf-8');
     }
@@ -527,9 +511,15 @@ const server = http.createServer(async (req, res) => {
       if (!body) return send(req, res, 404, 'no ledger index for that dimension', 'text/plain');
       return send(req, res, 200, JSON.stringify(body), 'application/json; charset=utf-8');
     }
-    if (u.pathname.startsWith('/assets/')) return serveFile(res, req, path.join(ASSETS, u.pathname.slice(8)));
+    if (u.pathname.startsWith('/assets/')) {
+      if (!W.paths.assets) return send(req, res, 404, 'no asset pack for this world', 'text/plain');
+      return serveFile(res, req, path.join(W.paths.assets, u.pathname.slice(8)), [W.paths.assets]);
+    }
     // the skin manifest and the individual PNGs, for poking at; the page only asks for the strip
-    if (u.pathname.startsWith('/skins/')) return serveFile(res, req, path.join(SKINS, u.pathname.slice(7)));
+    if (u.pathname.startsWith('/skins/')) {
+      if (!W.paths.skins) return send(req, res, 404, 'no skin pack for this world', 'text/plain');
+      return serveFile(res, req, path.join(W.paths.skins, u.pathname.slice(7)), [W.paths.skins]);
+    }
     if (u.pathname.startsWith('/shared/')) return serveFile(res, req, path.join('shared', u.pathname.slice(8)));
     // three is served straight out of node_modules; the build/ dir is self-contained (its
     // three.module.js imports ./three.core.js by relative path).
@@ -537,12 +527,12 @@ const server = http.createServer(async (req, res) => {
     // The card's picture, whatever made it: a deployment's own screenshot at build/embed.png wins over
     // the drawn default, with no rebuild and no restart - the same rule the shells and skins follow.
     if (u.pathname === '/embed.png') {
-      const f = embedImageFile();
-      return f ? serveFile(res, req, f)
+      const f = embedImageFile(W);
+      return f ? serveFile(res, req, f, [path.dirname(f)])
         : send(req, res, 404, 'no embed image: run `node tools/make-embed.mjs`, or put a PNG at build/embed.png', 'text/plain');
     }
     const rel = u.pathname === '/' ? 'index.html' : u.pathname.slice(1);
-    if (rel === 'index.html') return send(req, res, 200, embedPage(req, u), 'text/html; charset=utf-8');
+    if (rel === 'index.html') return send(req, res, 200, embedPage(req, u, W), 'text/html; charset=utf-8');
     return serveFile(res, req, path.join(WEB, rel));
   } catch (e) {
     return send(req, res, 500, `error: ${e.message}`, 'text/plain');
@@ -557,26 +547,46 @@ server.listen(PORT, HOST, () => {
   }
   // "the directory exists" is a different question from "the pack is here": a container built from a clone
   // has every pack directory present, holding one keep file each. Count the entries, and name the variable
-  // a mount should set, so this log answers "did my mount actually arrive?".
-  const packHere = (d) => (d === 'none' || !fs.existsSync(d)) ? 0
-    : fs.readdirSync(d).filter((f) => f !== '.keep' && !f.startsWith('.')).length;
-  console.log(`shell packs: ${packHere(PACKS) ? `${PACKS} (${packHere(PACKS)} entries)` : `nothing at ${PACKS} — mount a pack (WD_PACKS) or run node server/bake-shells.mjs`}`);
-  console.log(`lod tiles: ${lodSummary.tiles ? `${LODS} (${lodSummary.tiles} tiles, ${lodSummary.dims} dimensions)` : `nothing at ${LODS} — mount a pack (WD_LODS) or run node server/bake-lod.mjs`}`);
-  console.log(`  ledger: ${packHere(LEDGER) ? `${LEDGER} (${packHere(LEDGER)} files)` : `nothing at ${LEDGER} — mount a pack (WD_LEDGER) or run npm run bake:ledger`}`);
-  {
-    const sk = skinsSummary();
-    console.log(sk.available
-      ? `   skins: ${SKINS} (${sk.players} players${sk.without.length ? `, without a skin: ${sk.without.join(' ')}` : ''})`
-      : `   skins: ${sk.why}`);
+  // a mount should set, so this log answers "did my mount actually arrive?" - per world, because with
+  // --worlds a box can hold a save whose packs never arrived.
+  const mark = (slug) => (slug === REG.defaultSlug ? '*' : ' ');
+  for (const b of REG.bySlug.values()) {
+    console.log(`  world ${mark(b.slug)} ${b.slug || '(single)'}  ${b.paths.world}` +
+      `${b.problem ? `  FAILED: ${b.problem.split('\n')[0]}` : `  (${b.svc.dims.size} dimensions)`}`);
+    if (b.problem) continue;
+    const sk = b.skinSummary();
+    console.log(`  packs  assets ${b.atlas.states.length} states / ${b.atlas.textures.length} textures`
+      + ` · shells ${packHere(b.paths.shells)} · lods ${b.lodSummary.tiles} tiles/${b.lodSummary.dims} dims`
+      + ` · ledger ${packHere(b.paths.ledger)} files`
+      + ` · skins ${sk.available ? `${sk.players} players${sk.without.length ? ` (without: ${sk.without.join(' ')})` : ''}` : 'none'}`);
+    if (!packHere(b.paths.shells)) {
+      console.log(REG.multi
+        ? `         shells: nothing at ${b.paths.shells ?? '(no packs dir)'} — bake it into the bundle or push it (tools/world-push.mjs)`
+        : `         shells: nothing at ${b.paths.shells} — mount a pack (WD_PACKS) or run node server/bake-shells.mjs`);
+    }
+    if (!b.lodSummary.tiles) {
+      console.log(REG.multi
+        ? `         lods: nothing at ${b.paths.lods ?? '(no packs dir)'} — bake it into the bundle or push it (tools/world-push.mjs)`
+        : `         lods: nothing at ${b.paths.lods} — mount a pack (WD_LODS) or run node server/bake-lod.mjs`);
+    }
+    if (!packHere(b.paths.ledger)) {
+      console.log(REG.multi
+        ? `         ledger: nothing at ${b.paths.ledger ?? '(no packs dir)'} — bake it into the bundle or push it (tools/world-push.mjs)`
+        : `         ledger: nothing at ${b.paths.ledger} — mount a pack (WD_LEDGER) or run npm run bake:ledger`);
+    }
+    if (!sk.available) console.log(`         skins: ${sk.why ?? 'none'} — tools/fetch-skins.mjs fetches them once, never the browser`);
+    console.log(`  cache  ${CACHE === 'none' ? 'off (--cache none)'
+      : `${CACHE} as ${b.svc.worldTag}/<table ${b.svc.tableTag}>/${b.svc.lightTag} — from ${b.svc.worldTagFrom}`}`);
+    for (const d of b.svc.dimList()) {
+      console.log(`    ${d.id.padEnd(24)} regions=${String(d.regions).padStart(4)} chunks<=${d.chunksUpperBound}` +
+        ` x=${d.chunkExtent?.minX}..${d.chunkExtent?.maxX} z=${d.chunkExtent?.minZ}..${d.chunkExtent?.maxZ}`);
+    }
   }
-  console.log(`  world  ${WORLD}  (${svc.dims.size} dimensions)`);
-  console.log(`  cache  ${CACHE === 'none' ? 'off (--cache none)'
-    : `${CACHE} as ${svc.worldTag}/<table ${svc.tableTag}>/${svc.lightTag} — from ${svc.worldTagFrom}`}`);
-  for (const d of svc.dimList()) {
-    console.log(`  ${d.id.padEnd(24)} regions=${String(d.regions).padStart(4)} chunks<=${d.chunksUpperBound}` +
-      ` x=${d.chunkExtent?.minX}..${d.chunkExtent?.maxX} z=${d.chunkExtent?.minZ}..${d.chunkExtent?.maxZ}`);
+  if (REG.multi) {
+    console.log(`  serving ${REG.slugs().length} world(s): ${REG.slugs().join(' ')} - the page asks with ?world=<slug>,`);
+    console.log(`    an unknown slug is refused by name rather than answered with the default (${REG.defaultSlug}).`);
   }
-  console.log(`  states ${atlas.states.length}  textures ${atlas.textures.length}`);
+  for (const p of REG.problems) console.log(`  worlds: ${p}`);
 });
 
 // "The server ain't loading" has three possible answers — dead, wedged, or merely slow — and the log
@@ -588,7 +598,7 @@ server.listen(PORT, HOST, () => {
 const T0 = Date.now();
 const HEARTBEAT = Math.max(0, +arg('heartbeat', 60));
 if (HEARTBEAT) {
-  let prev = { ...svc.stats };
+  let prev = { ...REG.totals() };
   // A 1 s timer that only stamps the time is how the loop gets watched: if the callback lands late, the
   // loop was blocked, and by how much. That is the difference between "the server is slow" and "the
   // server is stuck", which is the question the 11/07 incident was about.
@@ -599,8 +609,12 @@ if (HEARTBEAT) {
     lastTick = now;
   }, 1000).unref();
   setInterval(() => {
+    const now = REG.totals();
     const d = [];
-    for (const [k, v] of Object.entries(svc.stats)) { if (v !== prev[k]) d.push(`${k}+${v - prev[k]}`); prev[k] = v; }
+    for (const [k, v] of Object.entries(now)) {
+      if (typeof v === 'number' && v !== prev[k]) d.push(`${k}+${v - (prev[k] ?? 0)}`);
+      prev[k] = v;
+    }
     let reqN = 0, slowN = 0;
     for (const e of REQ.values()) { reqN += e.n; slowN += e.slow; }
     // Name the stuck requests, not just that something is stuck: one line saying `/voxels ... 64x64 has
@@ -608,7 +622,7 @@ if (HEARTBEAT) {
     const stuck = [...INFLIGHT.values()].filter((v) => performance.now() - v.since > 2000)
       .map((v) => `${v.tag} ${(Math.round((performance.now() - v.since) / 100) / 10)}s`);
     console.log(`hb ${Math.round((Date.now() - T0) / 1000)}s rss=${(process.memoryUsage().rss / 1048576).toFixed(0)}MB` +
-      ` packs=${svc.packs.size} lagMax=${lagMax}ms reqs=${reqN}${slowN ? ` slow=${slowN}` : ''}` +
+      ` worlds=${now.worlds} packs=${now.packsOpen} lagMax=${lagMax}ms reqs=${reqN}${slowN ? ` slow=${slowN}` : ''}` +
       `${d.length ? ' ' + d.join(' ') : ''}${stuck.length ? ` INFLIGHT ${stuck.join(' | ')}` : ''}`);
     lagMax = 0;
   }, HEARTBEAT * 1000).unref();

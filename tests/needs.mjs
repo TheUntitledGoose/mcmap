@@ -41,6 +41,12 @@ export const needServer = () => (HAVE.save && HAVE.packs ? false
 export const needAssetsLedger = () => (HAVE.assets && HAVE.ledger ? false
   : why(`${ASSETS} and ${LEDGER} (npm run bake, then npm run bake:ledger)`));
 
+// Two saves built out of one: the multi-world data tests copy two region files, so they need a save
+// with those two regions in it, plus an atlas for both worlds to share.
+export const needWorlds = () => (HAVE.assets && HAVE.save
+  && existsSync(`${WORLD}/region/r.0.0.mca`) && existsSync(`${WORLD}/region/r.0.1.mca`) ? false
+  : why(`${ASSETS} and a save with world/region/r.0.0.mca and r.0.1.mca (the multi-world tests copy both)`));
+
 /** The shape `classifyStates` / `buildStateIds` accept when there is nothing baked to read. */
 export const EMPTY_ATLAS = { states: [], textures: [], quads: [], variants: [], layers: [] };
 

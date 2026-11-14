@@ -14,6 +14,9 @@ import { encodePngRgba, decodePng } from '../server/png.mjs';
 import { WORLDD_FLAGS } from '../server/worldd-flags.mjs';
 
 const wd = readFileSync('server/worldd.mjs', 'utf8').replace(/\r\n/g, '\n');
+// M18 moved "open one world and know its packs" into its own file, so the card's facts - the level name,
+// the version string, which picture to show - live there now. Assert against the file that holds them.
+const wb = readFileSync('server/world-bundle.mjs', 'utf8').replace(/\r\n/g, '\n');
 const page = readFileSync('web/index.html', 'utf8').replace(/\r\n/g, '\n');
 
 test('the card describes the address the bot used, not a guess baked into a file', () => {
@@ -103,8 +106,9 @@ test('worldd writes the tags into the page and serves the picture the tags name'
   assert.match(wd, /import \{ urlBase, pageUrl, embedTags, pngSize, fillEmbed \} from '\.\.\/shared\/embed\.mjs';/,
     'the policy lives where it can be tested without a save');
   assert.match(wd, /const EMBED_MARK = '<!--embed-->';/, 'the marker has to match the page byte for byte');
-  assert.match(wd, /fillEmbed\(html, EMBED_MARK, embedHead\(req, u\)\)/);
-  assert.match(wd, /if \(rel === 'index\.html'\) return send\(req, res, 200, embedPage\(req, u\)/,
+  assert.match(wd, /fillEmbed\(html, EMBED_MARK, embedHead\(req, u, W\)\)/,
+    'and the card is written for the world this request is about');
+  assert.match(wd, /if \(rel === 'index\.html'\) return send\(req, res, 200, embedPage\(req, u, W\)/,
     'the page goes through the filler, not straight off disk');
   assert.match(wd, /if \(u\.pathname === '\/embed\.png'\)/, 'the card needs a server that serves the image');
   assert.match(wd, /if \(!r\.filled && embedWarned !== r\.marks\)/,
@@ -115,22 +119,29 @@ test('worldd writes the tags into the page and serves the picture the tags name'
   }
   // What the card calls the world: this save's LevelName is literally "world", which names a folder and
   // not a server, and level.dat's Version.Id is the protocol number (3465), not a version anyone knows.
-  assert.ok(wd.includes("if (nm && !/^world\\d*$/i.test(nm)) return nm;"),
-    'a save called "world" has to be named by the directory holding it, or every card says "world"');
-  assert.match(wd, /version: String\(d\.Version\?\.Name/, '/meta must call 1.20.1 what a person calls it');
-  assert.match(wd, /protocol: Number\(d\.Version\?\.Id/, 'and keep the protocol number under its own name');
-  assert.match(wd, /world: WORLD, label: worldLabel\(\)/, 'the page is told what world it is showing');
+  assert.match(wb, /\/\^\(world\|world_nether\|world_the_end\|new world\|\)\?\$\/i/,
+    'a save called "world" has to be named by the directory or slug holding it, or every card says "world"');
+  assert.match(wb, /version: String\(d\.Version\?\.Name/, '/meta must call 1.20.1 what a person calls it');
+  assert.match(wb, /protocol: Number\(d\.Version\?\.Id/, 'and keep the protocol number under its own name');
+  assert.match(wd, /world: W\.paths\.world, slug: W\.slug, label: W\.label/,
+    'the page is told which world it is showing');
 });
 
 test('your own deployment can show your own world, and it does not need a rebuild', () => {
   // build/ is not committed, so a card made from a screenshot of a real save stays on that box
-  const order = wd.match(/const cand = \[[^\]]+\]/)?.[0] ?? '';
-  assert.match(order, /EMBED_IMAGE, path\.join\('build', 'embed\.png'\)/,
-    'a named image wins, then a card sitting in the deployment\'s build dir');
-  assert.match(order, /path\.join\('build', 'embed', 'embed\.png'\)/,
-    'then the mounted pack, so a card can be a volume rather than a rebuild');
-  assert.match(order, /path\.join\(WEB, 'img', 'embed\.png'\)/,
+  const order = wb.match(/function embedImageFor[\s\S]*?const cand = \[[^\]]+\]/)?.[0] ?? '';
+  assert.ok(order, 'the card search order exists in one place (embedImageFor in world-bundle.mjs)');
+  const at = (s) => order.indexOf(s);
+  assert.match(order, /override,/, 'a named image wins');
+  assert.ok(at("paths.embed ? path.join(paths.embed, 'embed.png')") > at('override,'),
+    'then this world\'s own card in its pack folder');
+  assert.ok(at("'build/embed.png'") > at('paths.embed'),
+    'then a card sitting in the deployment\'s build dir, so a local run picks up what you just made');
+  assert.match(order, /paths\.defaultEmbed/,
     'and last the drawn default that ships with the code');
+  assert.match(wd, /defaultEmbed: DEFAULT_CARD/, 'worldd names that default');
+  assert.match(wd, /const DEFAULT_CARD = path\.join\(WEB, 'img', 'embed\.png'\);/,
+    'and it is the committed drawing, not a screenshot of somebody\'s save');
 });
 
 test('the stack can carry a card without a rebuild, and mounts it where the server looks', () => {
@@ -139,7 +150,7 @@ test('the stack can carry a card without a rebuild, and mounts it where the serv
     'a card has to arrive as a pack, the way the shells and the skins do, not as a rebuild');
   // Bind-mounting a host path that does not exist CREATES a directory there, so the server has to look
   // for a file inside the mount rather than at the mount point itself.
-  assert.ok(wd.includes("path.join('build', 'embed', 'embed.png')"),
+  assert.ok(wb.includes("path.join(paths.embed, 'embed.png')"),
     'the mounted card is a file in the pack, not the pack directory');
 });
 
