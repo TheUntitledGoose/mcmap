@@ -17,6 +17,7 @@ import { cutReserve, patchThreadCap } from '../../shared/pool.mjs';
 import { recordCut, cutPrice, decideCut, mayTakeThread } from '../../shared/cutpolicy.mjs';
 import { meshKeyTool } from './mesh-key.js';
 import { parkPasses, indexedMatch } from './mesh-bytes.js';
+import { createProgress } from './loading.js';
 import { mountPanel } from './ui.js';
 import { HEIGHT_BIAS } from '../../shared/chunk-format.mjs';
 import { layerAlpha, stackOver, over, dmax } from '../../shared/composite.mjs';
@@ -55,7 +56,7 @@ import { buildTimeBlocks, markerOfIndex, pickMarkerHit, resetMarkerLift } from '
 // layer never claims: the ledger holds no player coordinates, and this build holds no per-player skins.
 import { nearestVisit, presenceOf, RUN_GAP_SEC } from '../../shared/ghosts.mjs';
 import {
-  absentText, BODY_H, BODY_W, bodyGeom, bodyLabel, bodiesHere, historyNear, occupancyOf, trackGeom,
+  absentText, BODY_H, BODY_W, bodyGeom, bodyLabel, bodiesHere, bodyWall, historyNear, occupancyOf, trackGeom,
 } from './ledger-ghosts.js';
 
 
@@ -293,6 +294,10 @@ const S = {
   // 20,148 of them lost all six and drew nothing ("some blocks are skipped entirely, some faces are not drawn
   // on some sides"). URL: ?timecull=0 turns it off, ?timecull=2 is the whole-filter rule for A/B.
   timeCull: Math.max(0, Math.min(2, num('timecull', 1))),
+  // A logged plant is a cross of quads, and the marker material culls back faces so a logged WALL stops
+  // drawing its own inside. Plants therefore get an explicitly reversed twin (indices only, +24 B/quad).
+  // URL: ?timetwin=0 draws them one-sided, which makes half of every logged plant disappear from one side.
+  timeTwin: num('timetwin', 1) ? 1 : 0,
   // The detail ring's ceiling while the replay runs, in chunks, 0 = leave the radius alone. Asked for and
   // measured, then set down to 0 because it does not pay: at a 140 m pull-back with the 8-chunk default the
   // page held 361 detail meshes / 12.40 M verts / 92.5 fps settled, and 5,709 of the 27,790 changes drawn
@@ -328,6 +333,15 @@ const S = {
   // a marker is an annotation and a body is a claim about the world; 0 = whichever is nearest. An A/B
   // switch, so it is URL-only: ?bodypick=0.
   bodyPick: num('bodypick', 1) ? 1 : 0,
+  // Does nearer real ground hide a change marker? 1 (default): a marker only owns a pixel when no chunk
+  // ground this page holds is in front of it, which is what the depth test already decided about the pixel.
+  // 0: the old rule - the annotation answers no matter what stands in front of it.
+  markPick: Math.max(0, Math.min(2, num('markpick', 1))),
+  markAniso: Math.max(0, Math.min(16, num('markaniso', 8))),
+  // Should a marker whose own sprite is transparent at the aimed texel stop answering for that pixel? 1 is
+  // the honest default (the fragment shader threw it away, so the viewer never saw it); 0 puts the old
+  // geometry-only pick back for A/B.
+  markAlpha: num('markalpha', 1) ? 1 : 0,
   // 1 = a change marker writes depth, so a marker in FRONT of another marker hides the far one instead of
   // both painting over each other in buffer order. It is OFF by default because of what it does to people:
   // a marker over the very voxel a body stands in is nearer than that body, so its depth buries the person
@@ -336,8 +350,17 @@ const S = {
   // layer sits on the grid and culls its inside - and tried from the other side (people drawn at 901, before
   // the markers), six mine framings searched and five had the page's own pick answer "body" while the aimed
   // pixel showed marker paint: a click and a picture that disagree are worse than either cause.
-  // URL: ?markdepth=1 turns marker depth-writing on for the A/B.
-  markDepth: num('markdepth', 0) ? 1 : 0,
+  // The marker layer sorts ITSELF. With no depth-write the layer is painted in log order, so a claim logged
+  // later wins the pixel against a block that is half a block nearer - measured at 8.6% of a wall framing and
+  // 17.9% of a cave framing, against a control pair that changed 0 pixels (build/q_markerpixab.js). The people
+  // are kept visible some other way (per-body depth policy in `ghostSync`), because a person outranks an
+  // annotation. `?markdepth=0` puts the unsorted layer back for A/B.
+  markDepth: num('markdepth', 1) ? 1 : 0,
+  // The marker layer is ONE material, so it either culls back faces or it does not, and it culls them: a
+  // layer that draws both sides shows the INSIDE of a logged wall's far faces, and while the layer was in log
+  // order those far faces are what won the pixel - "the faces in the back are inverted". URL: ?markside=0
+  // restores two-sided markers for the A/B (pair it with ?timetwin=0 to see the plant twin switch off too).
+  markSide: num('markside', 1) ? 1 : 0,
   // Following a person: how close the orbit comes when follow starts, and how far the camera may be from a
   // body before it JUMPS rather than eases. The snap distance is the measured gap across a silence: over a
   // silence longer than the body gap a hand moves a median 52-155 blocks and a p90 over 1,100
@@ -351,7 +374,15 @@ const S = {
   // evidence that someone is buried - at a real meadow party every such "occluder" was a baked LOD plate
   // 0.65 blocks from the eye while the frame showed the body painted at that pixel. 0 = any drawn layer
   // hides them, which is what this did before it was measured. URL: ?bodywall=0
+  // The loading bar: it appears only while work is pending, and only in a shape the counters support (a
+  // fraction when every wait has a total, a stripe when one of them has none). URL: ?bar=0 for probes that
+  // diff two frames and must not have a moving stripe in them.
+  bar: num('bar', 1) ? 1 : 0,
   bodyWall: num('bodywall', 1) ? 1 : 0,
+  // The picture and the click answer ONE voxel question - is anything solid between the eye and this person?
+  // URL: ?bodyseen=0 goes back to a bare distance contest, which is the thing that let a change marker or a
+  // coarse far patch answer for a person the frame was showing.
+  bodySeen: num('bodyseen', 1) ? 1 : 0,
   // A line around the voxel under the cursor. Cheap by policy, not by luck: one reusable 24-vertex box
   // and one raycast at `hoverMs` intervals, because a highlight that allocates a mesh per hover is a
   // hitch per hover. URL: ?nohover, ?hoverms=60
@@ -474,6 +505,10 @@ lodCellMaxPx: Math.max(1, num('lodcellmax', 8)),
   // lodMatFor). ?nolodclip leaves them drawn everywhere, which is how the coarse layer
   // looked before, cliffs and all.
   lodClip: params.has('nolodclip') ? 0 : (num('lodclip', 1) ? 1 : 0),
+  // A tile the clip would discard ENTIRELY is skipped at the draw call instead of running its whole
+  // vertex stream down the pipeline to throw every fragment away. ?lodhide=0 sends them through.
+  lodHide: params.has('lodhide') ? Math.max(0, Math.min(2, num('lodhide', 1)))
+    : (params.has('nolodhide') ? 0 : 1),
   // Re-cut a coarse patch when a full-resolution chunk lands inside it. Off only to A/B the plate that
   // this exists to remove. URL: ?nopatchdetail
   patchDetail: params.has('nopatchdetail') ? 0 : (num('patchdetail', 1) ? 1 : 0),
@@ -2818,6 +2853,12 @@ const uCovAt = { value: new THREE.Vector2(0, 0) };   // patch coordinate sitting
 const uCovBlk = { value: 256 };                      // blocks per far-grid patch (S.patch * CH)
 const uKill = { value: 0 };                          // debug: unconditional discard for the baked tiles
 let lodClipOn = 0, lodClipRect = [1e9, 1e9, -1e9, -1e9], lodCovPatches = 0, lodCovDetail = 0, lodCovHeld = 0;
+// Patches the live layer actually draws every block of - the same fact the clip texture is built from,
+// kept absolute (no wrap) so a whole baked tile can be tested against it. lodCovAnchor is where the
+// texture window starts: outside it the shader reads a wrapped texel, and a wrapped bit is not the bit
+// this set holds, so a tile touching the window edge is never hidden.
+const lodPaintSet = new Set();
+let lodCovAnchor = [0, 0], lodHidden = 0, lodHiddenVerts = 0;
 let patchDetailMarks = 0;
 let covForce = 0;                                // debug: 1 = everything covered, -1 = nothing, 0 = normal
 let lodKill = 0;                                 // debug: unconditional discard, to prove the patch is live
@@ -2879,6 +2920,7 @@ function updateLodClip() {
   const on = lodActive() && S.shellOn && S.lodClip !== 0;
   const PB = uCovBlk.value = S.patch * CH;
   covData.fill(0);
+  lodPaintSet.clear();
   lodCovPatches = 0;
   lodCovDetail = 0;
   lodCovHeld = 0;
@@ -2889,6 +2931,7 @@ function updateLodClip() {
     const [tcx, tcz] = centerChunk();
     const acx = Math.floor(tcx / S.patch), acz = Math.floor(tcz / S.patch);
     uCovAt.value.set(acx, acz);
+    lodCovAnchor = [acx, acz];
     let x0 = 1e9, z0 = 1e9, x1 = -1e9, z1 = -1e9;
     for (const pk of shellMeshes.keys()) {
       const c = pk.indexOf(',');
@@ -2898,6 +2941,7 @@ function updateLodClip() {
       if (covData[ci]) continue;
       covData[ci] = 255;
       lodCovPatches++;
+      lodPaintSet.add(px + ',' + pz);
       if (px < x0) x0 = px;
       if (pz < z0) z0 = pz;
       if (px + 1 > x1) x1 = px + 1;
@@ -2915,6 +2959,7 @@ function updateLodClip() {
       covData[ci] = 255;
       lodCovPatches++;
       lodCovDetail++;
+      lodPaintSet.add(px + ',' + pz);
     }
     // A patch the live layer owns but has not re-cut *yet* - retired on a pan, waiting out the quiesce
     // window before it is cut again - still owns that ground. Leaving its texel clear is how a baked
@@ -3178,6 +3223,65 @@ function requestLod() {
 
 
 
+/**
+ * Would the clip throw away EVERY fragment of this baked tile?
+ *
+ * The clip discards a coarse fragment wherever a finer layer draws that column, so a tile standing
+ * inside the skin of live detail geometry adds nothing to the picture - but it still pushes its whole
+ * vertex stream through the pipeline to learn that. Measured close in (orbit target 102,119,49, dist
+ * 20, whole world held): 737 draw calls and 2.16M scene vertices, against 528 calls and 1.27M with the
+ * baked layer switched off entirely - so ~880K vertices and ~210 calls were being fed to the GPU only
+ * to be discarded, and that frame cost 624 ms where the same view without them cost 351 ms. At
+ * whole-world framing those tiles ARE the picture, and this answer is false for every one of them.
+ *
+ * The test is the clip's own test, asked of the tile's GEOMETRY: every patch the drawn box touches
+ * must be one the live layer draws every block of (a meshed shell patch, or a full-resolution chunk -
+ * deliberately NOT a patch merely held and awaiting re-cut, which can uncover itself mid-pan), and every
+ * one must sit inside the texture window, so this absolute answer is the same bit the shader read.
+ *
+ * The box, not the region rectangle, because baked caps and edge trees overhang the tile's 512-block
+ * square, and the clip reads the fragment's world position: a first version keyed on the region
+ * rectangle hid a tile whose overhang stood over UNcovered ground, and the pixel A/B caught it - one
+ * pixel of 64 000 changed at a settled whole-world framing, while the control pair changed none.
+ */
+function tileFullyClipped(e) {
+  if (!S.lodHide || !lodPaintSet.size) return false;
+  const PB = S.patch * CH, [acx, acz] = lodCovAnchor, b = e.box;
+  if (!b) return false;
+  const p0 = Math.floor(b.min.x / PB), p1 = Math.floor(b.max.x / PB) + 1;
+  const q0 = Math.floor(b.min.z / PB), q1 = Math.floor(b.max.z / PB) + 1;
+  for (let pz = q0; pz < q1; pz++) {
+    if (Math.abs(pz - acz) >= COV_N) return false;
+    for (let px = p0; px < p1; px++) {
+      if (Math.abs(px - acx) >= COV_N) return false;
+      if (!lodPaintSet.has(px + ',' + pz)) return false;
+    }
+  }
+  return true;
+}
+
+/** Why is this tile (not) skippable? The patch-grid answer, in the units the clip itself uses. */
+function lodHideWhy(k) {
+  const e = lodMeshes.get(k);
+  if (!e) return { k, err: 'tile is not drawn' };
+  const c1 = k.indexOf(','), c2 = k.indexOf(',', c1 + 1);
+  const rx = +k.slice(c1 + 1, c2), rz = +k.slice(c2 + 1);
+  const PB = S.patch * CH, [acx, acz] = lodCovAnchor, b = e.box;
+  const p0 = Math.floor(b.min.x / PB), p1 = Math.floor(b.max.x / PB) + 1;
+  const q0 = Math.floor(b.min.z / PB), q1 = Math.floor(b.max.z / PB) + 1;
+  const miss = [];
+  for (let pz = q0; pz < q1; pz++) {
+    for (let px = p0; px < p1; px++) {
+      if (Math.abs(px - acx) >= COV_N || Math.abs(pz - acz) >= COV_N) { miss.push(px + ',' + pz + '?window'); continue; }
+      if (!lodPaintSet.has(px + ',' + pz)) miss.push(px + ',' + pz);
+    }
+  }
+  return { k, rx, rz, box: [b.min.x, b.min.z, b.max.x, b.max.z], p0, p1, q0, q1,
+    patch: S.patch, anchor: [acx, acz], verts: e.verts,
+    need: (p1 - p0) * (q1 - q0), painted: lodPaintSet.size, miss: miss.slice(0, 30),
+    hidden: tileFullyClipped(e) };
+}
+
 /** Move fetched tiles into drawables. Installing one is one BufferGeometry, so this is cheap. */
 
 function drainLod(now) {
@@ -3231,7 +3335,10 @@ function drainLod(now) {
 
     lodGroup.add(mesh);
 
-    lodMeshes.set(k, { mesh, verts: t.verts });
+    // The patch question is asked about the GEOMETRY, not the region rectangle: a baked cap or a
+    // tree crown at the tile edge sticks out past the tile's own 512-block square, and those
+    // fragments carry THAT world position into the clip. One bounding box per tile, once.
+    lodMeshes.set(k, { mesh, verts: t.verts, box: new THREE.Box3().setFromObject(mesh) });
     made += t.verts;
 
     n++;
@@ -3240,7 +3347,12 @@ function drainLod(now) {
 
   lodVerts = 0;
 
-  for (const e of lodMeshes.values()) lodVerts += e.verts;
+  lodHidden = 0; lodHiddenVerts = 0;
+  for (const [k, e] of lodMeshes) {
+    const gone = tileFullyClipped(e);
+    e.mesh.visible = !gone;
+    if (gone) { lodHidden++; lodHiddenVerts += e.verts; } else lodVerts += e.verts;
+  }
 
   lodTiles = lodMeshes.size;
 
@@ -3259,7 +3371,8 @@ function lodAt(wx, wz) {
   const t = lodStore ? lodStore.get(rx, rz) : null;
 
   return { rx, rz, held: !!t, cell: t ? t.cell : 0,
-    drawn: !!(t && lodMeshes.has(lodStore.key(rx, rz))), verts: t ? t.verts : 0,
+    drawn: !!(t && lodMeshes.get(lodStore.key(rx, rz))?.mesh.visible),
+    clipped: !!(t && !lodMeshes.get(lodStore.key(rx, rz))?.mesh.visible), verts: t ? t.verts : 0,
 
     policy: t ? t.policy : null };
 
@@ -3381,6 +3494,7 @@ function frameBody(now) {
   ghostTick(now);
   ghostFollowCam(dt);
   lap('people');
+  progressTick(now);
   // Refill when idle: request() skips coordinates already held, so this converges on the radius
   // around the camera instead of storming the server every frame. It used to run on every idle
   // frame, which at skin 96 is a 37 000-key scan and sort per frame - about 10 ms of pure
@@ -3707,6 +3821,12 @@ function pick(x, y) {
 // Attribution is fiddly (a hit sits exactly on a face plane), and the two probes must agree about
 // which block a pixel means, so it lives here once.
 /** Real chunk geometry, as opposed to one of the coarse far layers that only approximate the surface. */
+/** Is this object (and every group above it) actually being drawn? three's raycaster does not ask. */
+function isDrawn(o) {
+  for (; o; o = o.parent) if (!o.visible) return false;
+  return true;
+}
+
 function isDetailMesh(o) {
   for (; o; o = o.parent) if (o === lodGroup || o === ovGroup || o === shellGroup) return false;
   return true;
@@ -4071,10 +4191,16 @@ function markerHits(x, y, max = 12) {
   const hits = rc.intersectObject(TLAYER.mesh, false);
   const out = [];
   for (const h of hits) {
-    const item = TLAYER.markerEnd ? markerOfIndex(TLAYER.markerEnd, Math.floor(h.faceIndex / 2) * 6) : -1;
+    const item = markerItemOf(h.faceIndex);
     const row = item >= 0 ? (TLAYER.quadRow?.[item] ?? -1) : -1;
     const xyz = row >= 0 ? timeRowWorld(row) : null;
     out.push({ dist: +h.distance.toFixed(3), item, row: row >= 0 ? row : -1,
+      // Is this claim inside the playhead's draw range at all? A ray answers the whole buffer; the picture
+      // shows only the part of it that has happened by this second.
+      inDrawRange: item >= 0 && (TLAYER.drawn == null || item < TLAYER.drawn),
+      // ... and would its own sprite survive the alpha test at THIS texel? Both are needed before a claim
+      // can be blamed for a pixel; either one alone is a ray answer, not a picture answer.
+      sprite: hitPaints(h), alpha: hitAlpha(h),
       sec: row >= 0 ? TLAYER.tl.sec?.[row] ?? null : null,
       voxel: xyz ? [xyz[0], xyz[1], xyz[2]] : null });
     if (out.length >= max) break;
@@ -4094,9 +4220,19 @@ function timeRowWorld(row) {
  *
  * The time layer is deliberately not in `groups` (nothing else should raycast the overlay), which is why
  * a click on a marker used to fall straight through to the terrain behind it and ask about a voxel the
- * pointer was never on. three honours `geometry.drawRange` in its raycast, so a marker the playhead has
- * not reached yet cannot be hit - the answer is about what is on screen, not about the whole buffer.
+ * pointer was never on. And a raycast does NOT honour `geometry.drawRange` - measured: with the playhead at
+ * 34,724 of 289,072 claims, rays answered items 59,602 and 39,906, which the frame had not drawn. So the hits
+ * are filtered to the drawn range here: the answer is about what is on screen, not about the whole buffer.
  */
+/** Which buffer item a raycast triangle belongs to, or -1. A quad is 2 triangles = 6 indices. */
+function markerItemOf(faceIndex) {
+  if (!TLAYER.markerEnd) return Math.floor(faceIndex / 2);        // flat tiles: one quad per item
+  // A triangle is 3 indices and a quad is 2 triangles, so a hit triangle sits at quad*6 = floor(q/2)*6 in
+  // the index buffer. Asking with q*6 asks at twice the offset and returns a marker further along the
+  // buffer: the probe saw a ray aimed at row 350222 answer row 301547.
+  return markerOfIndex(TLAYER.markerEnd, Math.floor(faceIndex / 2) * 6);
+}
+
 function timeHitAt(x, y) {
   if (!TLAYER.mesh || !TLAYER.mesh.visible || !TLAYER.tl) return null;
   camera.updateMatrixWorld();
@@ -4104,7 +4240,26 @@ function timeHitAt(x, y) {
   rc.setFromCamera(new THREE.Vector2((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1), camera);
   rc.far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
   const t0 = performance.now();
-  const hit = pickMarkerHit(rc.intersectObject(TLAYER.mesh, false));
+  // The buffer holds EVERY claim in the filter; the playhead draws only the first `TLAYER.drawn` of them.
+  // A raycast does not know about `setDrawRange`, so without this filter a click answers a change that has
+  // not happened yet at the second being shown - the pixel is empty of it, and the card talks about a block
+  // from a later day. Filter the hits by item BEFORE the tie-break, or the newest-wins rule picks a future
+  // claim over the present one that is actually painted.
+  const hits = [];
+  for (const h of rc.intersectObject(TLAYER.mesh, false)) {
+    const it = markerItemOf(h.faceIndex);
+    if (it < 0) continue;
+    if (TLAYER.drawn != null && it >= TLAYER.drawn) continue;
+    h.item = it;
+    hits.push(h);
+  }
+  // The framebuffer keeps the NEAREST fragment that survives `alphaTest`; a raycast knows nothing about that.
+  // So walk the hits front to back and answer with the first one whose sprite would paint here. A plant
+  // marker is a cross of quads and a cube is a shell: the face the ray met first can be transparent while
+  // the same marker is what fills the pixel, and answering the transparent face throws the whole marker out.
+  const solid = hits.filter((h) => hitPaints(h));
+  TLAYER.markCut = hits.length - solid.length;      // faces this click's own sprite rejected
+  const hit = pickMarkerHit(solid.length ? solid : hits);
   TLAYER.hitMs = performance.now() - t0;          // 42 ms on a whole-dimension buffer: a click's cost
   if (!hit) return null;
   // One triangle per face of a marker: the geometry is indexed, and a flat tile is one quad = 6 indices.
@@ -4112,7 +4267,10 @@ function timeHitAt(x, y) {
   let row = -1, item = -1;
   // `quadRow` is the row mapping for BOTH looks, and `markerEnd` only exists when an item is bigger than
   // one quad. Naming them separately (markerRow) once made this read an undefined array.
-  if (TLAYER.markerEnd) {
+  if (hit.item != null) {
+    item = hit.item;
+    row = TLAYER.quadRow?.[item] ?? -1;
+  } else if (TLAYER.markerEnd) {
     // A triangle is 3 indices and a quad is 2 triangles, so a hit triangle sits at quad*6 = floor(q/2)*6
     // in the index buffer. Asking with q*6 asks at twice the offset and returns a marker further along
     // the buffer: the probe saw a ray aimed at row 350222 answer row 301547.
@@ -4124,9 +4282,40 @@ function timeHitAt(x, y) {
   if (row < 0) return null;
   const xyz = timeRowWorld(row);
   if (!xyz) return null;
+  // What SHAPE this claim has: a plain cube or an authored model. A cube is flush with the block it
+  // annotates, so it and that block's own face are the same plane and a dead-heat depth there belongs to
+  // the marker (polygon offset is what paints it there); a model's faces sit wherever the model put them.
+  let cube = false;
+  { const nm = TLAYER.tl.nameOf?.(row) ?? '';
+    const st = nm ? (blockNameIds().get(nm) ?? 0) - 1 : -1;
+    if (st >= 0 && st < assets.states.length) cube = !!assets.states[st].cube?.length; }
   return { row, item, xy: [x, y], voxel: xyz, sec: TLAYER.tl.sec[row], action: TLAYER.tl.action[row],
     dist: hit.distance,                       // so a body and a marker can be settled by who is nearer
+    cube,                                     // a cube marker is flush; a model marker is its own shape
+    // Does the sprite this ray hit actually PAINT at that texel? A cutout marker (a plant, a leaf cross, a
+    // head) covers a whole voxel face to the RAY while the fragment shader throws most of it away, so the
+    // pixel can show the block behind a marker the ray says is in front.
+    paints: hitPaints(hit), alpha: hitAlpha(hit),
+    hits: hits.length, spriteHits: solid.length,   // how many faces the ray met, and how many would paint
     look: TLAYER.look, point: [+hit.point.x.toFixed(2), +hit.point.y.toFixed(2), +hit.point.z.toFixed(2)] };
+}
+
+/** The atlas texel a raycast landed on, or null when the hit carries no uv. */
+function hitAlpha(hit) {
+  if (!hit?.uv) return null;
+  const p = sampleAtlas(hit.uv.x, hit.uv.y);
+  return p ? p[3] / 255 : null;
+}
+
+/**
+ * Would a fragment survive at this hit? `alphaTest` is a shader decision, so no raycast reports it: a
+ * plant marker whose texel here is transparent paints NOTHING, and a click that answers it is answering
+ * something the viewer cannot see. Unknown (no uv, no atlas) is treated as painted - the conservative answer
+ * for opaque geometry, which is the overwhelming majority of markers.
+ */
+function hitPaints(hit) {
+  const a = hitAlpha(hit);
+  return a === null ? true : a >= S.alphaTest;
 }
 
 /**
@@ -4161,6 +4350,10 @@ function timeMarkerBox(x, y) {
     quads: (end - start) / 6, drawn: t.item < TLAYER.drawn,
     aabb: [...lo, ...hi].map((v) => +v.toFixed(3)),
     overVoxel: +over.toFixed(3),                  // >0 means the shape sticks out of its own voxel
+    // A ray MEETING a marker is not the pixel BELONGING to it: since the layer tests depth, ground nearer
+    // than the marker paints over it and answers the click instead. Say both, or a probe reads "the ray
+    // touched a marker" as "this marker is what a click here gets".
+    rayOnly: true, markerTook: markerTakesPixel(t, pickWorld(x, y)),
   };
 }
 
@@ -4188,7 +4381,12 @@ async function askAt(x, y) {
     showGhostCard(body);
     return null;
   }
-  if (t) { LEDGER.askWhy = `the ${TLAYER.look} marker for row ${t.row}`; return ledgerAsk(t.voxel[0], t.voxel[1], t.voxel[2]); }
+  // A marker behind real rock is not painted there, so it does not get to answer either: asking that pixel
+  // asks the rock in front of it, which is what the viewer is pointing at.
+  if (t && markerTakesPixel(t, p)) {
+    LEDGER.askWhy = `the ${TLAYER.look} marker for row ${t.row}`;
+    return ledgerAsk(t.voxel[0], t.voxel[1], t.voxel[2]);
+  }
   if (!p || !p.block) { LEDGER.askWhy = 'the pixel hit no drawn block'; closeLedgerCard(); return null; }
   // A block the log says is not there at this moment is still worth asking about - its history answers
   // "when did this appear" - but the answer has to lead with the fact that it is not standing now.
@@ -4654,6 +4852,11 @@ const TLAYER = {
   activeDays: 0, busyDay: 0, busyN: 0,   // how much of the calendar the log actually covers
   rows: 0, other: 0, truncated: false,
   freshArm: 0,           // the tick that armed the machine, waiting for its first mesh
+  // The moment the viewer was standing at when they UNticked the time machine, and which filter it belonged
+  // to. Ticking it back on is the same question, so it must answer with the same moment: an un/re-tick used
+  // to arm a fresh machine, which seeked to the first logged change and started PLAYING. That is how
+  // "the highlight answers another second" happens without anything being wrong with the highlight.
+  heldAt: null, heldFilter: '', heldPlay: 0,
   bytes: 0, fetchMs: 0, filterMs: 0, buildMs: 0,
   err: '',
 };
@@ -4692,26 +4895,43 @@ let timeBlockMat = null;
 function timeBlockMatOf() {
   if (!timeBlockMat) {
     timeBlockMat = new THREE.MeshBasicMaterial({
-      map: atlasTex, vertexColors: true, side: THREE.DoubleSide,   // cross-model plants need both faces
+      // FrontSide, and the builder pays for it: a cube that draws both faces shows the INSIDE of its far
+      // faces, and with no depth-write to sort them the far face wins - which is what "the faces in the back
+      // are inverted" looks like. A plant made of crossed quads still needs both sides, so the builder
+      // appends an explicitly reversed twin for model geometry only (`mirrorQuads`).
+      map: atlasTex, vertexColors: true, side: THREE.FrontSide,
       alphaTest: S.alphaTest,                                      // the atlas holds cutout sprites too
       fog: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2,
     });
   }
   timeBlockMat.map = atlasTex;                                    // the atlas texture is rebuilt on reload
+  // Anisotropic filtering, and it is the CLICK that needs it. The pick samples the sprite's alpha at the exact
+  // texel the ray crossed, so a marker being minified hard (a block a hundred blocks off) can paint through the
+  // GPU's mip average while the CPU answer says "that texel is empty" - and the click then refuses a pixel the
+  // picture clearly paints. Smearing ALONG the surface instead of across it is what pulls those two answers
+  // back together. It is not a paint fix: with mip levels capped at 0 the plants still painted whole
+  // (?mipmax=0), so the picture was never the victim here.
+  { const want = Math.min(S.markAniso, renderer.capabilities.getMaxAnisotropy() || 1);
+    if (atlasTex.anisotropy !== want) { atlasTex.anisotropy = want; atlasTex.needsUpdate = true; } }
   timeBlockMat.alphaTest = S.alphaTest;
   // A marker wearing a block's face IS a block, so it obeys walls: a hill in front of it hides it. The
   // `see through terrain` switch is about flat map paint - the heat tiles and the plate/tile layer - and
   // applying it here is what turns a place filter into a wall of green seen through a house.
   timeBlockMat.depthTest = true;
   timeBlockMat.opacity = 1;                                       // opaque: shape carries the message
-  // ...but it does not get to SEAL a person inside the shell it grew around their voxel. Measured at a real
-  // mine framing (build/q_m15why.js, pixel A/B at the body's own pixel, same camera, bodies on / bodies off /
-  // depthTest off): obeying walls changed 0 of 1,972 sampled pixels in the body's own box, and the same body
-  // with its depth test switched off changed 751. So the body was drawn and rejected by a depth value the
-  // world's own ray never reported - the nearest terrain sat 10.42 away, the body 9.89. What wrote that depth
-  // is the marker over their voxel, 5.02 away, and a marker that writes depth buries the person it annotates.
-  // Markers draw at 902 and bodies at 903, so a marker that only TESTS depth is still hidden by terrain
-  // (terrain wrote that depth first) and stops sealing the people standing in the block it annotates.
+  timeBlockMat.side = S.markSide ? THREE.FrontSide : THREE.DoubleSide;
+  // The layer SORTS itself. Without depth-write the driver paints it in buffer (log) order, and a claim
+  // logged later wins the pixel against a block that is half a block nearer: at a dense wall framing that
+  // moved 62,564 of 1,024,000 pixels (6.1%) against a control pair that moved 1, and the sampled pixels were
+  // pairs of DIFFERENT voxels 0.6-1.1 blocks apart in depth (build/q_markerpixab.js).
+  //
+  // It used to be off, because a marker that writes depth can seal a person standing inside the shell it grew
+  // around their voxel: measured at a mine framing, bodies on/off changed 0 of 1,972 pixels in the body's own
+  // box while switching the BODY's depth test changed 751 - the body was drawn and rejected by a depth value
+  // the world's own ray never reported (nearest terrain 10.42, body 9.89, the marker over their voxel 5.02).
+  // The people answer that per body now: `ghostDepth` puts each one in a draw group whose material ignores
+  // depth when this page's own voxels say nothing solid stands between the eye and them. An annotation no
+  // longer decides who is visible, so the layer is free to sort. `?markdepth=0` puts log-order painting back.
   // An earlier attempt wrote `= !S.markDepth`, which kept the sealing behaviour as the default and made the
   // A/B switch mean its own opposite; the flag now says what it writes.
   timeBlockMat.depthWrite = !!S.markDepth;
@@ -4733,7 +4953,16 @@ function clearTimeMesh() {
  * This dimension's history, in time order: one request, and only when the layer is asked for. The whole
  * overworld table is 4.7 MB, so a map view that never scrubs must not pay for it.
  */
+/**
+ * The bar has to stop promising "the action log" the moment the log arrives, on EVERY way out of this
+ * function - it has seven early returns, so the flag cannot be cleared by hand at each one.
+ */
 async function timeLoad() {
+  TLAYER.loading = 1;
+  try { return await timeLoadBody(); } finally { TLAYER.loading = 0; }
+}
+
+async function timeLoadBody() {
   const gen = ++TLAYER.gen;
   TLAYER.tl = null; TLAYER.err = ''; TLAYER.fact = '';
   // A fresh timeline is a fresh arm: the playhead decision (play from the first logged change, or show
@@ -4836,7 +5065,7 @@ function timeRebuild() {
       resetMarkerLift();
       const b = buildTimeBlocks(TLAYER.tl, LEDGER.pack, got.order, assets, blockNameIds(),
         { plates: lk === 'plates', grow: 1 + 2 * S.timeGrow,
-          stackGrow: S.timeStack ? 0.36 : 0, cull: S.timeCull, dedupe: !!S.timeDedupe });
+          stackGrow: S.timeStack ? 0.36 : 0, cull: S.timeCull, dedupe: !!S.timeDedupe, twin: S.timeTwin });
       lookMb[lk] = Math.round(b.stats.bytes / 1048576);
       const lastTried = lk === tries[tries.length - 1];
       if (b.stats.bytes <= budget || lastTried) {
@@ -4996,11 +5225,87 @@ function timeApply() {
 // Cost, measured over the shipped timeline: 10 ms for the presence pass over 351,531 rows, 0.003 ms per
 // "who stands here" question, 216 triangles per body and two draw calls for all of them. It is NOT in
 // the hover path: a body takes a click's raycast, never a hover's.
+/**
+ * M16: what the page is waiting for, and how much of it is left. A bar is a PROMISE about work remaining,
+ * so it is built only from counters the page already has, and the policy (fraction or stripe, when to speak,
+ * when to shut up) lives in web/js/loading.js where a Node test can hold it to the numbers. Five times a
+ * second: a bar that changes 60 times a second is unreadable, and the counters it reads are not free.
+ */
+const PROGRESS = createProgress({ clock: () => performance.now() });
+const BOOT_STEPS = 6;
+let bootStep = 0, barNext = 0, barShown = null, barHideAt = 0, barTxt = '';
+function bootStage(stage) {
+  bootStep++;
+  PROGRESS.note('boot', { done: bootStep, total: BOOT_STEPS, label: `loading the world (${stage})`, unit: 'steps' });
+}
+
+function progressTick(now) {
+  // The COUNTERS always run; only the picture is gated. `?bar=0` exists to keep an animated stripe out of a
+  // framebuffer diff, and a probe that then asks "is this page actually settled?" must not be told yes
+  // because nothing was measuring. Hiding the pill is not the same as forgetting the work.
+  if (now < barNext) {
+    if (!S.bar && barShown) { barShown = false; document.body.classList.remove('loading'); }
+    return;
+  }
+  barNext = now + 200;
+  if (store) {
+    // Chunks in flight for the current view: a real total, because the page asked for a known set.
+    if (store.queue.length || store.inflight) {
+      PROGRESS.note('chunks', { done: store.loaded, total: store.loaded + store.queue.length + store.inflight,
+        label: 'chunks', unit: 'held' });
+    } else PROGRESS.clear('chunks');
+    // Held chunks that still need a mesh cut. The workers answer this in waves, so the total moves; it is
+    // still a count, so a fraction stays honest.
+    if (store.dirty.size) {
+      PROGRESS.note('mesh', { done: meshes.size, total: meshes.size + store.dirty.size, label: 'meshes', unit: 'to cut' });
+    } else PROGRESS.clear('mesh');
+  }
+  // A pan dirties an unknown area of far ground: there is NO total for that, so this is the stripe case,
+  // and the bar says how many patches are waiting instead of inventing a percentage.
+  if (dirtyPatches.size) {
+    PROGRESS.note('far', { done: dirtyPatches.size, total: null, label: 'far ground',
+      unit: `patch${dirtyPatches.size === 1 ? '' : 'es'} to re-cut` });
+  } else PROGRESS.clear('far');
+  // The replay: chunks whose blocks have to be moved back to the playhead, and how many have been rebuilt.
+  if (HIST.on && HIST.marked > HIST.builds) {
+    PROGRESS.note('replay', { done: HIST.builds, total: HIST.marked, label: 'the replay', unit: 'chunks' });
+  } else PROGRESS.clear('replay');
+  // The timeline is 4.7 MB for this dimension, and a URL that asks for the time machine gets it at boot:
+  // that is the single longest wait on the page, and it has no useful total until the bytes arrive.
+  if (TLAYER.loading) PROGRESS.note('log', { done: 0, total: null, label: 'the action log' });
+  else PROGRESS.clear('log');
+  if (S.bar) drawProgress(now, PROGRESS.snapshot());
+  else if (barShown) { barShown = false; document.body.classList.remove('loading'); }
+}
+
+/**
+ * One element, three states: hidden (nothing pending), a bar (every wait is counted), a stripe (a wait with
+ * no known total). The hold before disappearing is deliberate: work arrives in bursts, and a bar that blinks
+ * every 200 ms reads as a fault rather than as progress.
+ */
+function drawProgress(now, s) {
+  const el = document.getElementById('pbar');
+  if (!el) return;
+  const fill = document.getElementById('pbar-fill'), txt = document.getElementById('pbar-txt');
+  if (s.shape === 'settled') {
+    if (barShown && now >= barHideAt) { barShown = false; document.body.classList.remove('loading'); }
+    return;
+  }
+  if (!barShown) { barShown = true; document.body.classList.add('loading'); }
+  barHideAt = now + 600;
+  el.classList.toggle('stripe', s.shape === 'stripe');
+  if (fill) fill.style.width = s.pct === null ? '' : `${Math.round(Math.max(0.02, s.pct) * 100)}%`;
+  if (txt && s.text !== barTxt) { barTxt = s.text; txt.textContent = s.text; }
+  el.title = `waiting on ${s.pending} kind${s.pending === 1 ? '' : 's'} of work`;
+}
+
 const GHOST = {
   presence: null, pgen: -1, pgap: -1, occ: null, err: '',
   bodies: [], standing: 0, why: [], seats: {},
   under: null, deepestY: null, deepestDown: null,   // how many bodies sit under the open sky (the note counts them)
   mesh: null, lines: null, per: null, sig: '',
+  shown: [], groups: 0, seenSig: '', seenCount: null, seenDrawn: 0, seenBy: null,   // who the voxels say is reachable
+  markAlphaOut: false,                                 // the last marker answer was thrown away by its own sprite
   tagBox: null, tags: [], tagsShown: 0, tagsSmall: 0, tagOff: 0, tagClamped: 0, tagSig: '', tagMs: 0,
   sel: -1,                       // a chosen player's timeline index; -1 = everybody
   nameSrc: null, nameList: [],
@@ -5064,24 +5369,76 @@ function ghostClear() {
   if (GHOST.mesh) { ledgerGroup.remove(GHOST.mesh); GHOST.mesh.geometry.dispose(); GHOST.mesh = null; }
   if (GHOST.lines) { ledgerGroup.remove(GHOST.lines); GHOST.lines.geometry.dispose(); GHOST.lines = null; }
   GHOST.per = null; GHOST.sig = ''; GHOST.standing = 0; GHOST.bodies = []; GHOST.tagSig = '';
+  GHOST.shown = []; GHOST.seenSig = ''; GHOST.seenCount = null; GHOST.seenDrawn = 0;
   if (GHOST.tagBox) GHOST.tagBox.textContent = '';
   GHOST.tags = []; GHOST.tagsShown = 0;
 }
 
-let ghostBodyMat = null, ghostLineMat = null;
+let ghostBodyMat = null, ghostThruMat = null, ghostLineMat = null;
 function ghostMats() {
   if (!ghostBodyMat) {
     // Flat unlit colour, because these are claims about evidence rather than objects in the world: a body
     // that picked up the world's lighting would read as a block the mesher drew.
     ghostBodyMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false, side: THREE.DoubleSide });
+    // The same paint with no depth test, for the bodies the page's OWN voxels say the eye can reach. A
+    // change marker is an annotation over a block; a person standing in it is the fact. Putting the choice
+    // on the body (two draw groups, one per answer) is what lets the marker layer sort itself.
+    ghostThruMat = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false, side: THREE.DoubleSide });
     ghostLineMat = new THREE.LineBasicMaterial({ vertexColors: true, fog: false, transparent: true, opacity: 0.9 });
   }
   // A person inside a house is inside it, so bodies obey walls by default; ?bodythrough=1 is a finder at
   // whole-world scale, and the note names which mode is on. The flat ledger overlays get the opposite
   // default because they ARE map paint.
   ghostBodyMat.depthTest = !S.bodyThrough;
+  ghostThruMat.depthTest = false;
   ghostLineMat.depthTest = !S.bodyThrough;
-  return [ghostBodyMat, ghostLineMat];
+  return [ghostBodyMat, ghostThruMat, ghostLineMat];
+}
+
+/**
+ * Which bodies the voxels this page holds say the eye can reach, and put each one in the draw group that
+ * matches. ONE question (`bodyWall`), asked of the same collision read a click uses, answered for the
+ * picture and the click both - which is the whole point: the "draw order is still fucked up" complaint was
+ * a pick that said person and a frame that said rock, because two different rules decided them.
+ */
+function ghostDepth() {
+  const geo = GHOST.mesh?.geometry;
+  if (!geo || !GHOST.shown?.length) return 0;
+  const p = camera.position;
+  const sig = `${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)}|${S.bodyThrough}`;
+  if (sig !== GHOST.seenSig) {
+    GHOST.seenSig = sig;
+    const eye = [p.x, p.y, p.z];
+    const cnt = { clear: 0, wall: 0, unknown: 0 };
+    // The answer is keyed by WHO, not by the object: a seat re-cut (a chunk arriving, the playhead moving
+    // half a second) builds new body objects, and an answer stored on the old ones would be read as "never
+    // asked" by every consumer that holds the new list.
+    GHOST.seenBy = new Map();
+    for (const b of GHOST.shown) {
+      b.seen = S.bodyThrough ? 'clear' : bodyWall(cellAt, b, eye);
+      GHOST.seenBy.set(b.player, b.seen);
+      cnt[b.seen] = (cnt[b.seen] ?? 0) + 1;
+    }
+    GHOST.seenCount = cnt;
+    GHOST.seenMs = 0;
+  }
+  let thru = 0;
+  for (const q of geo.groups) {
+    const b = GHOST.shown[q.body];
+    q.materialIndex = b && b.seen !== 'wall' ? 1 : 0;
+    if (q.materialIndex) thru++;
+  }
+  GHOST.seenDrawn = thru;
+  return thru;
+}
+
+/** The reachability answer for one player, asked of the voxels this page holds. */
+function bodySeenAnswer(b) {
+  if (GHOST.seenBy && GHOST.seenBy.has(b.player)) return GHOST.seenBy.get(b.player);
+  b.seen = S.bodyThrough ? 'clear'
+    : bodyWall(cellAt, b, [camera.position.x, camera.position.y, camera.position.z]);
+  (GHOST.seenBy ??= new Map()).set(b.player, b.seen);
+  return b.seen;
 }
 
 /**
@@ -5129,10 +5486,11 @@ function ghostCut(list) {
   const standing = list.filter((b) => !b.absent);
   const g = bodyGeom(standing);
   GHOST.per = g.per;
-  const [bodyMat, lineMat] = ghostMats();
+  GHOST.shown = standing;
+  const [bodyMat, thruMat, lineMat] = ghostMats();
   if (!GHOST.mesh) {
     const geo = new THREE.BufferGeometry();
-    const mesh = new THREE.Mesh(geo, bodyMat);
+    const mesh = new THREE.Mesh(geo, [bodyMat, thruMat]);
     mesh.name = 'ledger-people';
     mesh.renderOrder = 903;                       // AFTER the change markers (902), which by default only test
     // depth and never write it: a marker is an annotation around a block, so a person standing in that block
@@ -5150,6 +5508,11 @@ function ghostCut(list) {
   geo.setAttribute('position', new THREE.BufferAttribute(g.pos, 3));
   geo.setAttribute('color', new THREE.BufferAttribute(g.col, 3));
   geo.setDrawRange(0, g.verts);                   // a soup: the count is corners, not indices
+  // One draw group per person, so "who may draw through what" is a per-body answer rather than a property
+  // of the whole layer. `ghostDepth` re-points these at the two materials whenever the eye moves.
+  geo.groups = g.per.map((q, i) => ({ start: q.from, count: q.to - q.from, materialIndex: 0, body: i }));
+  GHOST.seenSig = '';
+  ghostDepth();
   const tg = S.bodyTracks
     ? trackGeom(TLAYER.tl, GHOST.presence, standing, { max: 96, cellOf: (ci) => LEDGER.pack.cell(ci) })
     : { pos: new Float32Array(0), col: new Float32Array(0), lines: 0 };
@@ -5257,6 +5620,7 @@ function ghostTick(now) {
     return;
   }
   if (now >= GHOST.next) { GHOST.next = now + 400; ghostSync(); }
+  ghostDepth();
   ghostPlace();
 }
 
@@ -5317,17 +5681,33 @@ function ghostTakesPixel(body, marker, world) {
       && marker.voxel[1] >= body.y - 1 && marker.voxel[1] <= body.y + 1) return true;
   }
   GHOST.v1 ??= new THREE.Vector3();
-  const dm = S.bodyPick ? Infinity : (marker?.dist ?? Infinity);
+  let dm = S.bodyPick ? Infinity : (marker?.dist ?? Infinity);
   let dw = Infinity;
   GHOST.hitFloor = false;
+  GHOST.hitSeen = null;
   GHOST.hitDetail = null;
+  // The SAME voxel question the picture answered for this body - is there a solid block between the eye and
+  // them? - decides the click too, and the answer is all-or-nothing. A body the voxels say is reachable is
+  // DRAWN with depth off, i.e. over whatever stands in front of it, so a click there is a click on the
+  // person; a body the voxels say is behind ground is drawn with depth on and hidden, so the click must not
+  // promise them. Deciding the two halves separately is how a pixel came to answer a person the frame was
+  // not showing. `unknown` (a sampled way runs into ground nobody fetched) fails OPEN: the viewer may still
+  // ask, and the note says why the seat is a guess.
+  if (S.bodySeen) {
+    GHOST.hitSeen = bodySeenAnswer(body);
+    if (GHOST.hitSeen === 'wall') return false;
+    dm = Infinity; dw = Infinity;
+    GHOST.hitExempt = true;
+    return GHOST.hitDist <= dm;
+  }
+  GHOST.hitExempt = false;
   // Only the voxels this page actually holds may hide a body. The coarse far layers are a guess about the
   // surface (percentile height, boxy caps, clipped near the camera), and a nearer hit in one of them was
   // measured at a meadow party 0.65 blocks from the eye while the frame showed the body painted there.
   const oc = S.bodyWall ? world?.detail
     : (world?.point ? { point: world.point, dist: world.dist, block: world.block } : null);
   if (oc?.point) {
-    dw = oc.dist ?? camera.position.distanceTo(GHOST.v1.set(oc.point[0], oc.point[1], oc.point[2]));
+    dw = Math.min(dw, oc.dist ?? camera.position.distanceTo(GHOST.v1.set(oc.point[0], oc.point[1], oc.point[2])));
     GHOST.hitDetail = +dw.toFixed(2);
     // The ground under their feet is not a wall. The test is positional, not directional: a block in their
     // OWN column at or below the block they stand on is the floor, and an up-facing normal is not - that
@@ -5351,13 +5731,91 @@ function pixelHits(x, y) {
 
 /** Who WOULD answer a click here, under the rule above. A probe should measure the page's policy rather
     than re-derive it from three distances and get it wrong in a different way. */
+/**
+ * Does a change marker own this pixel? It used to win on principle - an annotation over a voxel, not a
+ * solid thing - and that was true while the layer ignored depth. It no longer does: since the marker layer
+ * tests AND writes depth, a marker behind ground is NOT PAINTED at that pixel, and a click that answers it
+ * is answering something the viewer cannot see. Two things decide it, and both are things the frame already
+ * decided: whether the marker's own sprite survives the alpha test at this texel, and whether any DRAWN
+ * ground sits in front of it.
+ *
+ * Which ground counts is measured, not assumed (build/q_ownersagree.js, 50 sampled pixels per framing, a
+ * control pair that moved 0 pixels, the playhead stood at a stated second):
+ *
+ *   rule 1, default - real chunk ground where the ray met any, a coarse layer only where it did not:
+ *                  party 1/50 disagree, wall 3/50, mine 0/50
+ *   rule 2, `?markpick=2` - the nearest surface of ANY layer, coarse included:
+ *                  party 1/50, wall 1/50, mine 7/50
+ *
+ * Rule 2 loses at the mine because a baked LOD patch can be nearer to the RAY and still never reach the
+ * framebuffer: the clip shader throws those fragments away where real ground is installed. At the wall
+ * (px 853,533) the LOD surface was 27.19, the real ground 38.61 and the marker 38.61 - and the frame showed
+ * the MARKER. So the coarse surface is not the ground there, and the pick has to know that.
+ *
+ * Bodies do NOT use this rule, and must not: a coarse heightfield has no doorway, so for a PERSON only the
+ * page's own chunk voxels count as a wall (`bodyWall`). Getting it wrong that way buries people standing in
+ * the open.
+ */
+function markerTakesPixel(mark, world) {
+  if (!mark) return false;
+  if (!S.markPick) return true;
+  // First: did this marker's own sprite even survive the alpha test here? A fern marker standing in front of
+  // a lawn answers the RAY and paints grass, and no distance rule can see that.
+  if (S.markAlpha && mark.paints === false) { GHOST.markAlphaOut = true; return false; }
+  GHOST.markAlphaOut = false;
+  const d = world?.detail;
+  GHOST.markDetail = d ? d.dist : null;
+  GHOST.markTie = false;
+  // The frame composes EVERY layer, so the witness is the nearest ground that actually PAINTS. A coarse patch
+  // does not paint where a real chunk mesh owns its column: that is exactly what the LOD clip discards
+  // (`detailHere`, `?nolodclip`). Measured over 50 sampled pixels per framing (build/q_ownersagree.js, a
+  // control pair that moved 0 pixels, the playhead stood at a stated second):
+  //
+  //   counting any coarse hit as ground:  party 1/50, wall 3/50, mine 7/50
+  //   real chunk ground only:            party 1/50, wall 1/50, mine 0/50
+  //   coarse only where no detail mesh owns the column (default): the two cases below stop being a rule choice
+  //
+  // mine px 640,400 wanted the second rule (LOD 14.27, marker 14.57, real ground 15.7 - the frame showed the
+  // MARKER, because the LOD fragment there was clipped away), while party px 213,533 wanted the first (a baked
+  // LOD plant at 16.22 over a marker at 16.23, with no real ground nearer than 91 - and the frame really did
+  // show the plant). One rule covers both: ask whether the coarse layer is drawn at all down that column.
+  const first = world && world.drawn !== 'detail' ? world : null;
+  const coarsePaints = !!first && (!S.lodClip
+    || !detailHere(Math.floor(first.point[0] / CH), Math.floor(first.point[2] / CH)));
+  GHOST.markCoarse = coarsePaints ? first.dist : null;
+  let front;
+  if (S.markPick === 2) front = d ? d.dist : (first ? first.dist : null);   // older rule, kept probeable
+  else if (coarsePaints) front = d ? Math.min(d.dist, first.dist) : first.dist;
+  else front = d ? d.dist : null;
+  GHOST.markFront = front;
+  if (front == null) return true;
+  // An EXACT tie goes to the ground, and the answer says it was a tie. A flush cube marker sits on the
+  // annotated block's own face and polygonOffset pulls it about four depth-units toward the eye - of the
+  // order of 1e-4 blocks at 11 m - which wins a mathematical tie on the GPU but is not knowable from a pick.
+  // Measured both ways: a party pixel on a player_head (marker 10.91, real ground 10.91, same voxel) shows
+  // the BLOCK's face, while a mine pixel with the same arithmetic shows the marker. So the page gives the
+  // tie to the ground and admits the tie, rather than pretending to know.
+  if (Math.abs(mark.dist - front) <= 0.02) {
+    GHOST.markTie = true;
+    // The GROUND owns a dead heat, and the answer says it was a tie. Measured at the dense wall, where most of
+    // the wall IS the players' placements: every sampled coplanar pixel (marker 27.37 against ground 27.37,
+    // same voxel, and a dozen more like it) showed the BLOCK's face, not the marker's. Giving the plane to a
+    // cube marker because polygonOffset ought to win it produced 12 disagreements of 25 sampled pixels there.
+    // Nothing is lost by answering with the ground: a click on that voxel still reaches the change through
+    // `timeStandAt`, which is the per-voxel answer table rather than a ray.
+    return false;
+  }
+  return mark.dist < front;
+}
+
 function pixelOwner(x, y) {
   const h = pixelHits(x, y);
   const bd = h.body ? GHOST.hitDist : null;   // pixelHits leaves the body's own distance here
   const takes = !!h.body && ghostTakesPixel(h.body, h.marker, h.world);
+  const mark = !takes && markerTakesPixel(h.marker, h.world);
   const v = GHOST.v1 ??= new THREE.Vector3();
   return {
-    owner: takes ? 'body' : h.marker ? 'marker' : h.world ? 'world' : 'nothing',
+    owner: takes ? 'body' : mark ? 'marker' : h.world ? 'world' : 'nothing',
     floor: GHOST.hitFloor,
     player: takes && h.body ? h.body.player : null,
     bodyDist: h.body ? +bd.toFixed(2) : null,
@@ -5369,6 +5827,16 @@ function pixelOwner(x, y) {
     worldQuad: h.world ? h.world.quad : null,
     worldState: h.world ? (h.world.state ?? h.world.shellState) : null,
     markerDist: h.marker ? +h.marker.dist.toFixed(2) : null,
+    markerVoxel: h.marker?.voxel ?? null,          // which voxel that marker describes
+    markerPaints: h.marker ? h.marker.paints !== false : null,   // did its sprite survive the alpha test here
+    markerCube: h.marker ? !!h.marker.cube : null,               // flush cube, or an authored model's own faces
+    markerAlpha: h.marker ? h.marker.alpha ?? null : null,       // the texel's alpha, so a rejection is checkable
+    alphaRejected: !!GHOST.markAlphaOut,
+    markGroundDist: GHOST.markDetail ?? null,      // the real ground a marker has to beat, if any
+    markFrontDist: GHOST.markFront ?? null,        // ... and the surface the frame would show in front of it
+    markerTie: GHOST.markTie ?? false,             // a dead heat, which the page gives to the ground and says
+    markCoarse: GHOST.markCoarse ?? null,          // a coarse surface that IS drawn there, so it can bury one
+    markerTook: mark,
     worldDist: h.world?.point
       ? +camera.position.distanceTo(v.set(h.world.point[0], h.world.point[1], h.world.point[2])).toFixed(2)
       : null,
@@ -5621,6 +6089,15 @@ function peopleNote() {
   out.push(S.bodyThrough ? 'a body answers a click through anything (bodythrough).'
     : S.bodyPick ? 'a person answers a click before a change marker does; the real ground in front of them still answers first (?bodypick=0 to put the nearest thing back, ?bodywall=0 to let far paint hide them too).'
       : 'the nearest drawn thing answers the click, change markers included.');
+  // The draw and the click answer the SAME question, and the sentence should say who it answered how, or a
+  // person hiding behind a hill looks like the old bug rather than a decision.
+  if (GHOST.standing && !S.bodyThrough && GHOST.seenCount) {
+    const c = GHOST.seenCount;
+    out.push(`${GHOST.seenDrawn} of them have nothing solid between the eye and them in this page's own voxels, `
+      + `so they draw and answer as one person; ${c.wall ?? 0} stand behind ground this world holds and hide, and `
+      + `${c.unknown ?? 0} cross ground nobody has fetched. (?bodyseen=0 puts back the bare distance contest, `
+      + `which is how a change marker used to answer for someone you could see.)`);
+  }
   for (const w of GHOST.why.slice(0, 3)) out.push(w);
   if (GHOST.why.length > 3) out.push(`... and ${GHOST.why.length - 3} more with no body at this moment`);
   if (!GHOST.standing) {
@@ -6233,9 +6710,18 @@ function setTimePlay(on) {
 }
 
 function setTime(on) {
+  // Which set of rows the playhead indexes. Not `TLAYER.gen` (that counts fetches), and not the row count
+  // alone: who/what/how-many are what move the cursor's meaning.
+  const sig = TLAYER.tl ? `${TLAYER.tl.dimKey}|${S.ledgerWho}|${S.timeCls}|${S.timeLimit}` : '';
+  if (!on && S.time && TLAYER.tl) { TLAYER.heldAt = S.timeAt; TLAYER.heldFilter = sig; TLAYER.heldPlay = S.timePlay; }
   S.time = on ? 1 : 0;
   TLAYER.err = '';
-  TLAYER.freshArm = 1;
+  // A FRESH arm decides a starting moment (first logged change, playing). That decision belongs to the first
+  // time this filter is armed, not to every un/tick of the checkbox: re-ticking the same filter goes back to
+  // the moment and the play/pause state the viewer left, which is what `heldAt` is for.
+  const same = !!TLAYER.tl && TLAYER.heldAt != null && TLAYER.heldFilter === sig;
+  TLAYER.freshArm = same ? 0 : 1;
+  if (same) { S.timeAt = TLAYER.heldAt; S.timePlay = TLAYER.heldPlay; }
   if (!S.time) { S.timePlay = 0; clearTimeMesh(); if (panel) panel.refresh(); return false; }
   // Ticking "time machine" is one decision, and what a viewer expects from it is the world at that moment,
   // not tiles painted over today. `?time=1` already armed the voxel undo; the panel path used to leave it
@@ -6324,6 +6810,17 @@ ${TLAYER.look === 'blocks' ? 'drawn as the blocks themselves'
       : !S.timeCull
         ? '\nface culling is off: the inside of the players\' own build is drawn - ?timecull=1 hides it'
         : '')
+    // Draw order, stated because it was wrong for a whole pass: a layer that never writes depth paints in
+    // BUFFER order, so a claim farther from the eye could win the pixel over a nearer one simply by being
+    // written later. It sorts by depth now, and people stay visible because THEY answer per body.
+    + (!S.markDepth
+      ? '\nthe overlay paints in LOG order rather than depth order, which is how a far claim used to win a '
+        + 'pixel from a near one - ?markdepth=1 sorts it'
+      : '')
+    + (!S.markSide
+      ? '\nevery marker shows BOTH of its sides, so the inside of a logged wall draws over its own outside - '
+        + '?markside=1 keeps the outside only'
+      : '')
     + (TLAYER.fact ? `\n${TLAYER.fact}` : '');
 }
 
@@ -6364,7 +6861,10 @@ function pickState(x, y) {
   // Fog already hides anything past `far`, so a probe that reports a hit 900 blocks away is
   // describing pixels the user sees as plain sky; keep the ray to the visible range.
   rc.far = Math.max(64, scene.fog ? scene.fog.far : Infinity);
-  const hits = rc.intersectObjects(groups, true);
+  // three's raycaster never asks whether an object is visible, so anything the frame does not draw
+  // would still answer the pick - a click disagreeing with the picture, the one thing this page keeps
+  // having to fix. Filter on visibility, ancestors included.
+  const hits = rc.intersectObjects(groups, true).filter((x) => isDrawn(x.object));
   const hit = hits[0];
   if (!hit) return null;
   const h = describeHit(hit, rc.ray);
@@ -6776,11 +7276,21 @@ window.__world = {
     };
   },
   // The baked far layer: which tile covers a block, how many are held/drawn, and what was refused.
+  // Why a baked tile is or is not skipped at the draw call: the patch grid answer under that tile.
+  lodHideWhy: (k) => {
+    if (!lodStore) return { err: 'no lod store' };
+    const kk = k ?? (() => { const [tcx, tcz] = centerChunk(); return lodStore.key(Math.floor(tcx / 32), Math.floor(tcz / 32)); })();
+    return kk ? lodHideWhy(kk) : { err: 'no tile under the orbit target', target: centerChunk() };
+  },
   lodDiag: () => ({
     on: lodActive() ? 1 : 0, avail: lodAvail ? 1 : 0, cap: S.lodCap,
     clipOn: lodClipOn, clip: lodClipRect.map((v) => (v > 1e8 ? 'off' : v)), cov: lodCovPatches,
     covDetail: lodCovDetail,
     held: lodStore ? lodStore.tiles.size : 0, drawn: lodTiles, verts: lodVerts,
+    // held-but-not-submitted: the tile is in the scene graph and nothing of it would reach the
+    // fragment stage, so it is skipped at the draw call. `verts` counts only what is really submitted.
+    hideOn: S.lodHide, hiddenTiles: lodHidden, hiddenVerts: lodHiddenVerts,
+    paintedPatches: lodPaintSet.size, anchor: lodCovAnchor, patch: S.patch,
     loaded: lodStore ? lodStore.loaded : 0, dropped: lodStore ? lodStore.dropped : 0, refused: lodStore ? lodStore.badTiles : 0,
     passes: [lodPasses, lodPassRuns, lodSkipRect], passInfo: [passCand, passZero, passPick], picks: lodPicks.slice(0, 14),
     flips: lodFlips, flipLog: lodFlipLog.slice(-10), release: lodRelease,
@@ -6821,6 +7331,12 @@ window.__world = {
   },
   dbgCovFill: (v) => { covForce = v === 0 ? 0 : (v > 0 ? 1 : -1); },
   dbgLodKill: (v) => { lodKill = +v || 0; uKill.value = lodKill; },
+  // What three thinks it drew last frame. A cost claim ("the overlay costs most of the frame") has to be
+  // attributable to a number the driver agrees with, not to a vertex count the scene graph reports.
+  rendInfo: () => ({ calls: renderer.info.render.calls, triangles: renderer.info.render.triangles,
+    points: renderer.info.render.points, lines: renderer.info.render.lines,
+    frame: renderer.info.render.frame, geometries: renderer.info.memory.geometries,
+    textures: renderer.info.memory.textures, programs: renderer.info.programs.length }),
   dbgPrograms: () => renderer.info.programs.map((p) => ({ name: p.name, used: p.usedTimes, key: /dvclip\w*/.exec(p.cacheKey) })),
   dbgLodUniforms: () => ({
     at: [uCovAt.value.x, uCovAt.value.y], blk: uCovBlk.value, tex: !!uLodCov.value,
@@ -6850,10 +7366,14 @@ window.__world = {
     pickRule: S.bodyThrough ? 'through' : S.bodyPick ? 'people first' : 'nearest',
     standing: GHOST.standing, absent: GHOST.why.length, why: GHOST.why, seats: GHOST.seats,
     under: GHOST.under, deepestY: GHOST.deepestY, deepestDown: GHOST.deepestDown,
+    // who the page's own voxels say is reachable from this eye: the answer that picks the body's depth
+    // policy AND the click's owner, so the frame and the answer come from one question
+    seen: GHOST.seenCount ?? {}, seenDrawn: GHOST.seenDrawn ?? 0, seenRule: !!S.bodySeen,
     bodies: GHOST.bodies.map((b) => (b.absent
       ? { player: b.player, absent: b.absent, age: b.age, acted: b.acted }
       : { player: b.player, row: b.row, sec: b.sec, age: b.age, action: b.action, block: b.block,
-        x: b.x, y: b.y, z: b.z, floor: b.floor, seat: b.seat, above: b.above, down: b.down, visit: b.visit })),
+        x: b.x, y: b.y, z: b.z, floor: b.floor, seat: b.seat, above: b.above, down: b.down, visit: b.visit,
+        seen: GHOST.seenBy?.get(b.player) ?? b.seen ?? null })),
     presence: GHOST.presence ? {
       gap: GHOST.presence.gap, handRows: GHOST.presence.handRows, visits: GHOST.presence.visits,
       first: GHOST.presence.first, last: GHOST.presence.last, spanSec: GHOST.presence.spanSec,
@@ -6907,6 +7427,12 @@ window.__world = {
   // (and two chunk streams that never settle the same way). `?markdepth=1` is the same switch from a URL.
   markDepth: (on) => { S.markDepth = on ? 1 : 0; const m = timeBlockMatOf();
     return { markDepth: S.markDepth, depthWrite: !!m.depthWrite, depthTest: !!m.depthTest }; },
+  // The baked layer's draw-call skip, switched inside one page so a frame A/B does not need two
+  // browsers (and two chunk streams that never settle the same way). `?lodhide=0` is the URL form.
+  lodHide: (on) => { S.lodHide = on ? 1 : 0; return { lodHide: S.lodHide }; },
+  progress: () => PROGRESS.snapshot(),
+    markSide: (on) => { S.markSide = on ? 1 : 0; const m = timeBlockMatOf();
+    return { markSide: S.markSide, side: m.side, front: THREE.FrontSide, double: THREE.DoubleSide }; },
   hist: histStats,
   time: () => ({
     on: !!S.time, playing: !!S.timePlay, tl: !!TLAYER.tl, err: TLAYER.err, fact: TLAYER.fact || '',
@@ -6925,6 +7451,11 @@ window.__world = {
     // faces the layer refused to draw because another claim of this filter sits behind them
     culledFaces: TLAYER.culled ?? 0, fullyInside: TLAYER.enclosed ?? 0,
     faceCull: S.timeCull,            // 0 off, 1 as of the second the claim stands (default), 2 whole filter
+    cullBackFaces: !!S.markSide,      // true = the layer shows its OUTSIDE only, so an inside face cannot win a pixel
+    plantTwins: !!S.timeTwin,
+    markerPick: S.markPick,            // 0 off, 1 nearest ground of any layer (default), 2 real chunk ground only
+    markerAlpha: !!S.markAlpha,        // and does a marker whose sprite is transparent here answer at all
+    markAniso: atlasTex.anisotropy,    // what the device actually granted, not what was asked
     dedupedClaims: TLAYER.deduped ?? 0, dedupeMode: TLAYER.dedupeMode ?? false, grow: S.timeGrow,
     geomMbCap: S.timeGeomMb,
     markerGeoMb: TLAYER.mesh ? +(TLAYER.mesh.geometry.attributes.position.array.byteLength
@@ -6932,6 +7463,7 @@ window.__world = {
     // The ACTIVE material, not whichever one happens to exist: with look=blocks the tile material may
     // never have been made, and a null here once read as "the layer has no depth test".
     depthTest: TLAYER.mesh ? !!TLAYER.mesh.material.depthTest : null,
+    depthWrite: TLAYER.mesh ? !!TLAYER.mesh.material.depthWrite : null,   // does the layer sort itself
     opacity: TLAYER.mesh ? TLAYER.mesh.material.opacity : null,
     polyOffset: TLAYER.mesh ? !!TLAYER.mesh.material.polygonOffset : null,
     xray: !!S.ledgerXray,
@@ -7425,6 +7957,9 @@ const dimLabel = (id) => DIM_LABEL[id]
 // click. Everything dimension-scoped is dropped here: chunk payloads, their meshes, the heightmap
 // skin and its patches, and the in-flight worker jobs (guarded by dimGen).
 function switchDim(id) {
+  // A new dimension has new numbers. The old world's counts would hold the bar at some panic that stopped
+  // being true the moment the switch started.
+  PROGRESS.reset();
   if (!id || id === currentDim() || !assets) return;
   dimGen++;
   clearMeshBytes();               // those bytes are voxels of the dimension we just left
@@ -7455,6 +7990,7 @@ function switchDim(id) {
   // this dimension's cell table, which is the one ledger bug that would look like a correct picture.
   TLAYER.gen++;
   TLAYER.tl = null; TLAYER.err = ''; TLAYER.fact = ''; TLAYER.bytes = 0; TLAYER.fetchMs = 0;
+  TLAYER.heldAt = null; TLAYER.heldFilter = '';   // another dimension's log does not owe you this moment
   clearTimeMesh();
   if (S.time) timeLoad();
   resetWorkers();
@@ -8027,6 +8563,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
 // ---- boot ------------------------------------------------------------------
 (async () => {
   try {
+    bootStage('this world');
     meta = await fetch('/meta').then((r) => r.json());
     if (meta.level?.spawn) SPAWN = meta.level.spawn;
     hud.dim.innerHTML = (meta.dims ?? [])
@@ -8040,10 +8577,12 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     rig.target.set(SPAWN[0], SPAWN[1], SPAWN[2]);
     applyGoto();
 
+    bootStage('its shapes');
     await loadAssets();
     // Spinning the workers up costs one atlas-JSON parse each (~50 ms), which is free next to the
     // first chunk mesh; do it before any chunk is requested so no frame pays for it later.
     startWorkers();
+    bootStage('the meshers');
     // Baked far tiles replace the whole-dimension overview, so do not spend 16 MB and a second of
     // meshing on a layer nothing will see. ?ov=1 asks for both.
     lodAvail = (meta.packed?.lod?.tiles ?? 0) > 0;
@@ -8055,6 +8594,7 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     // Coverage before the first chunk request: over the overworld's bounding box, three quarters of
     // the tiles a pan asks for were never written, and each one used to cost a round trip.
     if (S.groundCov) await groundLoad(currentDim());
+    bootStage('which ground exists');
     store = new ChunkStore(currentDim(), storeOpts());
     applyDetailBudget();
     resize();
@@ -8069,10 +8609,12 @@ island stays at whatever "close detail" says at any zoom. URL: ?detailpixels=0, 
     rig.dist = Math.min(rig.dist, S.maxZoom);
     updateView();
     requestAround();
+    bootStage('the first chunks');
     // M12: ask whether this world keeps a ledger before the panel is built, because the "whose
     // actions" menu is made from the player list and a control that fills itself in later is a control
     // that silently offers one choice. A missing ledger is a note, not an error: the viewer works.
     await ledgerMetaLoad();
+    bootStage('the action log');
     buildPanel();
     // M12b: the timeline is deliberately not a boot request - 4.7 MB for the overworld, and most
     // visits never scrub. But a URL that asks for the layer gets it, filters included, before the

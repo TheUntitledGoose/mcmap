@@ -51,6 +51,68 @@ export const solidFn = (cellAt) => (x, y, z) => {
 };
 
 /**
+ * Does a wall stand between an eye and this body?
+ *
+ * Walks from the body toward the eye through the voxels the browser actually holds and stops at the first
+ * solid one. Three answers, because a chunk nobody fetched is not a wall:
+ *
+ *   'wall'    every way to reach them is blocked by a known solid block - they are behind it, and so is its
+ *             pixel
+ *   'clear'   at least one way to reach them (head, chest or hip, across the shoulders) is known and empty
+ *   'unknown' no way is known-empty, but part of the way is ground the browser has not fetched - not proof
+ *             of anything, so the page shows the person: nothing is drawn out there either
+ *
+ * Several rays, not one, because "is this person visible" is not "is the line to their chest clear": a body
+ * in a one-block tunnel grazes a wall corner on the way to the middle of them, and a single ray then hides
+ * a person the frame is showing. Any part seen is enough.
+ *
+ * The body's own column at or below their feet is never the wall: the ground they stand on is nearer than
+ * their chest, and a block one over at foot height is a step, not an occluder. A block at their own height
+ * one column over IS still a wall - that is a tunnel wall, and it is why this test is positional rather
+ * than a height band.
+ *
+ * One rule, two consumers: the people layer picks its depth policy from this, and a click asks it the same
+ * question, so the picture and the answer cannot disagree.
+ */
+const BODY_SEE = [1.62, 1.0, 0.35];          // head, chest, hip
+const BODY_ACROSS = [-0.35, 0, 0.35];        // across the shoulders, square to the eye line
+
+export function bodyWall(cellAt, b, eye, { max = 256, minStep = 0.6 } = {}) {
+  const feet = b.floor ?? b.y - 1;
+  const dx0 = eye[0] - (b.x + 0.5), dz0 = eye[2] - (b.z + 0.5);
+  const flat = Math.hypot(dx0, dz0) || 1;
+  const px = -dz0 / flat, pz = dx0 / flat;            // the horizontal direction across the body
+  let unknown = false;
+  for (const hgt of BODY_SEE) {
+    for (const s of BODY_ACROSS) {
+      const r = rayClear(cellAt, b, feet, b.x + 0.5 + px * s, b.y + hgt, b.z + 0.5 + pz * s, eye, max, minStep);
+      if (r === 'clear') return 'clear';               // one clear line is enough to see a person
+      if (r === 'unknown') unknown = true;
+    }
+  }
+  return unknown ? 'unknown' : 'wall';
+}
+
+function rayClear(cellAt, b, feet, tx, ty, tz, eye, max, minStep) {
+  const dx = eye[0] - tx, dy = eye[1] - ty, dz = eye[2] - tz;
+  const len = Math.hypot(dx, dy, dz);
+  if (!(len > 1e-6)) return 'clear';                   // an eye inside the person answers for them
+  // Samples are capped, so the step grows with the distance: never finer than `minStep` (a one-block wall
+  // must not be stepped over), and never more than `max` samples on the way.
+  const step = Math.max(minStep, len / max);
+  let unknown = false;
+  for (let t = step; t < len; t += step) {
+    const k = t / len;
+    const x = Math.floor(tx + dx * k), y = Math.floor(ty + dy * k), z = Math.floor(tz + dz * k);
+    if (Math.abs(x - b.x) <= 1 && Math.abs(z - b.z) <= 1 && y <= feet) continue;
+    const c = cellAt(x, y, z);
+    if (c === C_FULL) return 'wall';
+    if (c !== C_PASS) unknown = true;
+  }
+  return unknown ? 'unknown' : 'clear';
+}
+
+/**
  * Every body the evidence supports at `sec`, with its feet placed.
  *
  * `cellOf(cellIndex) -> {cx, cz}` is the pack's chunk table: a timeline row carries a cell INDEX and

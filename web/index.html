@@ -22,6 +22,26 @@
   #pill .st.err { color: #ff8f8f; }
   #pill .st:empty { display: none; }
 
+  /* What the page is waiting for, and how much of it is left. It appears only while something really is
+     pending (body.loading), so it never sits over the world claiming work that finished. The two shapes are
+     the two honest answers: a fraction when every waiting kind has a total, a stripe when something pending
+     has no known total (a pan dirties an unknown area). See web/js/loading.js. */
+  #pbar { position: fixed; left: 10px; bottom: 10px; display: none; align-items: center; gap: 8px;
+    max-width: 46vw; padding: 4px 10px; border-radius: 999px; font-size: 11px;
+    background: rgba(8, 11, 15, .62); border: 1px solid rgba(255, 255, 255, .10); color: #9aa6b3;
+    backdrop-filter: blur(3px); pointer-events: none; z-index: 12; }
+  body.loading #pbar { display: flex; }
+  #pbar i.tr { position: relative; display: block; flex: 0 0 96px; height: 4px; border-radius: 999px;
+    background: rgba(255, 255, 255, .13); overflow: hidden; }
+  #pbar i.fl { position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: 999px;
+    background: #7fe0a8; transition: width .18s ease-out; }
+  #pbar.stripe i.fl { width: 38%; animation: pbar-sweep 1.1s linear infinite; }
+  #pbar.bad i.fl { background: #ff8f8f; }
+  #pbar em { font-style: normal; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #pbar b { color: #cfe0ee; font-weight: 600; margin-right: 6px; }
+  @keyframes pbar-sweep { from { transform: translateX(-110%); } to { transform: translateX(370%); } }
+  @media (prefers-reduced-motion: reduce) { #pbar.stripe i.fl { animation: none; width: 100%; opacity: .55; } }
+
   /* The instrument panel: fps buckets, mesh timings, worker count, the dimension picker. Hidden
      unless the page was opened with ?debug=1 or the user presses H, because it is a workbench, not
      a UI - and every headless probe already loads ?debug=1, so hiding it costs the tooling nothing. */
@@ -146,6 +166,8 @@
 <canvas id="gl"></canvas>
 
 <div id="pill"><b id="fps">–</b><span class="u">fps</span><span class="u" id="scale"></span><span class="st" id="msg"></span></div>
+
+<div id="pbar" title="what the page is waiting for"><i class="tr"><i class="fl" id="pbar-fill"></i></i><em id="pbar-txt"></em></div>
 
 <div id="hud">
   <div class="row"><span class="k">verts</span><b id="verts">-</b><span class="k">tris</span><b id="tris">-</b></div>

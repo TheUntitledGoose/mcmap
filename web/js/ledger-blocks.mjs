@@ -134,7 +134,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   // 0 restores same-size markers, which is the A/B. `stackTau` is how many claims at one voxel it takes to
   // get most of the way there.
   const { plates = false, maxQuads = 0, lift = 0.004, maxLift = 0.08, grow = 1,
-    stackGrow = 0, stackTau = 3, cull = 1, dedupe = false } = opts;
+    stackGrow = 0, stackTau = 3, cull = 1, dedupe = false, twin = 1 } = opts;
   const ramp = stackGrow > 0 ? stackGrow : 0;
   const keepLast = ramp > 0 ? false : dedupe;
   const cullAll = cull === 2 || cull === 'all';
@@ -153,7 +153,7 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
   const stats = {
     rows: order.length, markers: 0, cubes: 0, plates: 0, models: 0, unknown: 0, air: 0,
     noCell: 0, noModel: 0, faces: 0, quads: 0, verts: 0, tris: 0, stopped: false, bytes: 0,
-    stacked: 0, maxStack: 0, culled: 0, enclosed: 0, deduped: 0, repeats: 0, deepest: 0,
+    stacked: 0, maxStack: 0, culled: 0, enclosed: 0, deduped: 0, repeats: 0, deepest: 0, doubled: 0,
   };
   // When each voxel FIRST entered this filter, as a position in `order`: a face is inside the build only from
   // that second onward. The same pass remembers the NEWEST claim at each voxel for the opt-in dedupe.
@@ -223,9 +223,20 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
       stats[plates ? 'plates' : 'cubes']++;
     } else if (state.g?.length) {
       const arm = state.g[assets.pickArm(state, h)];
+      const mi0 = stream.i;
       for (const qi of arm) {
         emitQuad(assets, trio, state, qi, bx, y, wz, FAKE_CHUNK, NO_AT, 0, 0, inner, null, null, null, null, -1, null);
         stats.faces++;
+      }
+      // The layer is ONE material, and that material culls back faces (`side: FrontSide` in the page) - a
+      // marker that drew both sides was showing the INSIDE of its far faces, which is what "the faces in the
+      // back are inverted" looks like. A cross-shaped plant genuinely needs both, so it gets an explicit
+      // twin with the opposite winding. Indices only: the corners are already in the buffer. `?timetwin=0`
+      // restores single-sided models for the A/B.
+      if (twin) {
+        const was = stream.i;
+        mirrorQuads(stream, mi0, was);
+        stats.doubled += stream.i - was;          // the TWIN's indices, not the pair's
       }
       stats.models++;
     } else { stats.noModel++; continue; }
@@ -292,6 +303,30 @@ export function buildTimeBlocks(tl, cells, order, assets, byName, opts = {}) {
  * also why a block claimed once can come back with a stack depth of 10 and get scaled like a tenth claim.
  */
 function vkey(x, y, z) { return `${x},${y},${z}`; }
+
+/**
+ * Append a reversed-winding twin of every quad in `stream.idx[from..to)`. A FrontSide material culls the far
+ * side of a cube (which is the point), but a plant made of two crossed quads then disappears when viewed
+ * from behind, so the only honest fix is to draw those quads twice with the opposite winding. Triangles are
+ * reversed independently of how the quad was split, and no corners are duplicated - just 6 more indices per
+ * quad, 24 bytes.
+ */
+function mirrorQuads(stream, from, to) {
+  const need = to - from;
+  if (!need) return;
+  if (stream.i + need > stream.idx.length) {
+    const x = new Uint32Array(Math.max(stream.idx.length * 2, stream.i + need));
+    x.set(stream.idx); stream.idx = x;
+  }
+  for (let k = from; k < to; k += 6) {
+    const a = stream.idx[k], b = stream.idx[k + 1], c = stream.idx[k + 2];
+    const d = stream.idx[k + 3], e = stream.idx[k + 4], f = stream.idx[k + 5];
+    const o = stream.i;
+    stream.idx[o] = c; stream.idx[o + 1] = b; stream.idx[o + 2] = a;
+    stream.idx[o + 3] = f; stream.idx[o + 4] = e; stream.idx[o + 5] = d;
+    stream.i = o + 6;
+  }
+}
 
 /**
  * Of the faces a click ray hit, the one that owns the pixel. A voxel logged N times is N cubes of the same

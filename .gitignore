@@ -6,6 +6,9 @@ build/*
 !build/q_*.js
 !build/q-*.js
 !build/*_parse*.cjs
+!build/parse_*.cjs
+!build/chk_probes.sh
+!build/run_*.sh
 !build/mk_*.mjs
 !build/mk_*.cjs
 !build/panel_layout.txt

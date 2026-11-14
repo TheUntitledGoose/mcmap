@@ -10,7 +10,7 @@ import { readPack, decodeTimeline } from '../shared/ledger-pack.mjs';
 import { presenceOf } from '../shared/ghosts.mjs';
 import { C_FULL, C_PASS, C_UNKNOWN } from '../shared/player.mjs';
 import {
-  bodiesHere, bodyGeom, trackGeom, bodyLabel, absentText, historyNear, tintOf, solidFn, occupancyOf,
+  bodiesHere, bodyGeom, bodyWall, trackGeom, bodyLabel, absentText, historyNear, tintOf, solidFn, occupancyOf,
   BODY_H, BODY_W,
 } from '../web/js/ledger-ghosts.js';
 import { fakeLog } from './fake-ledger.mjs';
@@ -189,4 +189,44 @@ test('a body colour is light in 0..1, not bytes in 0..255', () => {
   for (const v of g.col) assert.ok(v >= 0 && v <= 1, `a body vertex colour is ${v}, which clips to white`);
   assert.ok(new Set(g.col.map((v) => v.toFixed(3))).size >= 3,
     'every vertex carries the same colour, so the body reads as a flat silhouette');
+});
+
+// The picture and the click answer ONE question now, so the question needs its own tests: it decides which
+// draw group a person lands in as much as who owns a pixel.
+test('is anything solid between the eye and this person: the one answer the frame and the click share', () => {
+  const grid = (solid) => (x, y, z) => (solid.has(`${x},${y},${z}`) ? C_FULL : C_PASS);
+  const at = (x, y, z) => ({ x, y, z, floor: y - 1 });
+  const sky = grid(new Set(['0,63,0']));                 // the ground they stand on, nothing else
+  assert.equal(bodyWall(sky, at(0, 64, 0), [0, 90, 0]), 'clear',
+    'a body under open sky is clear, and the floor under them is not an occluder');
+  assert.equal(bodyWall(sky, at(0, 64, 0), [0, 64, 40]), 'clear',
+    'and neither is the column they stand in, read sideways');
+
+  const wall = grid(new Set(['0,63,0', '0,64,10', '0,65,10', '0,66,10']));   // a wall 10 out
+  assert.equal(bodyWall(wall, at(0, 64, 0), [0, 65, 40]), 'wall',
+    'solid ground between the eye and them hides them, and the frame is allowed to agree');
+
+  // A block at their own height one column over is a TUNNEL WALL, not a floor: the mine framing proved it
+  // hides them (stone at 10.42 against a body at 9.89), and a height band around body.y used to excuse it.
+  const tunnel = grid(new Set(['0,63,0', '1,64,0', '2,64,0', '3,64,0', '4,64,0', '5,64,0']));
+  assert.equal(bodyWall(tunnel, at(0, 64, 0), [12, 64, 0]), 'wall',
+    'the wall of a tunnel is not the floor of it');
+
+  // Ground nobody fetched is not proof of a wall - the same three-way honesty the seat uses.
+  // A wall the eye can see OVER. The middle of a person is behind it and their head is not, and one ray to
+  // the chest used to answer 'wall' for a person the frame is plainly showing - in a one-block tunnel that
+  // grazed a corner on the way to their middle, hiding somebody standing in plain sight.
+  const halfwall = grid(new Set(['0,63,0', '0,64,10', '0,65,10', '0,66,10', '0,67,10']));
+  assert.equal(bodyWall(halfwall, at(0, 64, 0), [0, 80, 20]), 'clear',
+    'head over the wall, so the person is visible and must draw');
+  assert.equal(bodyWall(halfwall, at(0, 64, 0), [0, 66, 20]), 'wall',
+    'the same body, eye under the lip: every way in is blocked');
+
+  const held = (x, y, z) => (x >= 4 ? C_PASS : C_UNKNOWN);
+  assert.equal(bodyWall(held, at(0, 64, 0), [40, 64, 0]), 'unknown',
+    'an unfetched chunk down the line says "not knowable", never "you are hidden"');
+  assert.equal(bodyWall((x, y, z) => C_UNKNOWN, at(0, 64, 0), [40, 64, 0]), 'unknown',
+    'and a body with no voxels under any part of the way is unknown rather than clear');
+  assert.equal(bodyWall(grid(new Set(['0,63,0'])), at(0, 64, 0), [0, 64.6, 0]), 'clear',
+    'an eye inside the person answers for them, not against them');
 });

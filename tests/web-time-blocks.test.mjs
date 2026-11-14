@@ -238,16 +238,33 @@ test('marker draw ends climb, and the hit maps back to the marker that drew it',
   }
 });
 
-test('a plant marker is the plant, not a cube - and its index count is what the draw range uses', () => {
+test('a plant marker is the plant, not a cube - and its reversed twin is what survives a one-sided material', () => {
   const b = build([[9, 64, 9, 2, 'minecraft:grass', 'minecraft:air', 10]]);
   assert.equal(b.stats.models, 1, 'grass is a model state in this atlas');
   assert.equal(b.stats.cubes, 0);
-  // grass bakes to 4 quads, so the marker spans 24 indices, not a cube's 36. A draw range computed as
+  const one = build([[9, 64, 9, 2, 'minecraft:grass', 'minecraft:air', 10]], { twin: 0 });
+  // grass bakes to 4 quads, so one-sided it spans 24 indices, not a cube's 36. A draw range computed as
   // "items x 6" or "items x 36" would either cut the plant in half or eat the next marker.
-  assert.equal(b.markerEnd[0], 24);
-  assert.equal(b.idx.length, 24);
+  assert.equal(one.markerEnd[0], 24);
+  assert.equal(one.stats.doubled, 0);
+  // Both sides ARE needed for a cross of quads, and the way to get them is an explicit twin: a two-sided
+  // material does it to every logged WALL as well and shows the inside of its back faces.
+  assert.equal(b.markerEnd[0], 48, 'every model quad is drawn twice, once each way round');
+  assert.equal(b.idx.length, 2 * one.idx.length, 'and the twin costs indices, never corners');
+  assert.equal(b.stats.doubled, one.idx.length, 'the count names the TWIN, not the pair');
+  // Structure, not a magic index list: the twin must reverse each TRIANGLE of each quad, whichever diagonal
+  // the corner shading chose.
+  const twin = [...b.idx].slice(one.idx.length);
+  assert.equal(twin.length, one.idx.length);
+  for (let k = 0; k < one.idx.length; k += 6) {
+    const q = one.idx.subarray(k, k + 6);
+    assert.deepEqual(twin.slice(k, k + 6), [q[2], q[1], q[0], q[5], q[4], q[3]],
+      'the twin reverses each TRIANGLE, so both windings stay planar-consistent');
+    assert.deepEqual(new Set([...q, ...twin.slice(k, k + 6)]).size, 4, 'and reuses the same four corners');
+  }
   const cube = build([[9, 64, 9, 2, 'minecraft:stone', 'minecraft:air', 10]]);
   assert.equal(cube.markerEnd[0], 36);
+  assert.equal(cube.stats.doubled, 0, 'a cube gets no twin: its back faces are the INSIDE of a block');
 });
 
 test('the real overworld place filter fits under the default ceiling, as blocks', () => {

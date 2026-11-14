@@ -43,7 +43,8 @@ test('ticking the time machine also arms the block correction, and never over an
 // The arm promise has two entry points, and the first version of the fix only covered one of them: a page
 // that boots with ?time=1 never calls setTime, so it sat at second 0 and drew an empty map.
 test('a fresh time arm is marked on BOTH entry points, and the rebuild decides where it starts', () => {
-  assert.match(bodyOf('setTime'), /TLAYER\.freshArm = 1;/, 'the checkbox path lost its fresh-arm mark');
+  assert.match(bodyOf('setTime'), /TLAYER\.freshArm = same \? 0 : 1;/,
+    'the checkbox path still marks a fresh arm, but only for a filter it has not armed before');
   assert.match(bodyOf('timeLoad'), /TLAYER\.freshArm = 1;/, 'the ?time=1 boot path lost its fresh-arm mark');
   const rb = bodyOf('timeRebuild');
   assert.match(rb, /if \(TLAYER\.freshArm\)/, 'nothing consumes the fresh arm');
@@ -224,7 +225,7 @@ test('the playhead pick asks the log, never the mesh, and answers nothing rather
 test('a person answers a click before a marker and before far paint, but real ground in front does not', () => {
   const g = bodyOf('ghostTakesPixel');
   assert.match(g, /if \(S\.bodyThrough\) return true;/, 'the whole-world finder no longer answers outright');
-  assert.match(g, /const dm = S\.bodyPick \? Infinity : \(marker\?\.dist \?\? Infinity\);/,
+  assert.match(g, /let dm = S\.bodyPick \? Infinity : \(marker\?\.dist \?\? Infinity\);/,
     'a marker is back in the distance race, which is the unclickable-person bug again');
   assert.match(g, /return GHOST\.hitDist <= dm && GHOST\.hitDist <= dw;/,
     'a body no longer has to be in front of the world surface, so it answers through walls');
@@ -295,11 +296,12 @@ test('the time-machine sentence says what happened to repeated claims, and culli
   // Every claim drawing means coplanar cubes at one voxel, so the ray needs a tie-break or a click answers
   // whichever cube three.js happened to walk first.
   const hit = bodyOf('timeHitAt');
-  assert.match(hit, /pickMarkerHit\(rc\.intersectObject\(TLAYER\.mesh, false\)\)/,
-    'a dead-heat depth between two claims of one voxel must answer with the newest');
+  assert.match(hit, /pickMarkerHit\(solid\.length \? solid : hits\)/,
+    'a dead-heat depth between two claims of one voxel must answer with the newest, and among candidates only '
+    + 'those whose own sprite would survive the cut here');
   // And the two switches have to reach the builder: a setting the builder never sees is a checkbox that
   // repaints nothing.
-  assert.match(src, /cull: S\.timeCull, dedupe: !!S\.timeDedupe\s*\}/,
+  assert.match(src, /cull: S\.timeCull, dedupe: !!S\.timeDedupe, twin: S\.timeTwin\s*\}/,
     'the cull rule and the dedupe rule never reached buildTimeBlocks');
   assert.match(src, /timeCull: Math\.max\(0, Math\.min\(2, num\('timecull', 1\)\)\)/,
     'face culling has three honest settings, and the default is the time-aware one');
@@ -331,7 +333,7 @@ test('a look change and a filter change drop the counters and facts that no long
   assert.match(rb, /TLAYER\.stacked = 0; TLAYER\.maxStack = 0;/, 'and the repeat counts with them');
 });
 
-test('a change marker tests the world\'s depth but never writes its own, and the people draw after it', () => {
+test('a change marker sorts itself against the world, and each person answers for themselves', () => {
   const m = bodyOf('timeBlockMatOf');
   assert.match(m, /timeBlockMat\.depthWrite = !!S\.markDepth;/,
     'the depth-write flag stopped saying what it writes');
@@ -339,16 +341,32 @@ test('a change marker tests the world\'s depth but never writes its own, and the
     'the depth-write switch means its own opposite again');
   assert.match(m, /timeBlockMat\.depthTest = true;/,
     'a marker stopped obeying the world, so a hill in front of it stops hiding it');
-  assert.match(src, /markDepth: num\('markdepth', 0\) \? 1 : 0,/,
-    'the default went back to writing depth, which buries the person standing in the block a marker annotates');
-  assert.doesNotMatch(src, /markDepth: num\('markdepth', 1\)/,
-    'a default that was measured to bury bodies is back');
-  // A person owns the pixel over the annotation on their own block because they draw LAST, and the marker
-  // layer that could seal them in does not write depth by default.
-  assert.match(bodyOf('ghostCut'), /mesh\.renderOrder = 903;/,
-    'the people no longer draw after the change markers, so a marker paints over a person again');
-  assert.match(bodyOf('timeRebuild'), /renderOrder = 902;/,
-    'the marker layer still draws before the people');
+  // The layer SORTS itself now. With no depth-write it is painted in log order, and a claim logged later
+  // wins the pixel against a block half a block nearer: 88,499 pixels of a wall framing (8.6%) and 183,690
+  // of a cave framing (17.9%) moved when the switch flipped, against a control pair that moved 0.
+  assert.match(src, /markDepth: num\('markdepth', 1\) \? 1 : 0,/,
+    'the layer that used to paint in LOG order now writes depth, so a near claim stops losing to a far one');
+  assert.doesNotMatch(src, /markDepth: num\('markdepth', 0\)/,
+    'a default that cannot sort came back');
+  assert.match(m, /getMaxAnisotropy\(\)/,
+    'the atlas is filtered ALONG the surface, so the texel the ray samples is near the texel the pixel sampled: '
+    + 'with mip levels alone a marker 100 blocks off still PAINTS whole (?mipmax=0) while the click read one '
+    + 'hidden texel of it and refused the pixel (build/q_magentafind.js)');
+  // One material, and it culls back faces: a two-sided marker layer shows the INSIDE of every logged wall's
+  // back faces, which is what "the faces in the back are inverted" describes.
+  assert.match(m, /side: THREE\.FrontSide/, 'the marker layer went two-sided again');
+  assert.doesNotMatch(m, /side: THREE\.DoubleSide/, 'a two-sided marker layer draws the inside of its own cubes');
+  // What makes the sorted layer safe for people is that THEY answer per body, not as a layer.
+  assert.match(bodyOf('ghostMats'), /ghostThruMat = new THREE\.MeshBasicMaterial/, 'the second body material went away');
+  assert.match(bodyOf('ghostMats'), /ghostThruMat\.depthTest = false;/);
+  assert.match(bodyOf('ghostCut'), /new THREE\.Mesh\(geo, \[bodyMat, thruMat\]\)/,
+    'the people went back to one material for the whole layer');
+  assert.match(bodyOf('ghostCut'), /geo\.groups = g\.per\.map/, 'and back to one draw range for the whole layer');
+  assert.match(bodyOf('ghostDepth'), /q\.materialIndex = b && b\.seen !== 'wall' \? 1 : 0;/,
+    'nobody decides per-body depth any more');
+  assert.match(bodyOf('ghostTakesPixel'), /bodySeenAnswer\(body\)/,
+    'the click stopped asking the same voxel question the picture asked');
+  assert.match(src, /bodySeen: num\('bodyseen', 1\) \? 1 : 0,/, 'the shared rule needs its A/B switch');
 });
 
 // The playhead's unit is a ROW: of this dimension's 351,531 rows many share one second, so a key that moved
@@ -449,4 +467,197 @@ test('a buried body says how deep it is, on the tag and in the note', () => {
   const note = bodyOf('peopleNote');
   assert.ok(/caves/.test(note) && /\?caves=1/.test(note),
     'the note names the one control that draws the rock a mined body stands in');
+});
+
+// A loading bar is a promise about work that is left. The promise is only as good as the counters behind
+// it, and the whole point of web/js/loading.js is that the shape (fraction / stripe / nothing) is decided by
+// data rather than by whatever the frame loop happened to be doing.
+test('a pick never answers a claim the playhead has not drawn', () => {
+  const th = bodyOf('timeHitAt');
+  assert.match(th, /if \(TLAYER\.drawn != null && it >= TLAYER\.drawn\) continue;/,
+    'a raycast reads the WHOLE filter buffer while setDrawRange shows only the claims that have happened by '
+    + 'this second - without this filter the card talks about a block from a later day');
+  assert.match(th, /pickMarkerHit\(solid\.length \? solid : hits\)/, 'the undrawn hits must go BEFORE the newest-wins tie-break, or '
+    + 'the newest-claim rule happily answers with a claim that is not on screen');
+  assert.match(bodyOf('markerItemOf'), /markerOfIndex\(TLAYER\.markerEnd, Math\.floor\(faceIndex \/ 2\) \* 6\)/,
+    'a raycast hands back a TRIANGLE number: floor(q/2)*6 indices, not q*6');
+  assert.match(bodyOf('markerHits'), /inDrawRange: item >= 0 && \(TLAYER\.drawn == null \|\| item < TLAYER\.drawn\)/,
+    'the probe that asks "what claims does this ray meet" has to say which of them are drawn');
+  assert.match(th, /cube,\s+\/\/ a cube marker is flush; a model marker is its own shape/,
+    'the answer has to carry the marker\'s SHAPE, because a flush cube and an authored model settle a '
+    + 'dead-heat depth differently');
+  assert.match(th, /cube = !!assets\.states\[st\]\.cube\?\.length/, 'and it comes from the atlas table, not from a guess');
+});
+
+test("a marker that the world paints over stops answering the click", () => {
+  const mp = bodyOf('markerTakesPixel');
+  assert.ok(mp, 'markerTakesPixel is gone');
+  assert.match(mp, /if \(!S\.markPick\) return true;/, 'the old rule keeps its A/B switch');
+  assert.match(mp, /const d = world\?\.detail;/, 'the ground the frame composes is the witness');
+  assert.match(mp, /if \(S\.markPick === 2\) front = d \? d\.dist : \(first \? first\.dist : null\);/,
+    'the real-chunk-ground-only rule stays probeable as ?markpick=2');
+  assert.match(mp, /const first = world && world\.drawn !== 'detail' \? world : null;/);
+  assert.match(mp, /const coarsePaints = !!first && \(!S\.lodClip/, 
+    'a coarse patch counts as ground only where it is actually DRAWN: the LOD clip discards its fragments '
+    + 'where a chunk mesh owns the column, and counting a clipped patch buried 7 of 50 mine pixels '
+    + '(LOD 14.27, marker 14.57, real ground 15.7 - the frame showed the marker)');
+  assert.match(mp, /else if \(coarsePaints\) front = d \? Math\.min\(d\.dist, first\.dist\) : first\.dist;/,
+    'where no real ground is installed, the coarse layer IS the ground (party px 213,533: a baked LOD plant '
+    + 'at 16.22 over a marker at 16.23, nothing real nearer than 91 - the frame showed the plant)');
+  assert.match(mp, /else front = d \? d\.dist : null;/);
+  assert.match(mp, /if \(Math\.abs\(mark\.dist - front\) <= 0\.02\) \{/, 'a dead-heat depth is named, not guessed');
+  assert.match(mp, /GHOST\.markTie = true;/, 'and the answer admits it was a tie');
+  assert.match(mp, /^    return false;$/m,
+    'the GROUND owns a dead heat: at the dense wall every sampled coplanar pixel (marker 27.37 against ground '
+    + '27.37, same voxel, and a dozen more) showed the blocks own face, and handing that plane to a cube '
+    + 'marker because polygonOffset ought to win it produced 12 disagreements of 25 sampled pixels');
+  assert.match(mp, /return mark\.dist < front;/, 'anywhere else the marker must be genuinely in front of the ground');
+  assert.match(bodyOf('pixelOwner'), /markerTakesPixel\(h\.marker, h\.world\)/);
+  assert.match(bodyOf('pixelOwner'), /owner: takes \? 'body' : mark \? 'marker' : h\.world \? 'world' : 'nothing'/);
+  assert.match(bodyOf('askAt'), /if \(t && markerTakesPixel\(t, p\)\)/,
+    'the click and the probe must run the SAME rule, or a probe measures a policy the page does not have');
+  assert.match(src, /markPick: Math\.max\(0, Math\.min\(2, num\('markpick', 1\)\)\)/);
+  assert.match(src, /markerPick: S\.markPick,/);
+  assert.match(src, /markAniso: Math\.max\(0, Math\.min\(16, num\('markaniso', 8\)\)\)/,
+    'the filtering that keeps the click honest is a setting, not a constant');
+});
+
+test('the marker layer sorts itself, shows only its outside, and crosses a plant twice', () => {
+  const m = bodyOf('timeBlockMatOf');
+  assert.match(src, /markDepth: num\('markdepth', 1\) \? 1 : 0,/,
+    'the layer that used to paint in LOG order must now write depth, so a near claim stops losing to a far one');
+  assert.match(m, /timeBlockMat\.depthWrite = !!S\.markDepth;/,
+    'the switch must mean what it says: markdepth=1 writes depth');
+  assert.match(src, /markSide: num\('markside', 1\) \? 1 : 0,/,
+    '"faces in the back, again inverted" was this layer drawing the INSIDE of every logged wall');
+  assert.match(m, /timeBlockMat\.side = S\.markSide \? THREE\.FrontSide : THREE\.DoubleSide;/);
+  assert.match(src, /timeTwin: num\('timetwin', 1\) \? 1 : 0,/,
+    'a one-sided layer would delete a crossed plant seen from behind, so the twin ships on');
+  assert.match(src, /cull: S\.timeCull, dedupe: !!S\.timeDedupe, twin: S\.timeTwin/,
+    'the twin is a setting, not a constant, or ?timetwin=0 cannot A-B it');
+  const note = bodyOf('timeNote');
+  assert.match(note, /!S\.markDepth[\s\S]{0,220}LOG order/, 'a layer that paints in log order has to say so out loud');
+  assert.match(note, /!S\.markSide[\s\S]{0,220}BOTH of its sides/, 'both-sides is a mode, and names itself');
+});
+
+test('a person is drawn or hidden by the same voxel answer the click uses, per body', () => {
+  assert.match(src, /bodySeen: num\('bodyseen', 1\) \? 1 : 0,/);
+  const cut = bodyOf('ghostCut'), dep = bodyOf('ghostDepth'), px = bodyOf('ghostTakesPixel');
+  assert.match(cut, /new THREE\.Mesh\(geo, \[bodyMat, thruMat\]\)/,
+    'one mesh, two materials: a layer-wide switch cannot hide one person and show another');
+  assert.match(cut, /geo\.groups = g\.per\.map/, 'one draw group PER body, since sight is per body');
+  assert.match(dep, /bodyWall\(cellAt, b, eye\)/, 'the picture asks the shared voxel question');
+  assert.match(dep, /GHOST\.seenBy = new Map\(\)/,
+    'the answer is keyed by WHO: a seat re-cut builds new body objects, and an answer left on the old ones '
+    + 'reads as never-asked - which is how a body can look fine and refuse the click');
+  assert.match(dep, /GHOST\.seenBy\.set\(b\.player, b\.seen\)/);
+  assert.match(dep, /q\.materialIndex = b && b\.seen !== 'wall' \? 1 : 0;/);
+  assert.match(px, /bodySeenAnswer\(body\)/, 'the click asks the SAME question, not a distance contest');
+  assert.match(px, /if \(GHOST\.hitSeen === 'wall'\) return false;/,
+    'all-or-nothing: a body the voxels hide is drawn with depth on, so the click must not promise it');
+  assert.match(px, /GHOST\.hitExempt = true;\s*return GHOST\.hitDist <= dm;/,
+    'and a body the voxels reach is drawn OVER what is in front of it, so nothing but another body takes it');
+  assert.match(src, /ghostDepth\(\);\s*ghostPlace\(\);/, 'the answer refreshes on the body tick, not once per load');
+});
+
+// A loading bar is a promise about work that is left. The promise is only as good as the counters behind
+// it, and the whole point of web/js/loading.js is that the shape (fraction / stripe / nothing) is decided by
+// data rather than by whatever the frame loop happened to be doing.
+test('the loading bar is mounted, gated on real pending work, and probeable', () => {
+  const html = readFileSync('web/index.html', 'utf8').replace(/\r\n/g, '\n');
+  assert.match(html, /<div id="pbar"[^>]*><i class="tr"><i class="fl" id="pbar-fill">/,
+    'the bar has no track to fill');
+  assert.match(html, /body\.loading #pbar \{ display: flex; \}/,
+    'the bar is not gated on the page saying it is actually waiting');
+  assert.match(html, /#pbar \{[^}]*display: none;/, 'and it is visible by default, which is the bug');
+  assert.match(html, /#pbar\.stripe i\.fl/, 'a wait with no total has no stripe to draw');
+  assert.match(html, /prefers-reduced-motion/, 'an animated bar with no exit for people who asked for stillness');
+  assert.match(src, /import \{ createProgress \} from '\.\/loading\.js';/, 'the page draws its own bar policy');
+  assert.match(src, /const PROGRESS = createProgress\(\{ clock: \(\) => performance\.now\(\) \}\);/);
+  const pt = bodyOf('progressTick');
+  assert.match(pt, /PROGRESS\.note\('chunks'/, 'the bar does not know about chunks streaming in');
+  assert.match(pt, /PROGRESS\.note\('mesh'/, 'nor about mesh work it queued');
+  assert.match(pt, /PROGRESS\.note\('far', \{ done: dirtyPatches\.size, total: null/,
+    'far ground has no total, and the bar must not invent one');
+  assert.match(pt, /PROGRESS\.note\('replay'/, 'nor about the replay rebuilding chunks');
+  assert.match(pt, /PROGRESS\.note\('log'/, 'nor about the 4\.7 MB timeline');
+  assert.match(pt, /PROGRESS\.clear\('chunks'\)/, "who clears 'chunks' when it stops being pending?");
+  assert.match(pt, /PROGRESS\.clear\('mesh'\)/, "who clears 'mesh'?");
+  assert.match(pt, /PROGRESS\.clear\('far'\)/, "who clears 'far ground'?");
+  assert.match(pt, /PROGRESS\.clear\('replay'\)/, "who clears 'the replay'?");
+  assert.match(pt, /PROGRESS\.clear\('log'\)/, "who clears 'the action log'?");
+  assert.match(bodyOf('drawProgress'), /document\.body\.classList\.add\('loading'\)/);
+  assert.match(bodyOf('drawProgress'), /now >= barHideAt/, 'a bar that blinks on every 200 ms gap reads as a fault');
+  assert.match(pt, /if \(!S\.bar && barShown\) \{ barShown = false; document\.body\.classList\.remove\('loading'\); \}/,
+    'with the bar switched off the counters must still run, or a probe cannot read the wait it is gating');
+  assert.match(src, /if \(S\.bar\) drawProgress\(now, PROGRESS\.snapshot\(\)\);/,
+    'the off switch is about PAINTING, not about knowing: ?bar=0 must not blind the measurement');
+  assert.match(src, /progressTick\(now\);/, 'nothing asks the bar to update, so it never moves');
+  assert.match(src, /bar: num\('bar', 1\) \? 1 : 0,/, '?bar=0 is the switch a frame-diffing probe needs');
+  assert.match(pt, /if \(!S\.bar && barShown\) \{ barShown = false; document\.body\.classList\.remove\('loading'\); \}/,
+    'a frame-diffing probe asks for no bar, and a pill that keeps animating after that switch is a moving pixel '
+    + 'in every A/B that follows - the URL has to take it out of the picture, not just stop updating it');
+  assert.match(pt, /if \(S\.bar\) drawProgress\(/,
+    'only the PICTURE is gated on ?bar: the counters keep running, or a probe that turns the pill off cannot ask '
+    + 'whether the page is settled any more and every "at rest" measurement in a bar=0 run reads as nothing owed');
+  // boot: six named steps, and the count has to match or the bar lies about being nearly done.
+  const bootCalls = (src.match(/bootStage\('/g) ?? []).length;
+  assert.match(src, /const BOOT_STEPS = 6;/, 'the boot bar has no total');
+  assert.equal(bootCalls, 6, `${bootCalls} boot steps report in, but the bar promises 6`);
+  assert.match(src, /PROGRESS\.reset\(\);/, 'a dimension switch keeps the old world\'s panic');
+  assert.match(src, /progress: \(\) => PROGRESS\.snapshot\(\),/, 'a probe cannot ask what the bar is claiming');
+  assert.match(bodyOf('timeLoad'), /TLAYER\.loading = 1;/, 'the longest wait on the page is invisible to the bar');
+  assert.match(bodyOf('timeLoad'), /finally \{ TLAYER\.loading = 0; \}/,
+    'seven early returns, and the bar would promise the log forever');
+});
+
+test("a marker whose sprite is transparent here stops answering, and drawn ground can bury a marker", () => {
+  const mp = bodyOf("markerTakesPixel");
+  assert.match(mp, /if \(S\.markAlpha && mark\.paints === false\)/,
+    "the fragment shader threw that texel away: a fern marker standing in front of a lawn answers the RAY and paints grass");
+  assert.match(bodyOf('timeHitAt'), /paints: hitPaints\(hit\), alpha: hitAlpha\(hit\)/,
+    "the marker answer carries the alpha verdict, so the click and the probe read the same one");
+  assert.match(bodyOf('hitAlpha'), /sampleAtlas\(hit\.uv\.x, hit\.uv\.y\)/, 'the CPU copy of the atlas, not the GPU');
+  assert.match(bodyOf('hitPaints'), /a === null \? true : a >= S\.alphaTest/,
+    "no uv, no opinion: opaque geometry must stay painted");
+  assert.match(src, /markAlpha: num\('markalpha', 1\) \? 1 : 0,/);
+  assert.match(src, /markerAlpha: !!S.markAlpha,/);
+  assert.match(bodyOf('timeHitAt'), /solid\.length \? solid : hits/,
+    'the ray prefers a candidate whose sprite survives the cut - the answer is the pixel, not the triangle');
+  assert.match(bodyOf('markerHits'), /sprite: hitPaints\(h\), alpha: hitAlpha\(h\)/,
+    'and the stack probe must be able to tell "not drawn yet" from "draws nothing here"');
+  assert.match(bodyOf('markerHits'), /inDrawRange:/, 'draw range is a separate fact from sprite coverage');
+});
+
+test('un-ticking and re-ticking the time machine keeps the moment you were standing at', () => {
+  const st = bodyOf('setTime');
+  assert.match(st, /TLAYER\.heldAt = S\.timeAt;/, 'switching the overlay off must remember the moment');
+  assert.match(st, /TLAYER\.heldFilter === sig/, 'and only the SAME filter may claim that moment back');
+  assert.match(st, /TLAYER\.freshArm = same \? 0 : 1;/,
+    're-ticking the same filter is not a fresh arm: a fresh arm seeks to the first logged change and starts '
+    + 'PLAYING, which is how the highlight ends up answering a second nobody asked for');
+  assert.match(st, /S\.timeAt = TLAYER\.heldAt; S\.timePlay = TLAYER\.heldPlay;/,
+    'the moment comes back, and so does whether it was running');
+  assert.match(src, /heldAt: null, heldFilter: '', heldPlay: 0,/, 'the held moment is page state, not a closure');
+  assert.match(src, /TLAYER\.heldAt = null; TLAYER\.heldFilter = '';/,
+    "another dimension's log does not owe you this moment");
+});
+test('a baked tile is skipped only when the clip would kill every fragment it draws', () => {
+  const tf = bodyOf('tileFullyClipped');
+  assert.match(tf, /e\.box/, 'ask about the DRAWN box, not the region rectangle: baked caps and trees at a '
+    + 'tile edge stick out past the 32x32 chunk square, and a skip keyed on that square erased ground the live '
+    + 'layer never paints (1 pixel of 64,000 disagreed at a settled whole-world framing, control pair 0)');
+  assert.match(tf, /lodPaintSet\.has/, 'only patches the live layer DRAWS count; a patch merely held and '
+    + 'awaiting re-cut can uncover itself mid-pan');
+  assert.match(tf, /Math\.abs\(px - acx\) >= COV_N/, 'outside the coverage window the shader reads a wrapped '
+    + 'texel, so a tile touching the edge is never hidden');
+  assert.match(src, /box: new THREE\.Box3\(\)\.setFromObject\(mesh\)/,
+    'the box is computed once at install, from the mesh, in world coordinates');
+  const dl = bodyOf('drainLod');
+  assert.match(dl, /e\.mesh\.visible = !gone;/, 'the skip is a visibility flip');
+  assert.match(src, /\.filter\(\(x\) => isDrawn\(x\.object\)\)/,
+    'and a visibility flip must be paired with the pick: three answers rays for invisible meshes, the frame does not');
+  assert.match(src, /hiddenTiles: lodHidden, hiddenVerts: lodHiddenVerts/,
+    'a saved draw call that is not countable is a screenshot argument again');
+  assert.match(src, /lodHideWhy/, 'a tile that is NOT skipped has to be explainable: which patches, which box');
 });
