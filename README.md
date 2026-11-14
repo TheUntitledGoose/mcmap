@@ -206,9 +206,18 @@ Three things that only go wrong in Portainer, not in `docker compose`:
   `/stats` reporting `decodes: 0` forever is the symptom), write the host path out in full:
   `source: /srv/minecraft/DarkRPG`.
 
-**The packs are not in git.** A fresh clone has no `build/assets`, and the image build stops in a
-preflight that says so, because a container that starts without them serves a world with holes where
-the far view should be and no error. Bake first, on a machine holding the save and the game jars:
+**The packs are not in git — so get them in one of two ways.** A clone of this repository has
+`build/assets/` and friends as empty keep files: the directories exist so the image build never dies in
+`COPY` (it used to, with `failed to compute cache key: "/build/ledger": not found`, which named no file
+and no fix), and the build now prints what is missing instead:
+
+```text
+pack assets: NOT HERE - build/assets holds only the keep file -> mount a baked pack there, or bake it here and rebuild
+pack shells: NOT HERE - build/shells holds only the keep file -> ...
+```
+
+* **Bake them into the image** — the best first start, but the build machine needs the save and your own
+  1.20.1 jars:
 
 ```bash
 npm run bake          # census, assets, shells, LOD rungs
@@ -218,6 +227,27 @@ node tools/fetch-skins.mjs  # the cast's skins, if you want them: one Mojang cal
                       # name with no profile (the strip's white cell does that honestly)
 docker build -t mcmap .
 ```
+
+* **Or build from the clone and mount the packs** — ~168 MB, copied once off the machine that baked them
+  (`build/cache` is *not* one of them; it is regenerated per container). The target paths below are the
+  paths the server reads by default, which is why no `WD_*` has to change for a mount:
+
+```bash
+docker run -d --name mcmap -p 8765:8765   -v /srv/DarkRPG:/data/DarkRPG:ro   -v /srv/mcmap/packs/assets:/srv/app/build/assets:ro   -v /srv/mcmap/packs/shells:/srv/app/build/shells:ro   -v /srv/mcmap/packs/lods:/srv/app/build/lods:ro   -v /srv/mcmap/packs/ledger:/srv/app/build/ledger:ro   -v mcmap-cache:/data/cache mcmap
+```
+
+In Portainer the same four lines go in `volumes:` (they are in `compose.yaml` as comments, ready to
+uncomment). The boot log answers whether a mount actually arrived, rather than whether a directory exists
+— which is not the same question when a keep file lives in it:
+
+```text
+shell packs: /srv/app/build/shells (8 entries)
+shell packs: nothing at /srv/app/build/shells — mount a pack (WD_PACKS) or run node server/bake-shells.mjs
+```
+
+A missing **asset** pack stops the boot, on purpose, and the log names `WD_ASSETS` and the bake command.
+A missing shell/LOD/ledger pack does not: the page then has no far layers and no action history, which is
+a hole you can see rather than a crash.
 
 **Health check and the boot sweep.** The health check is `GET /stats`, and the start period is
 300 s. The sweep at boot runs before the port opens: on a current cache it is cheap (measured: 1 s to

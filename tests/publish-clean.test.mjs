@@ -19,7 +19,9 @@ const forbiddenTracked = [
   /^build\/cache/,              // derived, huge, and keyed to this machine
   /^build\/skins\/(?!\.keep$)/, // fetched faces: the .keep file is the only thing of ours
   /^build\/ledger\/actions\.bin$/, // a build input with raw rows, 32 MB
-  /^build\/shells\//, /^build\/lods\//, /^build\/assets\//, // baked from jars you own: not ours to ship
+  /^build\/shells\/(?!\.keep$)/, /^build\/lods\/(?!\.keep$)/, /^build\/assets\/(?!\.keep$)/,
+    // baked from jars you own, so not ours to ship. The .keep files ARE ours: they exist so the image's
+    // COPY of a pack directory does not die on a clone that has never baked anything.
   /^\.private\//,               // the real player handles
   /^deploy\//,
 ];
@@ -60,7 +62,7 @@ test('history carries no save, no server binaries, no notes', () => {
     .map((l) => l.slice(41));
   const bad = objs.filter((p) => /^(DarkRPG|HANDOFF\.md|PLAN\.md|\.private)(\/|$)/.test(p)
     || /\.(jar|mca|sqlite|dat|dat_old|log|log\.gz|ledpack|bin|png)$/.test(p)
-    || /^build\/(cache|skins\/(?!\.keep)|shells|lods|assets|msg_|doc_)/.test(p));
+    || /^build\/(cache|skins\/(?!\.keep$)|shells\/(?!\.keep$)|lods\/(?!\.keep$)|assets\/(?!\.keep$)|msg_|doc_)/.test(p));
   assert.deepEqual(bad.slice(0, 5), [], `${bad.length} unpublished things are still in history, e.g. `
     + `${bad.slice(0, 3).join(', ')} - rewrite history before any push (git filter-repo --path DarkRPG `
     + `--path HANDOFF.md --path PLAN.md --invert-paths)`);

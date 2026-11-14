@@ -14,6 +14,11 @@
 # image when the packs or the source change; the cache is the only thing that may live in the
 # container's own filesystem.
 #
+# If the machine building the image does not have the packs (a plain clone of this repo never does),
+# the build still works and the packs come from read-only mounts instead:
+#   -v /srv/mcmap/packs/assets:/srv/app/build/assets:ro   (and shells, lods, ledger the same way)
+# Mounting at those paths needs no configuration, because they are the paths the server reads by default.
+#
 # Build context note: .dockerignore keeps the ~3.6 GB save and the multi-GB payload cache out of the
 # context. Without it, `docker build` uploads gigabytes before doing anything and looks broken.
 
@@ -38,6 +43,13 @@ COPY web/ ./web/
 # Derived packs: everything a browser asks for besides /voxels. build/cache is deliberately absent —
 # it is regenerated per container. build/ledger/actions.bin is excluded by .dockerignore (the page
 # reads the .ledpack files; the raw 32 MB action dump is for analysis tools).
+#
+# Each of these directories is tracked by a `.keep` file, so this COPY also works on a machine that has
+# never baked anything: the directory exists, holds only the keep file, and the report below says so.
+# That is not a shortcut around the packs — it is what lets a stack deployed from a clone of this repo
+# reach the answer instead of dying in COPY with "failed to compute cache key: /build/ledger: not found",
+# which names no file, no cause and no fix. Either bake them here, or mount them at run time (the paths
+# below are exactly the paths the server reads by default, so a mount needs no WD_* change).
 COPY build/assets/ ./build/assets/
 COPY build/shells/ ./build/shells/
 COPY build/lods/ ./build/lods/
@@ -47,11 +59,11 @@ COPY build/ledger/ ./build/ledger/
 # own band colours. The directory is tracked by an empty keep file so this COPY never fails on a clone.
 COPY build/skins/ ./build/skins/
 
-# Preflight, with the sentence that tells you what to do rather than a stack of missing paths. The
-# packs are derived data and git-ignored: a clone of this repo has no build/assets at all, and a
-# container that starts without them serves a world with holes where the far layers should be.
-RUN node -e "const fs=require('fs');const need=['build/assets/atlas.json','build/assets/geometry.bin','build/assets/atlas.png'];const miss=need.filter(f=>!fs.existsSync(f));if(miss.length){console.error('image is missing '+miss.join(', '));console.error('the packs are derived, not committed: run \'npm run bake\' (and \'npm run bake:ledger\' for the history) on a machine holding the save and the game jars, then build again');process.exit(1)}" \
- && node -e "const fs=require('fs');const d=['build/shells','build/lods','build/ledger'];for(const p of d){if(!fs.existsSync(p)){console.error('missing '+p+': bake it before building the image');process.exit(1)}const n=fs.readdirSync(p).filter(f=>fs.statSync(p+'/'+f).isFile()).length;if(!n){console.error(p+' is empty: bake it before building the image');process.exit(1)}console.log('pack '+p+': '+n+' files')}"
+# Preflight: report, do not fail. The packs are derived data and git-ignored, so the honest question is
+# not "did the build machine have them" but "will this container be told where they are". Failing the
+# build here made the clone case impossible instead of merely incomplete; worldd still refuses to start
+# without the asset pack (and says which variable to mount), so nothing broken pretends to work.
+RUN node -e "const fs=require('fs');const P=[['assets','build/assets',['atlas.json','geometry.bin','atlas.png'],'WD_ASSETS'],['shells','build/shells',[],'WD_PACKS'],['lods','build/lods',[],'WD_LODS'],['ledger','build/ledger',[],'WD_LEDGER']];let miss=0;for(const [n,p,need,env] of P){const files=fs.existsSync(p)?fs.readdirSync(p).filter(f=>f!=='.keep'):[];const ok=need.length?need.every(f=>fs.existsSync(p+'/'+f)):files.length>0;if(ok){console.log('pack '+n+': '+p+' ('+files.length+' entries)')}else{miss++;console.log('pack '+n+': NOT HERE - '+p+' holds only the keep file -> mount a baked pack there, or bake it here and rebuild')}}if(!miss){console.log('all packs are in the image')}else{console.log('  bake on a machine holding the save and your own 1.20.1 jar:  npm run bake && npm run bake:ledger');console.log('  or mount one read-only at the path worldd already reads:  -v /srv/mcmap/packs/assets:/srv/app/build/assets:ro');console.log('  the asset pack is required: worldd exits at boot and names the same paths')}"
 # The skin pack is the one derived input that may legitimately be absent, so this reports instead of failing.
 RUN node -e "const fs=require('fs');const f='build/skins/manifest.json';const n=fs.existsSync(f)?JSON.parse(fs.readFileSync(f,'utf8')).skins.length:0;console.log(n?('pack build/skins: '+n+' players'):('pack build/skins: none (optional: the cast stands tinted; tools/fetch-skins.mjs fetches the pack once)'))"
 

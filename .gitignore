@@ -20,6 +20,25 @@ build/*
 !build/skins/
 build/skins/*
 !build/skins/.keep
+
+# The required packs get the same keep-file treatment, for a different reason. `COPY build/shells/` is a
+# hard error when the directory is not in the build context, so a stack deployed from a CLONE of this
+# repo could not even build - and what Docker reported was "failed to compute cache key ... /build/ledger:
+# not found", which names no file and no fix. The directories are therefore tracked, their contents are
+# not: the build gets as far as reporting which packs are missing, and worldd says so again at boot with
+# the WD_* variable that points at the mount.
+!build/assets/
+build/assets/*
+!build/assets/.keep
+!build/shells/
+build/shells/*
+!build/shells/.keep
+!build/lods/
+build/lods/*
+!build/lods/.keep
+!build/ledger/
+build/ledger/*
+!build/ledger/.keep
 .cache/
 *.log
 .DS_Store

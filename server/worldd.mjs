@@ -83,7 +83,14 @@ const lanAddrs = () => Object.values(os.networkInterfaces()).flat()
 
 const atlasPath = path.join(ASSETS, 'atlas.json');
 if (!fs.existsSync(atlasPath)) {
-  console.error(`no ${atlasPath} — run 'node server/pack-assets.mjs' first`);
+  // The asset pack is derived (server/pack-assets.mjs, out of your own 1.20.1 jar) and is not in git, so
+  // "absent" is the normal state of a fresh clone or a fresh container. In a container this is the whole
+  // user-visible surface: one exit line, then a restart loop. So name both ways to fix it and the variable
+  // that a mount would set, instead of printing a path with no verb attached to it.
+  console.error(`worldd: no ${atlasPath}`);
+  console.error(`  bake it:   node server/pack-assets.mjs build/census.json ${ASSETS}`);
+  console.error(`             (needs the save and your own 1.20.1 client jar on this machine)`);
+  console.error(`  or mount a baked pack and point the server at it:  --assets <dir>   /   WD_ASSETS=<dir>`);
   process.exit(1);
 }
 const atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
@@ -429,8 +436,14 @@ server.listen(PORT, HOST, () => {
     console.log(`  listening on all interfaces${ips.length ? ` — from another machine: ${ips.map((a) => `http://${a}:${PORT}/`).join('  ')}` : ''}`);
     console.log('  (no auth: anyone who can reach this port can read the world save)');
   }
-  console.log(`shell packs: ${fs.existsSync(PACKS) ? PACKS : 'none baked - run node server/bake-shells.mjs'}`);
-  console.log(`lod tiles: ${lodSummary.tiles ? `${LODS} (${lodSummary.tiles} tiles, ${lodSummary.dims} dimensions)` : 'none baked - run node server/bake-lod.mjs'}`);
+  // "the directory exists" is a different question from "the pack is here": a container built from a clone
+  // has every pack directory present, holding one keep file each. Count the entries, and name the variable
+  // a mount should set, so this log answers "did my mount actually arrive?".
+  const packHere = (d) => (d === 'none' || !fs.existsSync(d)) ? 0
+    : fs.readdirSync(d).filter((f) => f !== '.keep' && !f.startsWith('.')).length;
+  console.log(`shell packs: ${packHere(PACKS) ? `${PACKS} (${packHere(PACKS)} entries)` : `nothing at ${PACKS} — mount a pack (WD_PACKS) or run node server/bake-shells.mjs`}`);
+  console.log(`lod tiles: ${lodSummary.tiles ? `${LODS} (${lodSummary.tiles} tiles, ${lodSummary.dims} dimensions)` : `nothing at ${LODS} — mount a pack (WD_LODS) or run node server/bake-lod.mjs`}`);
+  console.log(`  ledger: ${packHere(LEDGER) ? `${LEDGER} (${packHere(LEDGER)} files)` : `nothing at ${LEDGER} — mount a pack (WD_LEDGER) or run npm run bake:ledger`}`);
   {
     const sk = skinsSummary();
     console.log(sk.available

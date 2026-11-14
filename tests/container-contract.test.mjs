@@ -10,6 +10,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { envArgs } from '../shared/envargs.mjs';
 import { WORLDD_FLAGS } from '../server/worldd-flags.mjs';
@@ -76,6 +78,15 @@ test('the build context excludes the save, the cache and git history', () => {
   }
   assert.ok(!/!\s*(DarkRPG|build\/cache|\.git)/.test(IGNORE),
     'a negation puts a huge excluded tree back into the context');
+  // ... and the excludes must stay anchored at the context root: `build/*.json` cannot cross a slash, so
+  // build/assets/atlas.json still arrives. A `build/**` line would quietly strip the packs down to their
+  // keep files, and the container would then boot reporting packs it never got.
+  assert.ok(!/^build\/(\*\*|\*\/\*)/m.test(IGNORE),
+    '.dockerignore reaches into subdirectories of build/ - that is where the packs live');
+  for (const pack of ['assets', 'shells', 'lods', 'ledger', 'skins']) {
+    assert.ok(read('.gitignore').includes('!build/' + pack + '/.keep'),
+      `build/${pack}/.keep is git-ignored: a clone then has no directory to COPY and the build dies again`);
+  }
 });
 
 test('the stack mounts the save read-only and names the same paths the image defaults to', () => {
@@ -109,6 +120,101 @@ test('the health checks are spelled the way BOTH parsers require', () => {
   // exec form must be the array after it (a shell string there silently runs /bin/sh -c in front).
   assert.ok(/HEALTHCHECK[\s\S]{0,240}?\bCMD \["node"/.test(DOCKERFILE),
     'Dockerfile HEALTHCHECK is not the CMD ["node", ...] exec form');
+});
+
+test('a bare clone can build the image: every pack directory the image copies is tracked by a keep file', () => {
+  // The reason this exists: `COPY build/ledger/` where build/ledger is not in the build context is a hard
+  // error, and the packs are derived and git-ignored. Deploying this stack from a clone of the repository
+  // died with
+  //     failed to solve: failed to compute cache key: "/build/ledger": not found
+  // which names no file, no cause and no fix. So the DIRECTORY is tracked, its contents are not: the COPY
+  // always has something, and the report below is the place that answers "which packs did I forget".
+  for (const pack of ['build/assets/', 'build/shells/', 'build/lods/', 'build/ledger/', 'build/skins/']) {
+    assert.ok(DOCKERFILE.includes(`COPY ${pack}`), `Dockerfile does not copy ${pack}`);
+    assert.ok(fs.existsSync(`${pack}.keep`), `${pack}.keep is missing - a clone cannot build the image`);
+  }
+});
+
+test('the image reports a missing pack instead of failing the build, and names the mount that fixes it', () => {
+  // Failing the build made the clone case impossible rather than merely incomplete, and the message that
+  // reached the user was Docker's. The report must print and continue - and must name the WD_* variable
+  // for each pack, because "a pack is missing" without a mount path is the same dead end in a new font.
+  const start = DOCKERFILE.indexOf("RUN node -e \"const fs=require('fs');const P=[");
+  assert.ok(start >= 0, 'the pack preflight is gone from the Dockerfile');
+  const report = DOCKERFILE.slice(start, DOCKERFILE.indexOf('"', start + 40) + 1);
+  assert.ok(report.includes('WD_LEDGER'), 'the pack report was truncated while reading it: ' + report.length);
+  assert.ok(!/process\.exit\(1\)/.test(report),
+    'the pack preflight exits the build: a machine that has not baked anything cannot build the image');
+  for (const env of ['WD_ASSETS', 'WD_PACKS', 'WD_LODS', 'WD_LEDGER']) {
+    assert.ok(report.includes(env), `the pack report does not name ${env}`);
+    assert.ok(COMPOSE.includes(env), `compose.yaml never mentions ${env}: the mounts it documents may point nowhere`);
+  }
+  // "mount it at the path the image already uses" is only true if those paths are the documented ones.
+  for (const dir of ['/srv/app/build/assets', '/srv/app/build/shells', '/srv/app/build/lods', '/srv/app/build/ledger']) {
+    assert.ok(COMPOSE.includes(dir), `compose.yaml does not document a mount at ${dir}`);
+  }
+});
+
+test('worldd refuses to boot without the asset pack, and says which variable fixes it', async () => {
+  // In a stack this one line is the whole user-visible answer between restarts. A bare path in the log is
+  // how a deploy that "succeeded" ends up looking like a broken map.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcmap-nopacks-'));
+  const port = 8951 + (process.pid % 40);
+  try {
+    const child = spawn(process.execPath, ['server/worldd.mjs'], {
+      env: {
+        ...process.env,
+        WD_ASSETS: dir, WD_WORLD: path.join(dir, 'no-such-world'), WD_CACHE: 'none',
+        WD_HOST: '127.0.0.1', WD_PORT: String(port), WD_HEARTBEAT: '0',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    child.stdout.on('data', (b) => { out += b; });
+    child.stderr.on('data', (b) => { out += b; });
+    const code = await new Promise((res) => {
+      const t = setTimeout(() => { child.kill('SIGKILL'); res(null); }, 20000);
+      child.on('exit', (c) => { clearTimeout(t); res(c); });
+    });
+    assert.equal(code, 1, `it did not refuse to boot without an asset pack (code ${code}):\n${out}`);
+    assert.ok(/WD_ASSETS/.test(out), `the boot failure does not name WD_ASSETS:\n${out}`);
+    assert.ok(/pack-assets\.mjs/.test(out), `the boot failure does not say how to bake the pack:\n${out}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the boot log answers "did my mount arrive?", not "does the directory exist"', { skip: needServer() }, async () => {
+  // A container built from a clone has every pack directory present, holding one keep file each. Printing
+  // the path because it exists tells the operator the opposite of what they need to know.
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'mcmap-emptypacks-'));
+  const port = 8991 + (process.pid % 40);
+  const child = spawn(process.execPath, ['server/worldd.mjs'], {
+    env: {
+      ...process.env,
+      WD_PACKS: empty, WD_LODS: empty, WD_LEDGER: empty,
+      WD_PORT: String(port), WD_HOST: '127.0.0.1', WD_CACHE: 'none', WD_HEARTBEAT: '0',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  child.stdout.on('data', (b) => { out += b; });
+  child.stderr.on('data', (b) => { out += b; });
+  try {
+    let up = false;
+    for (let i = 0; i < 120 && !up; i++) {
+      try { up = (await fetch(`http://127.0.0.1:${port}/stats`)).ok; } catch { /* not listening yet */ }
+      if (!up) await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(up, `worldd did not come up with empty pack dirs:\n${out}`);
+    for (const env of ['WD_PACKS', 'WD_LODS', 'WD_LEDGER']) {
+      assert.ok(out.includes(env), `the boot log never mentions ${env} although its pack directory was empty:\n${out}`);
+    }
+    assert.ok(!/^shell packs: .*\(0 entries\)/m.test(out), 'it reported an empty pack directory as if it were a pack');
+  } finally {
+    child.kill('SIGKILL');
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
 });
 
 test('the health check route exists in the server', () => {

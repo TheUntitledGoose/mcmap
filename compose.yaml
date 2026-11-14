@@ -1,6 +1,6 @@
 # Portainer / docker compose stack for the world renderer.
 #
-# Stack -> "new stack" in Portainer, paste this, deploy. Three things you may have to point at:
+# Stack -> "new stack" in Portainer, paste this, deploy. Four things you may have to point at:
 #
 #   1. WORLD (below) — where a copy of DarkRPG/ lives on the host. The container only reads it.
 #   2. the image — either build it here ("build: ."), or build it on your machine and push it to a
@@ -8,6 +8,9 @@
 #   3. build: — a pasted stack has no build context on the host, so `build:` only works if the stack
 #      is deployed from the git repository (Portainer clones it into the stack path) or you build
 #      the image yourself first. If you pre-build, delete the `build:` block.
+#   4. the packs — a clone has none of them (derived, git-ignored, ~168 MB). Either bake them into the
+#      image on a machine that holds the save and your own jars, or mount them read-only: see the
+#      `volumes:` block below, whose target paths are exactly the paths the server reads by default.
 #
 # The bind source below is relative (./DarkRPG), which Portainer resolves next to the stack's own
 # files, not next to this yaml. If /data/DarkRPG/world comes up empty in the container, make the
@@ -64,6 +67,31 @@ services:
         read_only: true
       # The payload cache. A named volume survives redeploys; delete it whenever you like.
       - mcmap-cache:/data/cache
+
+      # PACKS, only if the image was built from a clone (then build/assets holds a keep file and nothing
+      # else). Mount each baked pack at the path worldd already reads — that is why no WD_* has to change.
+      # Copy these four directories off the machine that baked them (~168 MB; build/cache is NOT one of
+      # them, it is regenerated per container):
+      #
+      #   - type: bind
+      #     source: /srv/mcmap/packs/assets
+      #     target: /srv/app/build/assets
+      #     read_only: true
+      #   - type: bind
+      #     source: /srv/mcmap/packs/shells
+      #     target: /srv/app/build/shells
+      #     read_only: true
+      #   - type: bind
+      #     source: /srv/mcmap/packs/lods
+      #     target: /srv/app/build/lods
+      #     read_only: true
+      #   - type: bind
+      #     source: /srv/mcmap/packs/ledger
+      #     target: /srv/app/build/ledger
+      #     read_only: true
+      #
+      # A missing asset pack stops the boot, and the log names the path. A missing shell/LOD/ledger pack
+      # does not: the page then has no far layers and no action history, which is a hole you can see.
 
     healthcheck:
       # Portainer's compose loader rejects a bare exec array here and wants the first word to say how
