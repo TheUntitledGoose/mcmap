@@ -96,6 +96,21 @@ test('the stack mounts the save read-only and names the same paths the image def
   assert.ok(sp && Number(sp[1]) >= 120, 'healthcheck start_period is shorter than the boot sweep can take');
 });
 
+test('the health checks are spelled the way BOTH parsers require', () => {
+  // `docker compose` accepts a bare exec array for healthcheck.test. Portainer's loader does not, and
+  // it fails the entire stack deploy, not just the check:
+  //   healthcheck.test must start either by "CMD", "CMD-SHELL" or "NONE"
+  const t = /test:\s*\[([^\]]*)\]/.exec(COMPOSE);
+  assert.ok(t, 'the stack has no healthcheck.test array to inspect');
+  const first = t[1].split(',')[0].trim().replace(/^["']|["']$/g, '');
+  assert.ok(['CMD', 'CMD-SHELL', 'NONE'].includes(first),
+    `healthcheck.test starts with "${first}"; Portainer needs CMD, CMD-SHELL or NONE as the first word`);
+  // The Dockerfile's own check has the opposite trap: HEALTHCHECK wants the CMD instruction, and the
+  // exec form must be the array after it (a shell string there silently runs /bin/sh -c in front).
+  assert.ok(/HEALTHCHECK[\s\S]{0,240}?\bCMD \["node"/.test(DOCKERFILE),
+    'Dockerfile HEALTHCHECK is not the CMD ["node", ...] exec form');
+});
+
 test('the health check route exists in the server', () => {
   // A health check pointed at a route that does not exist marks a healthy container unhealthy.
   assert.ok(/['"]\/stats['"]/.test(SERVER), 'the /stats route the image health-checks is gone');

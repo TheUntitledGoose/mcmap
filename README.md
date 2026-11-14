@@ -192,6 +192,20 @@ load-bearing:
   the save. Shipping them in the image is what makes a fresh container useful in ten seconds.
   `build/cache` is the opposite: never shipped, regenerated, swept against `WD_CACHE_MAX_GB` on boot.
 
+Three things that only go wrong in Portainer, not in `docker compose`:
+
+* **`healthcheck.test` must begin with `CMD`, `CMD-SHELL` or `NONE`.** Compose accepts a bare exec array
+  there; Portainer's loader refuses the *whole stack* with
+  `healthcheck.test must start either by "CMD", "CMD-SHELL" or "NONE"`. Both spellings are now asserted
+  in `tests/container-contract.test.mjs`.
+* **A pasted stack has no build context.** `build:` needs the files next to the stack, which is only true
+  if you deploy from the git repository. Pre-build and push the image instead, then delete the `build:`
+  block and keep `image:`.
+* **A relative bind source resolves next to the stack, not next to this file.** If `/data/DarkRPG/world`
+  is empty inside the container (`docker exec mcmap ls /data/DarkRPG/world` is the ten-second check, and
+  `/stats` reporting `decodes: 0` forever is the symptom), write the host path out in full:
+  `source: /srv/minecraft/DarkRPG`.
+
 **The packs are not in git.** A fresh clone has no `build/assets`, and the image build stops in a
 preflight that says so, because a container that starts without them serves a world with holes where
 the far view should be and no error. Bake first, on a machine holding the save and the game jars:
