@@ -72,4 +72,4 @@ for (const [n, f] of biggest.slice(0, 6)) console.log(`    ${(n / 1024).toFixed(
 console.log(`
 next:
   cd "${DEST}" && cp -r <this repo>/node_modules . && npm test     # 510 here, 387 with honest skips on a clone; no network
-  gh repo create mcmap --public --source . --push                  # or your own remote + push`);
+  cd "${out}" && git remote add origin git@github.com:<you>/mcmap.git && git push -u origin main`);
