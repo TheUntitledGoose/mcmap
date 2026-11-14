@@ -186,7 +186,7 @@ export function cornerPos(b, face, a, s) {
  * splits itself into one draw group per body so each one can pick its own depth policy, and the page's
  * draw range, its group spans and its ray-to-body lookup are all counted in VERTICES. An index buffer
  * would make all three of those count indices instead, for a saving of nothing at 216 corners a body.
- * (The chunk mesher did that experiment: `build/mk_index_spec.cjs`, `tests/web-index.test.mjs`.)
+ * (The chunk mesher did that experiment; `tests/web-index.test.mjs` keeps its result.)
  */
 export function bodyMesh({ slim = false, overlay = true, inflate = 0.5, texW = 64, texH = 64, column = 0 } = {}) {
   const pos = [], uvs = [];

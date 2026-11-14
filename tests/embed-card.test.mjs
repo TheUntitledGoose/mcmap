@@ -22,6 +22,8 @@ const page = readFileSync('web/index.html', 'utf8').replace(/\r\n/g, '\n');
 test('the card describes the address the bot used, not a guess baked into a file', () => {
   // A box on a LAN has no domain. The Host header is the only thing that knows how this server was
   // reached, so the card uses it - which is also why it is character-checked before being echoed.
+  // The address is from 192.0.2.0/24 (RFC 5737, reserved for documentation): a fixture should not
+  // quote a real LAN, and an example that happens to be somebody's router is a leak in a public repo.
   assert.equal(urlBase({ host: '192.0.2.10:8765' }), 'http://192.0.2.10:8765');
   assert.equal(pageUrl({ host: '192.0.2.10:8765' }), 'http://192.0.2.10:8765/',
     'a URL with a query and no path is legal and reads as a mistake');
