@@ -10,7 +10,7 @@
 // A test that cannot see its input must say so and skip, not fail: a clone of this repo should be able to
 // run the suite and see a green result with an honest count of what waited for data.
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 
 export const WORLD = process.env.WD_WORLD || 'DarkRPG/world';
 export const MODS = process.env.WD_MODS || 'DarkRPG/mods';
@@ -18,13 +18,21 @@ export const ASSETS = process.env.WD_ASSETS || 'build/assets';
 export const LEDGER = 'build/ledger';
 export const SKINS = 'build/skins';
 
+// A pack directory that holds only its `.keep` file is a placeholder, not a pack: the keep files exist so
+// a clone can build the Docker image (COPY of a missing directory is a hard error). Testing `existsSync`
+// on such a directory says "the far packs are here" and then the test dies on a missing atlas, which is
+// the failure a skip exists to prevent. So: contents, not existence.
+const hasContent = (dir) => {
+  try { return readdirSync(dir).some((f) => f !== '.keep'); } catch { return false; }
+};
+
 export const HAVE = {
   assets: existsSync(`${ASSETS}/atlas.json`) && existsSync(`${ASSETS}/geometry.bin`),
   save: existsSync(`${WORLD}/region`),
   jars: existsSync(MODS),
   ledger: existsSync(`${LEDGER}/meta.json`),
   skins: existsSync(`${SKINS}/manifest.json`),
-  packs: existsSync('build/shells') && existsSync('build/lods'),
+  packs: hasContent('build/shells') && hasContent('build/lods'),
 };
 
 const why = (what) => `needs ${what}: derived from a save and a game install, not in git`;
@@ -36,6 +44,10 @@ export const needJars = () => (HAVE.jars ? false : why(`the mod jars at ${MODS}`
 export const needLedger = () => (HAVE.ledger ? false : why('the baked ledger pack (npm run bake:ledger)'));
 export const needSkins = () => (HAVE.skins ? false : why('the skin pack (node tools/fetch-skins.mjs)'));
 export const needPacks = () => (HAVE.packs ? false : why('the baked far packs (npm run bake:shells && npm run bake:lod)'));
+// A baked tile is only comparable to a live mesh if both sides exist: the pack AND the atlas whose state
+// ids the tile's bytes are written in.
+export const needPackedTiles = () => (HAVE.packs && HAVE.assets ? false
+  : why(`${ASSETS} and the baked far packs (npm run bake)`));
 export const needServer = () => (HAVE.save && HAVE.packs ? false
   : why(`a live worldd: the save at ${WORLD} and the baked packs (npm run bake)`));
 export const needAssetsLedger = () => (HAVE.assets && HAVE.ledger ? false

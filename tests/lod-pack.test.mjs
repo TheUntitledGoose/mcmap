@@ -13,6 +13,7 @@ import { shellFrameCols } from '../server/shell.mjs';
 import { Assets } from '../web/js/assets.js';
 import { openShellFrame } from '../web/js/payload.js';
 import { meshShellPatch } from '../web/js/shell-mesh.js';
+import { needPackedTiles } from './needs.mjs';
 
 const ASSETS = path.join('build', 'assets');
 const PACKS = path.join('build', 'shells');
@@ -170,8 +171,10 @@ test('a served tile inflates to an image the browser can open', () => {
   }
 });
 
-const havePacks = fs.existsSync(PACKS);
-test('a baked region tile equals what the live far mesher makes for it', { skip: !havePacks }, (t) => {
+// Comparing a baked tile to a live mesh needs both halves: the tile, and the atlas whose state ids the
+// tile's bytes are written in. A clone has neither, and `build/shells` now exists there anyway because
+// its .keep file is what lets the Docker image build - so existence is not the question.
+test('a baked region tile equals what the live far mesher makes for it', { skip: needPackedTiles() }, (t) => {
   const atlasStat = fs.statSync(path.join(ASSETS, 'atlas.json'));
   const atlas = JSON.parse(fs.readFileSync(path.join(ASSETS, 'atlas.json'), 'utf8'));
   const stamp = atlasStamp(atlasStat, atlas.states.length);
