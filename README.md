@@ -209,7 +209,7 @@ Three things that only go wrong in Portainer, not in `docker compose`:
   | Variable | What it is | Example |
   |---|---|---|
   | `MCMAP_SAVE` | the folder containing `world/` | `/srv/mcmap/DarkRPG` |
-  | `MCMAP_PACKS` | a directory holding `assets/ shells/ lods/ ledger/` | `/srv/mcmap/packs` |
+  | `MCMAP_PACKS` | a directory holding `assets/ shells/ lods/ ledger/` (+ `skins/`, optional) | `/srv/mcmap/packs` |
 
   Both fall back to paths beside the compose file, which is why `docker compose up` on the machine that
   baked everything still needs no arguments. The packs are what the image cannot carry: they are derived

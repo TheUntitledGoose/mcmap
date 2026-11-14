@@ -101,6 +101,12 @@ services:
         source: ${MCMAP_PACKS:-./packs}/ledger
         target: /srv/app/build/ledger
         read_only: true
+      # Skins are the optional one: no skins/ directory beside the others and the cast stands in tinted
+      # bands, which is a visible answer in the panel rather than an error (tools/fetch-skins.mjs makes it).
+      - type: bind
+        source: ${MCMAP_PACKS:-./packs}/skins
+        target: /srv/app/build/skins
+        read_only: true
 
     healthcheck:
       # Portainer's compose loader rejects a bare exec array here and wants the first word to say how

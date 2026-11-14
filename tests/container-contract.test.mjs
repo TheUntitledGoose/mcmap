@@ -154,7 +154,7 @@ test('the image reports a missing pack instead of failing the build, and names t
     assert.ok(COMPOSE.includes(env), `compose.yaml never mentions ${env}: the mounts it documents may point nowhere`);
   }
   // "mount it at the path the image already uses" is only true if those paths are the documented ones.
-  for (const dir of ['/srv/app/build/assets', '/srv/app/build/shells', '/srv/app/build/lods', '/srv/app/build/ledger']) {
+  for (const dir of ['/srv/app/build/assets', '/srv/app/build/shells', '/srv/app/build/lods', '/srv/app/build/ledger', '/srv/app/build/skins']) {
     assert.ok(COMPOSE.includes(dir), `compose.yaml does not document a mount at ${dir}`);
   }
 });
