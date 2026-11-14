@@ -127,6 +127,78 @@ node tools/deploy-pack.mjs --world /srv/DarkRPG/world --stage deploy/
 # prints the rsync/tar commands for the big parts, and refuses to stage build/cache
 ```
 
+### Container (Docker, Portainer)
+
+There is a `Dockerfile` and a `compose.yaml`. The container is the same `worldd`, configured
+through the environment instead of a command line, because that is the thing a Portainer stack
+screen can actually show and edit:
+
+| Variable | Flag | Image default |
+|---|---|---|
+| `WD_WORLD` | `--world` | `/data/DarkRPG/world` |
+| `WD_CACHE` | `--cache` | `/data/cache` |
+| `WD_CACHE_MAX_GB` | `--cache-max-gb` | `6` |
+| `WD_HOST` / `WD_PORT` | `--host` / `--port` | `0.0.0.0` / `8765` |
+| `WD_PACKS` / `WD_LODS` / `WD_LEDGER` / `WD_ASSETS` | `--packs` … | `/srv/app/build/…` |
+| `WD_SLOW_MS` / `WD_HEARTBEAT` | `--slow-ms` / `--heartbeat` | `400` / `60` |
+
+Any `WD_*` that is not one of those flags **stops the boot with exit 2** and prints the real flag
+list. A mistyped `WD_WROLD` in a stack screen otherwise becomes "I mounted the save and the map is
+still empty", which is the worst kind of quiet.
+
+```bash
+docker build -t mcmap .
+docker run -d --name mcmap -p 8765:8765 \
+  -v /srv/DarkRPG:/data/DarkRPG:ro \
+  -v mcmap-cache:/data/cache mcmap
+```
+
+or, in Portainer, *Stacks → New stack → paste `compose.yaml`*. Two decisions in that file are
+load-bearing:
+
+* **The save is a read-only mount, not an image layer.** It is ~3 GB and it is a living directory;
+  a copy inside an image is a copy that silently goes stale, and the container has no business
+  writing to a world.
+* **The derived packs are image layers.** `build/assets` (3.6 MB), `build/shells` (63 MB),
+  `build/lods` (90 MB) and `build/ledger` without `actions.bin` (11 MB) — about 168 MB —
+  are re-baked by hand, cost about an hour, and change far less often than
+  the save. Shipping them in the image is what makes a fresh container useful in ten seconds.
+  `build/cache` is the opposite: never shipped, regenerated, swept against `WD_CACHE_MAX_GB` on boot.
+
+**The packs are not in git.** A fresh clone has no `build/assets`, and the image build stops in a
+preflight that says so, because a container that starts without them serves a world with holes where
+the far view should be and no error. Bake first, on a machine holding the save and the game jars:
+
+```bash
+npm run bake          # census, assets, shells, LOD rungs
+npm run bake:ledger   # block history, if you want the time machine
+docker build -t mcmap .
+```
+
+**Health check and the boot sweep.** The health check is `GET /stats`, and the start period is
+300 s. The sweep at boot runs before the port opens: on a current cache it is cheap (measured: 1 s to
+the first `/stats` over a 627,579-file / 1.4 GB cache), but a volume left by an **older build** is
+measured and then deleted whole, and that walk alone costs ~77 s for 627k files. `/stats` does not
+answer until that finishes, so with `restart: unless-stopped` and a short start period the container
+is killed mid-chore and comes back sweeping — a loop that looks like a crash. The first deploy of a
+volume that already holds a cache is the case to give room. `WD_CACHE=none` removes both the sweep and
+the cache.
+
+**No auth, same as ever.** What this serves is the entire map of a private save plus player names.
+On `0.0.0.0` inside a compose network that is fine for a LAN/VPN; anything reachable from the
+internet needs the proxy in front (section below) with TLS and a login, or a WireGuard interface.
+
+**If your build host has no docker binary** (this repo's development box is one), the part of the
+image contract that breaks in the field can still be checked:
+
+```bash
+node tools/sim-container.mjs        # stages exactly the COPY set, boots from it with only WD_* env
+```
+
+It boots the staged tree from that tree as its only cwd and hits every route the browser uses; a
+pack path that no longer matches the code, or a relative path that only works from the repo root,
+fails there instead of three days later as a hole in the far view.
+
 ### Ship it
 
 ```bash
@@ -360,7 +432,7 @@ MB kept getting flat tiles after the replay was repriced as blocks). The panel b
 ## Tests and measurement
 
 ```bash
-npm test                # 468 tests: formats, codecs, stores, mesher, lighting, collision,
+npm test                # 475 tests: formats, codecs, stores, mesher, lighting, collision, deployment contract,
                         # pool split, ledger, time machine (incl. what a pick may answer and what one
                         # voxel may draw), region coverage, remembered settings, the loading bar's
                         # promise, HTTP endpoints

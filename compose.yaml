@@ -1,0 +1,74 @@
+# Portainer / docker compose stack for the world renderer.
+#
+# Stack -> "new stack" in Portainer, paste this, deploy. Two things you may have to point at:
+#
+#   1. WORLD (below) — where a copy of DarkRPG/ lives on the host. The container only reads it.
+#   2. the image — either build it here ("build: ."), or build it on your machine and push it to a
+#      registry Portainer can pull, then change `image:` and drop `build:`.
+#
+# If the host has no copy of the save, the container still comes up and serves the baked far layers
+# and the action history, but /voxels 404s and the browser shows holes where detail should be.
+
+name: mcmap
+
+services:
+  worldd:
+    build:
+      context: .
+    image: mcmap:latest
+    container_name: mcmap
+    restart: unless-stopped
+
+    # One port, one service. The page it serves asks this same origin for /voxels, /shells, /lods,
+    # /ledger and /assets, so there is nothing else to expose.
+    ports:
+      - "8765:8765"
+
+    environment:
+      # The save, inside the container. Matches the read-only mount below.
+      WD_WORLD: /data/DarkRPG/world
+      # Where decoded chunk payloads are memoised. Keeps a pan across ground you already visited
+      # from re-decoding NBT. Bounded by WD_CACHE_MAX_GB and swept on boot.
+      WD_CACHE: /data/cache
+      WD_CACHE_MAX_GB: "6"
+      # Baked packs, shipped in the image. Set these to a mount if you ship packs separately.
+      WD_PACKS: /srv/app/build/shells
+      WD_LODS: /srv/app/build/lods
+      WD_LEDGER: /srv/app/build/ledger
+      WD_ASSETS: /srv/app/build/assets
+      # A request slower than this is logged with its route, so you can see what is slow from the
+      # container log instead of the browser.
+      WD_SLOW_MS: "400"
+      # Boot + every 60 s, one line: what it is serving and what it has open.
+      WD_HEARTBEAT: "60"
+
+    volumes:
+      # THE SAVE. Read-only: the renderer never writes to a world. Point this at wherever the
+      # folder containing world/ (and playerdata/, region/) lives.
+      - type: bind
+        source: ./DarkRPG
+        target: /data/DarkRPG
+        read_only: true
+      # The payload cache. A named volume survives redeploys; delete it whenever you like.
+      - mcmap-cache:/data/cache
+
+    healthcheck:
+      test: ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.WD_PORT||8765)+'/stats').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      # Boot ends with a cache sweep. On a current cache it is cheap - 1 s to the first /stats over a
+      # 627k-file / 1.4 GB cache - but a volume left behind by an OLDER build is measured and deleted
+      # whole, and that walk alone takes ~77 s for 627k files. /stats does not answer until the sweep
+      # is done, so a short start period kills the container mid-chore and it restarts in a loop.
+      start_period: 300s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    # The log is the whole operational surface: slow requests, cache sweep progress, the heartbeat.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "4"
+
+volumes:
+  mcmap-cache:

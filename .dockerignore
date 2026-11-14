@@ -1,0 +1,48 @@
+# The build context is the source and the packs, nothing else.
+#
+# The two big ones are not optional: DarkRPG/ is the ~3.6 GB save and build/cache/ is the payload
+# cache (hundreds of thousands of small files). Docker tars the context before the first instruction
+# runs, so including either means a multi-minute upload on every build, for a server that is told at
+# runtime where the save actually is.
+
+# --- the world: input data, mounted at run time ---
+DarkRPG/
+
+# --- derived, per-machine, huge ---
+build/cache/
+build/cache-test/
+build/assets-test/
+build/ov_backup/
+build/shells_v2_backup/
+build/rescue/
+build/ledger/actions.bin
+
+# --- version control: 2.8 GB of history the image never reads ---
+.git/
+.gitignore
+
+# --- local scratch: probes, screenshots, one-off scripts ---
+build/*.png
+build/*.jpg
+build/*.txt
+build/*.log
+build/*.json
+build/*.md
+build/*.js
+build/*.mjs
+build/*.cjs
+build/*.sh
+build/*.ps1
+build/*.py
+build/scratch/
+build/tmp/
+logs/
+deploy/
+node_modules/
+npm-debug.log*
+*.log
+*.tmp
+*.bak
+*.orig
+.DS_Store
+Thumbs.db

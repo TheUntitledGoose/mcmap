@@ -1,6 +1,12 @@
 // worldd — the Node side of the renderer: serves packed assets and decoded chunk payloads.
 //   node server/worldd.mjs [--world DarkRPG/world] [--assets build/assets] [--port 8765]
 //                          [--host 0.0.0.0]        (--host 127.0.0.1 to keep it local only)
+//
+// Every flag below can also be set from the environment as WD_<NAME>, dashes to underscores:
+//   WD_WORLD=/data/world WD_CACHE=/data/cache WD_PORT=8765 WD_LEDGER=none
+// That is how the container configures itself (see Dockerfile): a command line baked into an image
+// is invisible in Portainer's UI, a variable is not. An unknown WD_* stops the boot rather than
+// being ignored, because "I set the volume path and nothing moved" is the worst kind of quiet.
 // Routes:
 //   GET /meta                       world extent, dimensions, spawn, asset summary
 //   GET /voxel?dim&cx&cz            one chunk payload (binary, gzip when accepted)
@@ -29,8 +35,24 @@ import { classifyStates } from '../shared/cube-path.mjs';
 import { LOD_CELL } from '../shared/lod-format.mjs';
 import { summarizeLodDir } from './lod-pack.mjs';
 import { LedgerService } from './ledger-service.mjs';
+import { envArgs } from '../shared/envargs.mjs';
+import { WORLDD_FLAGS } from './worldd-flags.mjs';
 
-const argv = process.argv.slice(2);
+// Every flag the server reads lives in server/worldd-flags.mjs, so an environment variable that
+// does not name one of them is an error instead of a suggestion. tests/container-contract.test.mjs
+// checks that list against the arg()/num() calls actually used here.
+
+// envArgs turns WD_* into the same flags; it goes in front of argv so a typed flag still wins.
+const fromEnv = envArgs(process.env).filter((a) => a.startsWith('--')).map((a) => a.slice(2));
+const argv = [...envArgs(process.env), ...process.argv.slice(2)];
+{
+  const bad = [...new Set(fromEnv)].filter((n) => !WORLDD_FLAGS.includes(n));
+  if (bad.length) {
+    console.error(`worldd: WD_* variables name flags that do not exist: ${bad.map((n) => 'WD_' + n.replace(/-/g, '_').toUpperCase()).join(', ')}`);
+    console.error(`        real flags: ${WORLDD_FLAGS.map((f) => '--' + f).join(' ')}`);
+    process.exit(2);
+  }
+}
 const arg = (name, dflt) => {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 ? argv[i + 1] : dflt;

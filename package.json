@@ -26,6 +26,9 @@
     "browser:probe": "node tools/browser-probe.mjs --gpu --url http://127.0.0.1:8765/?debug=1 --out build/probe.png",
     "cache:prune:dry": "node tools/cache-prune.mjs --dry",
     "clean:scratch": "node tools/reap.mjs",
+    "container:check": "node --test tests/container-contract.test.mjs",
+    "container:sim": "node tools/sim-container.mjs",
+    "container:build": "docker build -t mcmap .",
     "deploy:check": "node tools/deploy-pack.mjs --no-stage",
     "deploy:stage": "node tools/deploy-pack.mjs",
     "cache:trim": "node tools/cache-prune.mjs --max-gb 2"
