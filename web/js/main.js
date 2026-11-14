@@ -53,7 +53,9 @@ import { buildTimeBlocks, markerOfIndex, pickMarkerHit, resetMarkerLift } from '
 // player's own hand caused, cut off at a measured silence) and what the floor under their feet is;
 // web/js/ledger-ghosts.js turns that into one body buffer, one route buffer, and the words next to them.
 // Both are tested without a browser (tests/shared-ghosts.test.mjs, tests/web-ghosts.test.mjs). What this
-// layer never claims: the ledger holds no player coordinates, and this build holds no per-player skins.
+// layer never claims: the ledger holds no player coordinates, so a body's position is an inference from the
+// rows that player's own hand caused; and a face is only worn if tools/fetch-skins.mjs could name the
+// profile behind the name - the browser never asks Mojang for anything.
 import { nearestVisit, presenceOf, RUN_GAP_SEC } from '../../shared/ghosts.mjs';
 import {
   absentText, BODY_H, BODY_W, bodyGeom, bodyLabel, bodiesHere, bodyWall, historyNear, occupancyOf, trackGeom,
