@@ -3,7 +3,8 @@
  * Delete payload-cache generations the server cannot read, and/or trim the cache to a byte budget.
  * See server/cache-prune.mjs.
  *
- *   node tools/cache-prune.mjs [--dir build/cache] [--keep-tags a,b] [--keep-hours 24] [--dry]
+ *   node tools/cache-prune.mjs [--dir build/cache] [--keep-tags a,b] [--keep-worlds w1,w2] \
+ *                              [--keep-hours 24] [--dry]
  *   node tools/cache-prune.mjs --max-gb 1.5          # oldest payload first, markers first of all
  */
 import path from 'node:path';
@@ -13,12 +14,15 @@ const arg = (k, d) => { const i = process.argv.indexOf('--' + k); return i < 0 ?
 const root = path.resolve(arg('dir', 'build/cache'));
 const dry = process.argv.includes('--dry');
 const keep = (arg('keep', '') || '').split(',').filter(Boolean);
+// Which SAVEs keep their cache. A world that is no longer served leaves a whole tree behind, and the
+// pruner cannot know it is dead unless it is told which ones are alive.
+const keepWorlds = (arg('keep-worlds', '') || '').split(',').filter(Boolean);
 const keepHours = +arg('keep-hours', '24');
 const maxGb = arg('max-gb', null);
 
 console.log(`cache ${root}${dry ? ' (dry run)' : ''}`);
 const t0 = Date.now();
-const r = pruneCache(root, { keepTags: keep, keepHours, dry, log: (m) => console.log('  ' + m) });
+const r = pruneCache(root, { keepTags: keep, keepWorlds, keepHours, dry, log: (m) => console.log('  ' + m) });
 console.log(`${dry ? 'reachable residue' : 'freed'}: ${r.files} files, ${(r.bytes / 1e9).toFixed(2)} GB ` +
   `in ${r.removed.length} trees (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
 

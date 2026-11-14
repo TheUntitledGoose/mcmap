@@ -111,6 +111,10 @@ const LODS = arg('lods', 'build/lods');
 // only place skins are read - the browser is never pointed at Mojang - and one strip means one texture
 // upload and one material for the whole cast instead of one per player.
 const SKINS = arg('skins', 'build/skins');
+// Which save the payload cache belongs to. Normally derived (see shared/world-tag.mjs); named here once
+// a box serves more than one world, so the cache directory carries the name a person chose rather than a
+// hash of where the save happens to live.
+const WORLD_TAG = arg('world-tag', '');
 
 // What a chat link becomes. The tags are written per request (see shared/embed.mjs); these three flags
 // exist for the deployments where guessing from the request is wrong - behind a proxy that rewrites
@@ -124,6 +128,7 @@ const lodSummary = LODS === 'none' ? { dims: 0, tiles: 0, cells: [] } : summariz
 const stamp = atlasStamp(fs.statSync(path.join(ASSETS, 'atlas.json')), atlas.states.length);
 const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
   isCubeState: (id) => stateCls.cube[id - 1] === 1,
+  worldTag: WORLD_TAG,
   // A far column needs two different answers: which block may *paint* it, and which one can hold a
   // surface up. They are not the same - water holds a lake skin up but must not paint it blue, and a
   // rose does not hold anything up at all. Both come from the packed atlas, not from block names.
@@ -148,7 +153,7 @@ const ledger = new LedgerService(LEDGER);
 // `--cache-sweep 0` keeps old generations on purpose (comparing two atlas stamps side by side).
 if (CACHE !== 'none' && num('cache-sweep', 1) !== 0) {
   const r = pruneCache(CACHE, {
-    keepTags: [String(svc.tableTag)], keepHours: num('cache-keep-h', 24),
+    keepTags: [String(svc.tableTag)], keepWorlds: [svc.worldTag], keepHours: num('cache-keep-h', 24),
     log: (m) => console.log('  cache: ' + m),
   });
   if (r.files) console.log('  cache: swept ' + r.files + ' unreachable files, ' + (r.bytes / 1e9).toFixed(2) + ' GB');
@@ -399,7 +404,8 @@ const server = http.createServer(async (req, res) => {
         byPath[p] = { n: e.n, ms: +e.ms.toFixed(0), max: +e.max.toFixed(0), slow: e.slow,
           kb: +(e.bytes / 1024).toFixed(0) };
       }
-      send(req, res, 200, JSON.stringify({ ...svc.stats, packsOpen: svc.packs.size,
+      send(req, res, 200, JSON.stringify({ ...svc.stats, worldTag: svc.worldTag, tableTag: String(svc.tableTag),
+        packsOpen: svc.packs.size,
         inflight: INFLIGHT.size, byPath }), 'application/json');
       return;
     }
@@ -413,7 +419,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (u.pathname === '/meta') {
       return send(req, res, 200, JSON.stringify({
-        world: WORLD, label: worldLabel(), level: levelSummary(), dims: svc.dimList(),
+        world: WORLD, label: worldLabel(), worldTag: svc.worldTag, level: levelSummary(), dims: svc.dimList(),
         assets: { states: atlas.states.length, textures: atlas.textures.length, atlasSize: atlas.atlasSize, geometry: atlas.geometry },
         stats: svc.stats,
         packed: { shells: fs.existsSync(PACKS), lod: lodSummary, ledger: ledger.ready,
@@ -564,6 +570,8 @@ server.listen(PORT, HOST, () => {
       : `   skins: ${sk.why}`);
   }
   console.log(`  world  ${WORLD}  (${svc.dims.size} dimensions)`);
+  console.log(`  cache  ${CACHE === 'none' ? 'off (--cache none)'
+    : `${CACHE} as ${svc.worldTag}/<table ${svc.tableTag}>/${svc.lightTag} — from ${svc.worldTagFrom}`}`);
   for (const d of svc.dimList()) {
     console.log(`  ${d.id.padEnd(24)} regions=${String(d.regions).padStart(4)} chunks<=${d.chunksUpperBound}` +
       ` x=${d.chunkExtent?.minX}..${d.chunkExtent?.maxX} z=${d.chunkExtent?.minZ}..${d.chunkExtent?.maxZ}`);

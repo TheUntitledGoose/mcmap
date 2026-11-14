@@ -11,6 +11,9 @@ export const WORLDD_FLAGS = [
   'world', 'assets', 'cache', 'web', 'vendor', 'ledger', 'port', 'host',
   'packs', 'lods', 'skins', 'cache-max-gb', 'cache-keep-h', 'cache-sweep', 'cache-reconcile',
   'slow-ms', 'heartbeat',
+  // which save the payload cache belongs to, when the directory and its seed are not answer enough
+  // (M18's world dropdown names worlds, so the cache should carry that name). See shared/world-tag.mjs.
+  'world-tag',
   // what a chat link becomes: the public address, the two sentences, and which picture. See shared/embed.mjs.
   'embed-url', 'embed-title', 'embed-desc', 'embed-image',
 ];

@@ -26,6 +26,10 @@ const opts = {
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dv-cache-'));
 const clean = () => fs.rmSync(tmpRoot, { recursive: true, force: true });
 const svcIn = (dir, extra = {}) => new WorldService('DarkRPG/world', ids, dir, { ...opts, ...extra });
+// Where a service keeps a chunk's payload. Asked of the service, never rebuilt by hand here: the tree has
+// three levels (save, state table, generation) and a test that retypes them drifts behind the code.
+const cfile = (svc, cx, cz, dimId = 'minecraft:overworld') => svc.cachePath(dimId, cx, cz);
+const cdir = (svc, dimId = 'minecraft:overworld') => path.dirname(svc.cachePath(dimId, 0, 0));
 
 // A chunk that exists, somewhere in the overworld the user actually looks at.
 const HIT = [2, 2];
@@ -41,7 +45,7 @@ test('cache round trip: a stored payload opens as the chunk that was decoded', (
   const a = svcIn(dir);
   const raw = a.chunkBytes('minecraft:overworld', HIT[0], HIT[1]);
   assert.ok(raw && raw.length > 1000, 'expected a populated chunk');
-  const cpath = path.join(dir, String(a.tableTag), a.lightTag, 'region', `${HIT[0]}_${HIT[1]}.bin`);
+  const cpath = cfile(a, HIT[0], HIT[1]);
   const st = fs.statSync(cpath);
   const onDisk = fs.readFileSync(cpath);
   const stored = onDisk.length > 4 && onDisk.subarray(0, 4).equals(Buffer.from('DVZ1'))
@@ -93,7 +97,7 @@ test('a hole costs no file: absence is answered from the region header', () => {
   assert.equal(svc.stats.decodes, 0, 'a hole must not decode anything');
   assert.ok(svc.stats.regionOpens <= 2, `one 24x24 box sits in one region, saw ${svc.stats.regionOpens} opens`);
   // And the cache directory must not even have been created for this dimension.
-  const dimDir = path.join(dir, String(svc.tableTag), svc.lightTag, 'region');
+  const dimDir = cdir(svc);
   const left = fs.existsSync(dimDir) ? fs.readdirSync(dimDir) : [];
   assert.equal(left.length, 0, `hole lookups left ${left.length} files behind`);
 
@@ -113,7 +117,7 @@ test('the cache bound evicts what this server wrote, oldest first, and never wal
   const wrote = [];
   for (let i = 0; i < 12; i++) {
     const b = svc.chunkBytes('minecraft:overworld', i, 7);
-    if (b) wrote.push(path.join(dir, String(svc.tableTag), svc.lightTag, 'region', `${i}_7.bin`));
+    if (b) wrote.push(cfile(svc, i, 7));
   }
   assert.ok(wrote.length >= 6, 'need several real payloads to evict');
   assert.ok(svc.stats.cachePruned > 0, 'over budget must evict, not just grow');
@@ -126,7 +130,7 @@ test('the cache bound evicts what this server wrote, oldest first, and never wal
 test('sweepCacheBudget clears 0-byte markers off the event loop, payloads only when over budget', async () => {
   const dir = path.join(tmpRoot, 'sweep');
   const svc = svcIn(dir, { cacheMaxBytes: 20000 });
-  const root = path.join(dir, String(svc.tableTag), svc.lightTag, 'region');
+  const root = cdir(svc);
   fs.mkdirSync(root, { recursive: true });
   for (let i = 0; i < 1200; i++) fs.writeFileSync(path.join(root, `h_${i}.bin`), Buffer.alloc(0));
   for (let i = 0; i < 20; i++) fs.writeFileSync(path.join(root, `p_${i}.bin`), Buffer.alloc(2000, 7));
@@ -159,7 +163,7 @@ test('cache size cap evicts old payloads instead of filling the disk', () => {
       if (e.isDirectory()) walk(p); else files.push(p);
     }
   };
-  walk(path.join(dir, String(svc.tableTag), svc.lightTag));
+  walk(cdir(svc));
   assert.ok(svc.stats.cachePruned > 0, 'the cap must actually evict');
   assert.ok(files.length < 22, `expected eviction, found ${files.length} payloads`);
   // Whatever survives must still be a readable payload.

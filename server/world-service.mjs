@@ -5,7 +5,8 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { readNbt } from '../tools/nbt.mjs';
 import { RegionFile } from '../tools/region.mjs';
-import { listDims, dimExtent } from './world-dims.mjs';
+import { listDims, dimExtent, levelSeed } from './world-dims.mjs';
+import { worldTagFor, isWorldTag } from '../shared/world-tag.mjs';
 import { packCells, makeReader, toWire } from '../shared/regionbits.mjs';
 import { decodeChunk, packChunk } from './chunk-payload.mjs';
 import { shellFromPayload, shellFrameCols } from './shell.mjs';
@@ -136,6 +137,17 @@ export class WorldService {
       const dir = path.join(worldRoot, d.dir);
       this.dims.set(d.id, { ...d, dir, key: d.dir.replace(/[/\\]/g, '_'), ...dimExtent(dir) });
     }
+    // Which SAVE this is, for the payload cache (shared/world-tag.mjs). Without this level, two saves
+    // with the same mod set read each other's decoded chunks: same table tag, same dimension key, same
+    // frame, someone else's terrain - and no error anywhere to say so.
+    this.worldTag = worldTagFor({
+      dir: path.resolve(worldRoot), seed: levelSeed(worldRoot), override: opts.worldTag,
+    });
+    if (!isWorldTag(this.worldTag)) {
+      // worldTagFor sanitizes, so this only fires on something deliberately hostile in --world-tag.
+      throw new Error(`world tag '${this.worldTag}' is not a usable directory name (from --world-tag '${opts.worldTag}')`);
+    }
+    this.worldTagFrom = opts.worldTag ? `--world-tag ${opts.worldTag}` : 'the world directory and its seed';
     this.regions = new Map();          // path -> { rgn, mtime } for open files, { rgn: null, seenAt } for misses
     this.order = [];                  // eviction list: open region files only, oldest first
     this.missingTtlMs = +(opts.missingTtlMs ?? 300000);
@@ -298,8 +310,20 @@ export class WorldService {
     this.order.push(p);
   }
 
+  /**
+   * Where one chunk's decoded payload lives, or null with no cache.
+   *
+   * Public on purpose: "would THIS save read that file?" is the question every cache question starts
+   * with, and a probe or a test that cannot ask it can only infer it from a directory listing.
+   */
+  cachePath(dimId, cx, cz) {
+    if (!this.cacheDir) return null;
+    return this.#cachePath(this.resolve(dimId), cx, cz);
+  }
+
   #cachePath(dim, cx, cz) {
-    return path.join(this.cacheDir, this.tableTag, this.lightTag, dim.key, `${cx}_${cz}.bin`);
+    return path.join(this.cacheDir, this.worldTag, String(this.tableTag), this.lightTag,
+      dim.key, `${cx}_${cz}.bin`);
   }
 
   /** Decoded payload bytes for one chunk, or null when the chunk is not generated. */
@@ -640,7 +664,7 @@ export class WorldService {
   async sweepCacheBudget() {
     if (this._sweep) return this._sweep;
     if (!this.cacheDir || !this.cacheMaxBytes) return null;
-    const root = path.join(this.cacheDir, String(this.tableTag), this.lightTag);
+    const root = path.join(this.cacheDir, this.worldTag, String(this.tableTag), this.lightTag);
     this._sweep = (async () => {
       const t0 = Date.now();
       const paths = [];

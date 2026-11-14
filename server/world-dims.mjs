@@ -3,6 +3,8 @@
 // (world/dimensions/<namespace>/<path>/region).
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
+import { readNbt } from '../tools/nbt.mjs';
 
 const VANILLA_NAME = { region: 'minecraft:overworld', 'DIM-1': 'minecraft:the_nether', DIM1: 'minecraft:the_end' };
 
@@ -30,6 +32,23 @@ export function listDims(worldRoot) {
 }
 
 const RE_REGION = /^r\.(-?\d+)\.(-?\d+)\.mca$/;
+
+/**
+ * The world seed from `level.dat`, as a string, or `''` when it cannot be read.
+ *
+ * One gunzip of a ~600-byte file at boot, and it is what separates two saves living at the same path (a
+ * replaced save, a restored-from-a-different-one directory) while staying identical for the same save
+ * across a lifetime of play - which is what the payload cache's world level needs (shared/world-tag.mjs).
+ * 1.18+ keeps it in `WorldGenSettings.seed`; older saves in `Data.Seed`. NBT longs arrive as BigInt.
+ */
+export function levelSeed(worldRoot) {
+  try {
+    const dat = zlib.gunzipSync(fs.readFileSync(path.join(worldRoot, 'level.dat')));
+    const d = readNbt(dat).value?.Data;
+    const s = d?.WorldGenSettings?.seed ?? d?.Seed;
+    return s === null || s === undefined ? '' : String(s);
+  } catch { return ''; }
+}
 
 /** Region file names present in a dimension -> chunk extent and file list (no file contents read). */
 export function dimExtent(dir) {

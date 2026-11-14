@@ -76,8 +76,9 @@ build/      DERIVED. Never committed except the probes that produced the numbers
   shells/              per-region shell + overview packs (653 files) ~63 MB
   lods/                pre-baked coarse tiles, cells 16/8/4          ~90 MB
   ledger/              block-history export + per-dimension packs    ~34 MB
-  cache/               decoded chunk payload cache; runtime-derived, pruned by budget,
-                       deletable at any time — do not ship it
+  cache/               decoded chunk payload cache, keyed by save:
+                       cache/<world>/<state table>/<lit|nolight>/<dim>/<chunk>.bin.
+                       Runtime-derived, pruned by budget, deletable at any time — do not ship it
   embed.png            your own link card, optional and not committed
 ```
 
@@ -166,6 +167,7 @@ screen can actually show and edit:
 |---|---|---|
 | `WD_WORLD` | `--world` | `/data/DarkRPG/world` |
 | `WD_CACHE` | `--cache` | `/data/cache` |
+| `WD_WORLD_TAG` | `--world-tag` | derived: the world directory and its `level.dat` seed |
 | `WD_CACHE_MAX_GB` | `--cache-max-gb` | `6` |
 | `WD_HOST` / `WD_PORT` | `--host` / `--port` | `0.0.0.0` / `8765` |
 | `WD_PACKS` / `WD_LODS` / `WD_LEDGER` / `WD_ASSETS` | `--packs` … | `/srv/app/build/…` |
@@ -271,6 +273,8 @@ is killed mid-chore and comes back sweeping — a loop that looks like a crash. 
 volume that already holds a cache is the case to give room. `WD_CACHE=none` removes both the sweep and
 the cache.
 
+A volume left by a build from **before the cache knew which save a payload came from** is deleted whole,
+
 **No auth, same as ever.** What this serves is the entire map of a private save plus player names.
 On `0.0.0.0` inside a compose network that is fine for a LAN/VPN; anything reachable from the
 internet needs the proxy in front (section below) with TLS and a login, or a WireGuard interface.
@@ -346,9 +350,18 @@ rsync -a --delete deploy/            you@webserver:/srv/worldd/
 rsync -a DarkRPG/world/              you@webserver:/srv/worldd/world/
 ```
 
-`build/cache` is excluded by design; a fresh cache costs decode time, not correctness.
-Cache files are keyed by a state-table tag and light generation, so a mismatched cache is
-ignored rather than mis-rendered.
+`build/cache` is excluded by design; a fresh cache costs decode time, not correctness. Its path says
+three things — which save, which state table, which payload generation:
+
+```
+build/cache/<worldTag>/<tableTag>/<lit|nolight>/<dimKey>/<cx>_<cz>.bin
+```
+
+The save half matters: two saves running the same mods share a state-table tag, and both call their
+biggest dimension folder `region`, so a cache without it can answer for the wrong world. `worldTag` is
+derived from the world directory and the `level.dat` seed; name it yourself with `--world-tag`.
+`node tools/cache-retag.mjs --dry` moves an existing cache under that level instead of re-decoding it
+(do it before the server writes into the new layout, where it is a rename rather than 627k file ops).
 
 ### Run it behind a proxy (the recommended shape)
 
