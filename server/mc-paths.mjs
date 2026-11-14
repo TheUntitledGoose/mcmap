@@ -1,9 +1,10 @@
 // Where a Minecraft install lives on this machine.
 //
-// There used to be a literal `the old hardcoded path\...` in five files here. That is somebody's
-// username, in a public repo, on a machine that may not exist any more: personal data that stops being
-// true the day it is copied. So the default is derived per platform instead, and the only way to point
-// at a jar by hand is to say so on purpose (VANILLA_JAR / MC_DIR).
+// There used to be a literal drive-letter-then-users-folder path to one person's jar in five files here.
+// That is somebody's username, in a public repo, on a machine that may not exist any more: personal data
+// that stops being true the day it is copied. So the default is derived per platform instead, and the only
+// way to point at a jar by hand is to say so on purpose (VANILLA_JAR / MC_DIR). If you are wondering why
+// this file exists at all: tests/publish-clean.test.mjs looks for that shape of path in every commit.
 import os from 'node:os';
 import path from 'node:path';
 
