@@ -8,12 +8,15 @@ import { ModelResolver, bakeApply } from './model-resolve.mjs';
 import { packTextures, textureStats } from './atlas.mjs';
 import { UV_TRANSFORMS, FACE_INFO, quadNormal } from '../shared/faces.mjs';
 import { cubeArmCodes, fullCubeArm, MAX_ARMS } from '../shared/cube-path.mjs';
+import { vanillaJar, vanillaJarHint } from './mc-paths.mjs';
 
 const CENSUS = process.argv[2] ?? 'build/census.json';
 const OUT = process.argv[3] ?? 'build/assets';
 const SERVER_ROOT = process.env.SERVER_ROOT ?? 'DarkRPG';
-const VANILLA_JAR = process.env.VANILLA_JAR ??
-  'your .minecraft/versions/1.20.1/1.20.1.jar';
+// The launcher's own jar, found per platform; VANILLA_JAR / MC_DIR override it. No hardcoded home
+// path here: this file is in a public repo.
+const VANILLA_JAR = vanillaJar();
+if (!fs.existsSync(VANILLA_JAR)) { console.error(vanillaJarHint()); process.exit(2); }
 
 const AIRS = new Set(['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air', 'minecraft:structure_void']);
 const BLEND_NAMES = /(water|lava|glass|ice|slime|honey|beacon|portal|shulker|curtain|crystal|fence|pane|leaves)/;

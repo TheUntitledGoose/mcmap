@@ -1,4 +1,4 @@
-# worldd — a browser map viewer for a modded Minecraft Java save
+# worldd — a 3D browser map viewer for a Minecraft Java save
 
 > [!IMPORTANT]
 > This entire repo is AI-generated. I have been making projects by hand for my life, but this one is a fully AI repo. If there are any issues, that is to be expected.

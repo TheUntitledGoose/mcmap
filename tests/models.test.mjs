@@ -7,10 +7,10 @@ import { ModelResolver, bakeApply } from '../server/model-resolve.mjs';
 import { FACE_INFO } from '../shared/faces.mjs';
 import { cubeArmCodes, cubeFaceUV, decodeFaceCode, CANON_RING, RING_ORDER } from '../shared/cube-path.mjs';
 import { needJars } from './needs.mjs';
+import { vanillaJar } from '../server/mc-paths.mjs';
 
 const SERVER_ROOT = process.env.SERVER_ROOT ?? 'DarkRPG';
-const VANILLA_JAR = process.env.VANILLA_JAR ??
-  'your .minecraft/versions/1.20.1/1.20.1.jar';
+const VANILLA_JAR = vanillaJar();
 
 const index = new AssetIndex(defaultJars(SERVER_ROOT, VANILLA_JAR));
 const R = new ModelResolver(index);

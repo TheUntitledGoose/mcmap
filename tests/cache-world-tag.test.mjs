@@ -18,6 +18,8 @@ import { levelSeed } from '../server/world-dims.mjs';
 // ---------------------------------------------------------------- the tag itself
 
 test('the tag is legible, stable, and different when either the path or the seed is', () => {
+  // Invented seeds, invented paths: this test is about the function's shape, and a real save's seed is
+  // not something a public repo needs to carry.
   const a = worldTagFor({ dir: '/srv/mcmap/worlds/DarkRPG/world', seed: '-1234567890123456789' });
   assert.equal(a, worldTagFor({ dir: '/srv/mcmap/worlds/DarkRPG/world', seed: '-1234567890123456789' }),
     'the same save must keep the same cache across restarts');
@@ -26,8 +28,8 @@ test('the tag is legible, stable, and different when either the path or the seed
     'a different seed is a different save');
   assert.notEqual(a, worldTagFor({ dir: '/srv/mcmap/worlds/SkyBlock/world', seed: '-1234567890123456789' }),
     'the same seed twice over (a copied template) is still two saves');
-  assert.equal(worldTagFor({ dir: 'C:\\You\\Downloads\\pi\\DarkRPG\\world', seed: '7' }),
-    worldTagFor({ dir: 'C:/You/Downloads/pi/DarkRPG/world', seed: '7' }),
+  assert.equal(worldTagFor({ dir: 'D:\\saves\\DarkRPG\\world', seed: '7' }),
+    worldTagFor({ dir: 'D:/saves/DarkRPG/world', seed: '7' }),
     'a Windows path and the same path written with forward slashes are one save');
 });
 

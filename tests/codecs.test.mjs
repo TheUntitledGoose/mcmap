@@ -5,8 +5,9 @@ import zlib from 'node:zlib';
 import { ZipFile } from '../server/zip.mjs';
 import { decodePng, encodePngRgba, crc32, pixel } from '../server/png.mjs';
 import { needJars } from './needs.mjs';
+import { vanillaJar } from '../server/mc-paths.mjs';
 
-const VANILLA = process.env.VANILLA_JAR ?? 'your .minecraft/versions/1.20.1/1.20.1.jar';
+const VANILLA = vanillaJar();
 
 test('zip: reads vanilla blockstate json', () => {
   const z = new ZipFile(VANILLA);

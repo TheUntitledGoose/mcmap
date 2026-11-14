@@ -3,10 +3,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ZipFile } from './zip.mjs';
+import { vanillaJar } from './mc-paths.mjs';
 
 const KIND_BY_DIR = { blockstates: 'json', models: 'json', textures: 'png' };
 
-export const DEFAULT_VANILLA_JAR = 'your .minecraft/versions/1.20.1/1.20.1.jar';
+// Derived per machine (see server/mc-paths.mjs): this repo is public and a path through someone's
+// user folder is not a project constant.
+export const DEFAULT_VANILLA_JAR = vanillaJar();
 
 // Jar order is asset-pack order: earlier jars win, so mods may override vanilla assets exactly as
 // they do in Minecraft. The vanilla jar is always included (and always last) — a renderer without

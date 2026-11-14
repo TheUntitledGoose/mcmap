@@ -1,7 +1,8 @@
 // Mean of the vanilla biome colormaps: the colour a tinted mask should average to over all biomes.
 import { ZipFile } from '../server/zip.mjs';
 import { decodePng } from '../server/png.mjs';
-const JAR = 'your .minecraft/versions/1.20.1/1.20.1.jar';
+import { vanillaJar } from '../server/mc-paths.mjs';
+const JAR = vanillaJar();
 const jar = new ZipFile(JAR);
 for (const n of process.argv.slice(2)) {
   const bytes = jar.read(n);
