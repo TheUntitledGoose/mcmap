@@ -20,6 +20,7 @@
 //   GET /ledger/rows?dim&cx&cz      what happened in one chunk, oldest first (JSON)
 //   GET /ledger/top?dim&cls&player  where the action is, most-changed chunks first (JSON)
 //   GET /assets/<file>              atlas.json / atlas.png / geometry.bin
+//   GET /embed.png                  the picture a chat link shows (yours if build/embed.png exists)
 //   GET /*                          the web app
 import fs from 'node:fs';
 import http from 'node:http';
@@ -37,6 +38,7 @@ import { summarizeLodDir } from './lod-pack.mjs';
 import { LedgerService } from './ledger-service.mjs';
 import { envArgs } from '../shared/envargs.mjs';
 import { skinStripFor, stripJson, stripPng } from './skin-strip.mjs';
+import { urlBase, pageUrl, embedTags, pngSize, fillEmbed } from '../shared/embed.mjs';
 import { WORLDD_FLAGS } from './worldd-flags.mjs';
 
 // Every flag the server reads lives in server/worldd-flags.mjs, so an environment variable that
@@ -109,6 +111,14 @@ const LODS = arg('lods', 'build/lods');
 // only place skins are read - the browser is never pointed at Mojang - and one strip means one texture
 // upload and one material for the whole cast instead of one per player.
 const SKINS = arg('skins', 'build/skins');
+
+// What a chat link becomes. The tags are written per request (see shared/embed.mjs); these three flags
+// exist for the deployments where guessing from the request is wrong - behind a proxy that rewrites
+// Host, or when you want the card to say something the save cannot work out for itself.
+const EMBED_URL = arg('embed-url', '');
+const EMBED_TITLE = arg('embed-title', '');
+const EMBED_DESC = arg('embed-desc', '');
+const EMBED_IMAGE = arg('embed-image', '');
 // Counted once at startup: the browser's /meta answer for "is there a baked far layer?".
 const lodSummary = LODS === 'none' ? { dims: 0, tiles: 0, cells: [] } : summarizeLodDir(LODS);
 const stamp = atlasStamp(fs.statSync(path.join(ASSETS, 'atlas.json')), atlas.states.length);
@@ -180,12 +190,107 @@ function levelSummary() {
     const dat = zlib.gunzipSync(fs.readFileSync(path.join(WORLD, 'level.dat')));
     const d = readNbt(dat).value.Data;
     return {
-      name: String(d.LevelName ?? ''), version: String(d.Version?.Id ?? d.version?.Id ?? ''),
+      name: String(d.LevelName ?? ''),
+      // Version.Id is the protocol number - 3465 for 1.20.1 - and /meta used to print it as "version",
+      // which reads like a very old Minecraft. Version.Name is the thing a person calls it; the number
+      // is still there, under the name it actually has.
+      version: String(d.Version?.Name ?? d.version?.Name ?? ''),
+      protocol: Number(d.Version?.Id ?? 0),
       dataVersion: Number(d.DataVersion ?? 0),
       spawn: [Number(d.SpawnX ?? 0), Number(d.SpawnY ?? 0), Number(d.SpawnZ ?? 0)],
       gameType: Number(d.GameType ?? -1), hardcore: Number(d.hardcore ?? 0), difficulty: String(d.difficulty ?? ''),
     };
   } catch (e) { return { error: String(e.message ?? e) }; }
+}
+
+/*
+ * The card a chat link becomes.
+ *
+ * A bot fetches this HTML and reads `<meta>`; it never runs the page. So the tags are written here,
+ * per request, from the address the bot used - and the image is served by this server too, because a
+ * tag pointing at a relative path is a tag pointing at nothing. A deployment that bakes its own picture
+ * (a screenshot of its own world, say) drops it at build/embed.png and this answers with that instead,
+ * no rebuild: the same "mount a pack, not an image" rule as the shells and the skins.
+ */
+const EMBED_MARK = '<!--embed-->';
+let levelCache = null;
+const levelOnce = () => (levelCache ??= levelSummary());
+
+/**
+ * What to call this save. LevelName is often literally "world" - it is here - which names a folder
+ * rather than a server, so the card asks the directory the save lives in instead: /data/DarkRPG/world
+ * is DarkRPG, which is what anybody pointing at it would say.
+ */
+function worldLabel() {
+  const nm = String(levelOnce().name || '').trim();
+  if (nm && !/^world\d*$/i.test(nm)) return nm;
+  const dir = path.resolve(WORLD);
+  const base = path.basename(dir);
+  return /^world\d*$/i.test(base) ? path.basename(path.dirname(dir)) : base;
+}
+
+function embedImageFile() {
+  // A named file, then a card in the image's own build dir, then a card in the mounted pack, then the
+  // drawn default that ships with the code. The middle two are the ones a deployment uses: a picture of
+  // its own world is data it mounts, not something that has to be baked into an image and rebuilt.
+  const cand = [EMBED_IMAGE, path.join('build', 'embed.png'),
+    path.join('build', 'embed', 'embed.png'), path.join(WEB, 'img', 'embed.png')].filter(Boolean);
+  for (const f of cand) if (fs.existsSync(f)) return f;
+  return null;
+}
+
+function embedTitle() {
+  if (EMBED_TITLE) return EMBED_TITLE;
+  return `${worldLabel()}: the whole save in a browser tab`;
+}
+
+// Honest, and assembled from what the boot already knows: no invented "284,239 chunks" from a bounding
+// box, because a bounding box is a rectangle and a world is not.
+function embedDescription() {
+  if (EMBED_DESC) return EMBED_DESC;
+  const lv = levelOnce();
+  const dims = svc.dimList();
+  const rows = ledger.ready ? (ledger.loadMeta()?.totalRows ?? 0) : 0;
+  const save = `${lv.version ? `Minecraft ${lv.version} ` : ''}save, ${dims.length} dimension${dims.length === 1 ? '' : 's'}`;
+  const what = 'streamed into a browser tab \u2014 pan the whole world, walk it in first person';
+  const when = rows ? `, and step back through ${Number(rows).toLocaleString('en-US')} logged block changes` : '';
+  return `${save}: ${what}${when}.`;
+}
+
+function embedHead(req, u) {
+  const at = {
+    override: EMBED_URL,
+    forwardedHost: req.headers['x-forwarded-host'], host: req.headers.host,
+    forwardedProto: req.headers['x-forwarded-proto'], secure: !!req.socket?.encrypted,
+    fallback: `127.0.0.1:${PORT}`,
+  };
+  // The path is canonicalised - /index.html and / are the same page, and the card shows the one a person
+  // would type - while the query survives, so a card made from a saved framing opens that framing.
+  const url = pageUrl({
+    ...at,
+    path: u.pathname === '/index.html' ? '/' : u.pathname,
+    search: u.search || '',
+  });
+  const file = embedImageFile();
+  return embedTags({
+    title: embedTitle(), description: embedDescription(), url,
+    image: file ? `${urlBase(at)}/embed.png` : null,
+    size: file ? pngSize(fs.readFileSync(file)) : null,
+  });
+}
+
+/** The page, with this request's card written into it. */
+let embedWarned = -1;
+function embedPage(req, u) {
+  const file = path.join(WEB, 'index.html');
+  const html = fs.readFileSync(file, 'utf8');
+  const r = fillEmbed(html, EMBED_MARK, embedHead(req, u));
+  if (!r.filled && embedWarned !== r.marks) {
+    embedWarned = r.marks;
+    console.log(`worldd: ${file} carries ${r.marks} \`${EMBED_MARK}\` marker(s), expected exactly 1 - ` +
+      'a link preview would show no card (see shared/embed.mjs)');
+  }
+  return r.html;
 }
 
 /**
@@ -308,7 +413,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (u.pathname === '/meta') {
       return send(req, res, 200, JSON.stringify({
-        world: WORLD, level: levelSummary(), dims: svc.dimList(),
+        world: WORLD, label: worldLabel(), level: levelSummary(), dims: svc.dimList(),
         assets: { states: atlas.states.length, textures: atlas.textures.length, atlasSize: atlas.atlasSize, geometry: atlas.geometry },
         stats: svc.stats,
         packed: { shells: fs.existsSync(PACKS), lod: lodSummary, ledger: ledger.ready,
@@ -423,7 +528,15 @@ const server = http.createServer(async (req, res) => {
     // three is served straight out of node_modules; the build/ dir is self-contained (its
     // three.module.js imports ./three.core.js by relative path).
     if (u.pathname.startsWith('/vendor/')) return serveFile(res, req, path.join(VENDOR_DIR, u.pathname.slice(8)));
+    // The card's picture, whatever made it: a deployment's own screenshot at build/embed.png wins over
+    // the drawn default, with no rebuild and no restart - the same rule the shells and skins follow.
+    if (u.pathname === '/embed.png') {
+      const f = embedImageFile();
+      return f ? serveFile(res, req, f)
+        : send(req, res, 404, 'no embed image: run `node tools/make-embed.mjs`, or put a PNG at build/embed.png', 'text/plain');
+    }
     const rel = u.pathname === '/' ? 'index.html' : u.pathname.slice(1);
+    if (rel === 'index.html') return send(req, res, 200, embedPage(req, u), 'text/html; charset=utf-8');
     return serveFile(res, req, path.join(WEB, rel));
   } catch (e) {
     return send(req, res, 500, `error: ${e.message}`, 'text/plain');

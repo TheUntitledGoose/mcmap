@@ -79,7 +79,8 @@ services:
       # THE PACKS. The image is built from this repository, so it carries keep files instead of packs:
       # mount a baked pack tree at the paths worldd already reads, and no WD_* has to change. Point
       # MCMAP_PACKS at a directory holding assets/, shells/, lods/, ledger/ (about 167 MB once extracted;
-      # build/cache is NOT one of them - it is regenerated per container):
+      # build/cache is NOT one of them - it is regenerated per container), and optionally skins/ and
+      # embed/, which are small and whose absence has a visible answer rather than a crash:
       #   MCMAP_PACKS=/srv/mcmap/packs
       # Leave it unset and the mounts land next to the stack, empty, and the boot log says so:
       #   shell packs: nothing at /srv/app/build/shells — mount a pack (WD_PACKS) or run node server/bake-shells.mjs
@@ -106,6 +107,15 @@ services:
       - type: bind
         source: ${MCMAP_PACKS:-./packs}/skins
         target: /srv/app/build/skins
+        read_only: true
+      # What a chat link shows, also optional: no embed/ directory and the server answers with the card
+      # that ships with the code (drawn, and no world in it). Put a PNG at packs/embed/embed.png -
+      # `node tools/make-embed.mjs --from build/shot.png` makes one from a screenshot - and the deployment
+      # links a picture of its own world. A DIRECTORY mount, not a file mount: bind-mounting a host path
+      # that does not exist creates a directory there, and the server would then be served a folder.
+      - type: bind
+        source: ${MCMAP_PACKS:-./packs}/embed
+        target: /srv/app/build/embed
         read_only: true
 
     healthcheck:

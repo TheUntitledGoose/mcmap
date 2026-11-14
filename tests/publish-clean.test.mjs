@@ -26,6 +26,12 @@ const forbiddenTracked = [
   /^deploy\//,
 ];
 
+// The only pictures that belong to this repo. `.png` is on the forbidden-extension list in the history
+// check below because probe screenshots used to be the biggest things lying around in history; these two
+// are different in kind - drawn by tools/make-embed.mjs, 15 KB and 0.6 KB, no world in them - and a clone
+// without them is a clone whose link card and tab icon are missing.
+const OUR_PNG = /^web\/img\/(embed|favicon)\.png$/;
+
 test('the tracked set carries no save, no cache, no jars, no faces, no notes', () => {
   const bad = tracked.filter((f) => forbiddenTracked.some((re) => re.test(f)));
   assert.deepEqual(bad, [], `these would be published: ${bad.slice(0, 10).join(', ')}`);
@@ -61,11 +67,22 @@ test('history carries no save, no server binaries, no notes', () => {
   const objs = git(['rev-list', '--objects', '--all']).split('\n').filter(Boolean)
     .map((l) => l.slice(41));
   const bad = objs.filter((p) => /^(DarkRPG|HANDOFF\.md|PLAN\.md|\.private)(\/|$)/.test(p)
-    || /\.(jar|mca|sqlite|dat|dat_old|log|log\.gz|ledpack|bin|png)$/.test(p)
+    || (/\.(jar|mca|sqlite|dat|dat_old|log|log\.gz|ledpack|bin|png)$/.test(p) && !OUR_PNG.test(p))
     || /^build\/(cache|skins\/(?!\.keep$)|shells\/(?!\.keep$)|lods\/(?!\.keep$)|assets\/(?!\.keep$)|msg_|doc_)/.test(p));
   assert.deepEqual(bad.slice(0, 5), [], `${bad.length} unpublished things are still in history, e.g. `
     + `${bad.slice(0, 3).join(', ')} - rewrite history before any push (git filter-repo --path DarkRPG `
     + `--path HANDOFF.md --path PLAN.md --invert-paths)`);
+});
+
+test('the pictures the repo does own are tracked, and only those', () => {
+  for (const f of ['web/img/embed.png', 'web/img/favicon.png']) {
+    assert.ok(tracked.includes(f), `${f} is what the card's tags and the tab point at: untracked, a clone has no picture`);
+  }
+  // and everything else that looks like a picture on disk stays out: build/embed.png is a screenshot of a
+  // private save, and web/img is small enough to audit by eye
+  const pics = tracked.filter((f) => /\.(png|jpg|jpeg|webp)$/i.test(f));
+  assert.deepEqual(pics, ['web/img/embed.png', 'web/img/favicon.png'],
+    `images in the publishable set: ${pics.join(', ')}`);
 });
 
 test('the repo does not carry a dependency lock that needs the network to read', () => {

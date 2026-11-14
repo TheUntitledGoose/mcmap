@@ -11,4 +11,6 @@ export const WORLDD_FLAGS = [
   'world', 'assets', 'cache', 'web', 'vendor', 'ledger', 'port', 'host',
   'packs', 'lods', 'skins', 'cache-max-gb', 'cache-keep-h', 'cache-sweep', 'cache-reconcile',
   'slow-ms', 'heartbeat',
+  // what a chat link becomes: the public address, the two sentences, and which picture. See shared/embed.mjs.
+  'embed-url', 'embed-title', 'embed-desc', 'embed-image',
 ];

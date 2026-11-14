@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fromWire, makeReader } from '../shared/regionbits.mjs';
 import { decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
+import { pngSize } from '../shared/embed.mjs';
 
 const PORT = 8790 + (process.pid % 90);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -126,6 +127,32 @@ test('a click query with near= answers the voxel it was aimed at', async () => {
     assert.equal(r.code, 400, `${bad} answered ${r.code}: ${r.text.slice(0, 80)}`);
     assert.match(r.text, /near/);
   }
+});
+
+test('the HTML a chat bot fetches carries its own card, absolute to the address it used', async () => {
+  // Bots do not run the page, and they do not resolve relative URLs against anything: the tags have to
+  // be in the bytes, and the picture has to be a URL this server answers. Behind a proxy, the forwarded
+  // pair is the only thing that knows the public name.
+  const r = await fetch(`${BASE}/?dim=minecraft%3Athe_nether`, {
+    headers: { 'X-Forwarded-Host': 'map.example.com', 'X-Forwarded-Proto': 'https, http' },
+  });
+  assert.equal(r.status, 200);
+  const html = await r.text();
+  assert.match(html, /<meta property="og:image" content="https:\/\/map\.example\.com\/embed\.png">/,
+    'a relative image URL is a card with no picture');
+  assert.match(html, /<meta property="og:url" content="https:\/\/map\.example\.com\/\?dim=minecraft%3Athe_nether">/,
+    'the framing in the URL survives into the link, so the card links back to the view it shows');
+  assert.match(html, /<meta name="twitter:card" content="summary_large_image">/);
+  // and the declared size must be the size of the picture actually on the wire: the deployment may have
+  // put its own screenshot at build/embed.png, and a wrong size in the tag crops the card wrong
+  const w = +html.match(/og:image:width" content="(\d+)"/)?.[1];
+  const h = +html.match(/og:image:height" content="(\d+)"/)?.[1];
+  const img = await fetch(`${BASE}/embed.png`);
+  assert.equal(img.status, 200, 'the card names a picture this server does not have');
+  assert.equal(img.headers.get('content-type'), 'image/png');
+  const real = pngSize(Buffer.from(await img.arrayBuffer()));
+  assert.ok(real, 'the embed picture is not a PNG');
+  assert.deepEqual({ w, h }, real, `the tags say ${w}x${h}, the file is ${real.w}x${real.h}`);
 });
 
 test('the log stays quiet enough to read', () => {

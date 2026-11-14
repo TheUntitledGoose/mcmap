@@ -61,10 +61,12 @@ is not”), so the scripts have to be self-contained.
 ```
 server/     Node: census, asset packer, payload decoder, worldd HTTP server, bakes
 shared/     constants and formats shared by Node and the page (chunk, shell, LOD, ledger,
-            pool split, view policy, player physics, region coverage bits)
+            pool split, view policy, player physics, region coverage bits,
+            link-card meta tags)
 web/        the page. No bundler, no framework: ESM + three.js
   js/       renderer, mesher, stores, lighting, collision — DOM-free and three-free where
             possible, so they are unit-testable in Node
+  img/      the card a chat link shows (/embed.png) and the tab icon
 tools/      dev tools: region reader, column/surface probes, browser probe, patcher
 tests/      node --test suites (323 as of 9.26). The logic layers are covered; visual
             correctness is proved by framebuffer probes
@@ -76,6 +78,7 @@ build/      DERIVED. Never committed except the probes that produced the numbers
   ledger/              block-history export + per-dimension packs    ~34 MB
   cache/               decoded chunk payload cache; runtime-derived, pruned by budget,
                        deletable at any time — do not ship it
+  embed.png            your own link card, optional and not committed
 ```
 
 `main.js` in the repo root is a historical artifact (the file recovered during the
@@ -168,6 +171,7 @@ screen can actually show and edit:
 | `WD_PACKS` / `WD_LODS` / `WD_LEDGER` / `WD_ASSETS` | `--packs` … | `/srv/app/build/…` |
 | `WD_SKINS` | `--skins` | `/srv/app/build/skins` (`none` turns the pack off) |
 | `WD_SLOW_MS` / `WD_HEARTBEAT` | `--slow-ms` / `--heartbeat` | `400` / `60` |
+| `WD_EMBED_URL` / `WD_EMBED_TITLE` / `WD_EMBED_DESC` / `WD_EMBED_IMAGE` | `--embed-url` … | unset: the card writes itself from the request and the save |
 
 Any `WD_*` that is not one of those flags **stops the boot with exit 2** and prints the real flag
 list. A mistyped `WD_WROLD` in a stack screen otherwise becomes "I mounted the save and the map is
@@ -281,6 +285,56 @@ node tools/sim-container.mjs        # stages exactly the COPY set, boots from it
 It boots the staged tree from that tree as its only cwd and hits every route the browser uses; a
 pack path that no longer matches the code, or a relative path that only works from the repo root,
 fails there instead of three days later as a hole in the far view.
+
+### What a link to it looks like
+
+A chat bot (Discord, Slack, Telegram) does not run the page. It fetches the HTML, reads `<meta>` tags,
+and fetches the image one of those tags names. Three consequences, each of which was wrong at first:
+
+* the tags have to be in the bytes the server sends — a title set by JavaScript is invisible to a bot;
+* the image URL has to be **absolute**, and absolute to the address the bot is calling, which a file on
+  disk cannot know (a LAN IP? a tailscale name? a proxied domain? the request is the only witness);
+* the server has to *serve* that image, at a path the tags name.
+
+So `worldd` writes the tag block into the page per request (`shared/embed.mjs`, into the single
+`<!--embed-->` marker in `web/index.html`), from `Host` or the `X-Forwarded-Host`/`-Proto` pair, and
+answers `/embed.png` itself. The Host is character-checked before being echoed — it is caller-supplied,
+so the caller is not allowed to write the card — and `--embed-url` overrides it for the deployment where
+the proxy lied.
+
+| Variable | Flag | Default |
+|---|---|---|
+| `WD_EMBED_URL` | `--embed-url` | derived from the request |
+| `WD_EMBED_TITLE` | `--embed-title` | the save's own name and what the page does with it |
+| `WD_EMBED_DESC` | `--embed-desc` | version, dimension count, and how many block changes the history pack holds |
+| `WD_EMBED_IMAGE` | `--embed-image` | first found of `build/embed.png`, `build/embed/embed.png`, `web/img/embed.png` |
+
+The declared `og:image:width/height` are read out of the PNG's own header, so the tags cannot drift away
+from the file they point at.
+
+The card that ships with the code is **drawn, not screenshotted** (`node tools/make-embed.mjs` →
+`web/img/embed.png`, 15 KB): a patch of ground at an angle and a few cubes lifted off it, because the page
+can put a block back in time. A screenshot is a claim about one framing of one save, and this file ships
+with every copy of the code. To show your own world, mount a card instead of rebuilding one:
+
+```bash
+node tools/make-embed.mjs --from build/shot.png      # 1536x768, wordmark over a darkened foot
+scp build/embed.png host:/srv/mcmap/packs/embed/embed.png
+```
+
+`packs/embed/` is mounted beside the other packs, so that is a file copy with no redeploy. `--max-w 1152`
+trades resolution for bytes: a screenshot card is ~2 MB of foliage noise that PNG cannot compress, and a
+bot fetches it once per URL and caches it on its own CDN. The title and description are assembled from the
+save: `level.dat`'s `LevelName` — or the folder holding the save, when that name is literally `world`,
+which it is here — plus the version, the dimension count, and the row count of the history pack.
+
+`web/img/favicon.png` comes from the same tool. A missing favicon is not cosmetic in this project: the
+headless probe prints its console-error list as "the screenshot is probably blank", and `/favicon.ico`
+404 was in every run.
+
+`tests/embed-card.test.mjs` covers the URL shape (forwarded pair, forged Host, proxy subpath), the tag
+shape (escaping, sizes, no image tag when there is no image), the marker count in the page, the mount in
+the stack, and that a card built from a screenshot contains the screenshot rather than a black canvas.
 
 ### Ship it
 
