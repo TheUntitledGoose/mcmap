@@ -52,22 +52,35 @@ export function tagHash(s) {
 }
 
 /**
- * The tag for one save. `override` (from `--world-tag`, and the slug in the `--worlds` layout) wins as
- * the *name*, and is sanitized rather than trusted: with M18's world dropdown a person names the world,
- * and the cache directory should carry that name. The seed still rides along in the hash, so the same
- * name over a different save is a different directory - the thing that would otherwise let a copied
- * cache (rsync and tar both keep mtimes, so the per-chunk staleness check cannot see the swap) answer
- * for a save that is not there any more. Two spellings of one name share one cache, which is the point.
+ * The tag for one save: <name>.<hash>.
+ *
+ * The NAME is what the operator asked for - --world-tag, or in the --worlds layout the folder the save
+ * sits in - sanitized rather than trusted, because with M18's world dropdown a person names the world
+ * and the cache directory should carry that name. It is display. It does not decide identity.
+ *
+ * The HASH is the save and nothing else: the directory it lives in, resolved, and its seed. One save
+ * reached through a junction, a bind or a .. is therefore one cache, and `darkrpg-world.<H>` beside
+ * `darkrpg.<H>` are provably one save - which is what lets the server adopt a payload tree filed under
+ * the old name (server/cache-adopt.mjs) instead of re-decoding the world. Hashing the name too, as this
+ * function used to, turned a spelling change into an afternoon of decoding: 627 579 payloads stranded
+ * under the old name, the sweep calling them "a save this server does not serve", and a viewer that
+ * merely looked slower.
+ *
+ * The seed still rides in the hash, so the same name over a different save is a different directory -
+ * the thing that would otherwise let a copied cache (rsync and tar both keep mtimes, so the per-chunk
+ * staleness check cannot see the swap) answer for a save that is not there any more. With no directory
+ * to ask, the name is all the identity there is, and a hand-named cache gets one.
  */
 export function worldTagFor({ dir = '', seed = '', override = '' } = {}) {
   const o = String(override ?? '').trim();
-  if (o) {
-    const clean = o.toLowerCase().replace(NOT_NAME, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 48);
-    const h = tagHash(`${clean}|${seed}`);
-    return clean ? `${clean}.${h}` : h;
-  }
+  const clean = o ? o.toLowerCase().replace(NOT_NAME, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 48) : '';
   const d = String(dir ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
-  return `${dirLabel(d)}.${tagHash(`${d}|${seed}`)}`;
+  // The hash says WHICH SAVE, and a name is not evidence about a save: pass the resolved directory and
+  // the seed, and `--world-tag darkrpg-world` beside a `--worlds` slug of `darkrpg` become two names for
+  // one cache the server can adopt rather than re-decode. With no directory to ask, the name is all there
+  // is, so a hand-named cache still gets an identity of its own.
+  const h = tagHash(`${d || clean}|${seed}`);
+  return clean ? `${clean}.${h}` : `${dirLabel(d)}.${h}`;
 }
 
 /**

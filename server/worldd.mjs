@@ -168,6 +168,18 @@ if (!DEF || DEF.problem) {
 }
 
 
+// A save can own a payload tree under a name this boot does not use: opened as `--world <dir>` one day
+// and through a `--worlds` slug the next. The hash half of the identity proves the save (resolved
+// directory + seed), so this is a rename, done before a single request lands and before the sweep below
+// can call those payloads unreachable. `--cache-adopt 0` turns it off.
+if (NOCACHE && num('cache-adopt', 1) !== 0) {
+  const ad = REG.adoptCacheTags(NOCACHE, { log: (m) => console.log('  cache: ' + m) });
+  if (ad.length) {
+    console.log('  cache: adopted ' + ad.length + ' cache ' + (ad.length === 1 ? 'tree' : 'trees')
+      + ' (' + ad.reduce((s, r) => s + r.payloads, 0) + ' payloads kept) under the names these worlds read');
+  }
+}
+
 // `--cache-sweep 0` keeps old generations on purpose (comparing two atlas stamps side by side).
 // The keep lists cover every world this process opens: a payload tree belonging to a world that is no
 // longer on disk is dead weight, and one belonging to a world that IS here is never touched.

@@ -25,6 +25,8 @@ import path from 'node:path';
 import { openWorld, findSave, findPacks, slugOk, worldLabel, levelSummary } from './world-bundle.mjs';
 import { levelSeed } from './world-dims.mjs';
 import { worldTagFor } from '../shared/world-tag.mjs';
+import { canonicalDir } from './fs-canon.mjs';
+import { adoptCacheTag } from './cache-adopt.mjs';
 import { tableTag } from './world-service.mjs';
 import { buildStateIds } from './chunk-payload.mjs';
 
@@ -48,7 +50,7 @@ export function worldIdentity(w) {
     // Same identity `openWorld` would compute for this world: in a --worlds root the slug is the tag's name
     // (openWorldFor passes `worldTag: w.slug`), so a parked save must report the directory it will use or
     // the cache keep-list would name nothing and the sweep would delete what this world is waiting for.
-    out.worldTag = worldTagFor({ dir: path.resolve(w.world), seed: levelSeed(w.world), override: w.slug });
+    out.worldTag = worldTagFor({ dir: canonicalDir(w.world), seed: levelSeed(w.world), override: w.slug });
   } catch { /* no seed: the payload cache cannot name this world yet */ }
   try {
     const a = w.packs.assets && path.join(w.packs.assets, 'atlas.json');
@@ -353,6 +355,14 @@ export class WorldRegistry {
   openNow(slug) {
     const w = this.discovered.get(slug);
     if (!w) return null;
+    // Before it opens: this save may own a payload tree under a name an older boot chose. Renaming it
+    // here is what saves the 25-minute re-decode, and the world that opens reads the new name from its
+    // first request on (cache paths are built per access, never held open).
+    if (this.openOpts?.cache) {
+      const tag = worldTagFor({ dir: canonicalDir(w.world), seed: levelSeed(w.world), override: slug });
+      if (tag) adoptCacheTag({ cacheDir: this.openOpts.cache, worldTag: tag,
+        keep: this.cacheKeep(), log: this.log });
+    }
     const b = openWorldFor(w, this.openOpts);
     this.bySlug.set(slug, b);
     if (!this.order.includes(slug)) this.order.push(slug);
@@ -439,6 +449,27 @@ export class WorldRegistry {
       .map((b) => [String(b.svc?.worldTag || b.worldTag || ''),
         [String(b.svc?.tableTag || b.tableTag || '')].filter(Boolean)])
       .filter(([w, tabs]) => w && tabs.length);
+  }
+
+  /**
+   * Give every world on this box the payload tree that already belongs to it, under whatever name an
+   * earlier boot wrote it. One resolved-directory-plus-seed hash proves the save, so this is a rename
+   * and not a question: 627 579 chunks stay decoded instead of being re-decoded while the pruner calls
+   * the old tree unreachable. A tree another world here claims is left alone (`cacheKeep()`), including
+   * a save the cap is merely holding closed. See server/cache-adopt.mjs.
+   */
+  adoptCacheTags(cacheDir, { dry = false, log = () => {} } = {}) {
+    const rows = [];
+    if (!cacheDir) return rows;
+    const keep = this.cacheKeep().filter((t) => t);
+    for (const b of this.bySlug.values()) {
+      if (b.problem) continue;
+      const tag = String(b.svc?.worldTag || b.worldTag || '');
+      if (!tag) continue;
+      const r = adoptCacheTag({ cacheDir, worldTag: tag, keep, dry, log });
+      if (r.adopted.length) rows.push(...r.adopted);
+    }
+    return rows;
   }
 
   /**

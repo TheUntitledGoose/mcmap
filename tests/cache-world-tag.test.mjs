@@ -11,6 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { worldTagFor, tagHash, isWorldTag } from '../shared/world-tag.mjs';
+import { tagHashOf } from '../server/cache-adopt.mjs';
+import { canonicalDir } from '../server/fs-canon.mjs';
 import { WorldService } from '../server/world-service.mjs';
 import { buildStateIds } from '../server/chunk-payload.mjs';
 import { levelSeed } from '../server/world-dims.mjs';
@@ -53,17 +55,43 @@ test('every tag the function can produce is one legal directory name', () => {
     `an override escaped the cache directory: ${t}`);
 });
 
-test('--world-tag names the cache, and the seed still says which save that name stands for', () => {
-  const named = worldTagFor({ dir: '/anything/at/all', override: 'darkrpg' });
+test('--world-tag names the cache, and the SAVE - not the name - decides its hash', () => {
+  const named = worldTagFor({ dir: '/srv/saves/dark/world', seed: '42', override: 'darkrpg' });
   assert.ok(named.startsWith('darkrpg.'), `a named tag should still read as the name, got ${named}`);
-  assert.equal(worldTagFor({ dir: '/anything/at/all', override: 'darkrpg', seed: '42' }),
-    worldTagFor({ dir: '/elsewhere/entirely', override: 'darkrpg', seed: '42' }),
-    'the name and seed travel together, so a cache volume can move between boxes');
-  assert.notEqual(named, worldTagFor({ dir: '/anything/at/all', override: 'darkrpg', seed: '77' }),
+  // Two names over one save: the directory names differ (the operator chose them) and the hash half does
+  // not, which is what lets the server adopt the payload tree instead of re-decoding the world
+  // (server/cache-adopt.mjs). Hashing the name as well used to turn "you spelled the flag differently"
+  // into an afternoon of decoding: 627 579 payloads stranded, and the sweep calling them unreachable.
+  const spelled = worldTagFor({ dir: '/srv/saves/dark/world', seed: '42', override: 'darkrpg-world' });
+  assert.notEqual(named, spelled, 'the name half is still the directory an operator asked for');
+  assert.equal(tagHashOf(named), tagHashOf(spelled),
+    'and the save decides the hash half, so adoption can prove the two names are one save');
+  // A different directory is a different save, even under one name and one seed - two copies of a
+  // template diverge the moment someone builds, and they must not read each other's chunks.
+  assert.notEqual(worldTagFor({ dir: '/a/world', seed: '42', override: 'x' }),
+    worldTagFor({ dir: '/b/world', seed: '42', override: 'x' }));
+  assert.notEqual(named, worldTagFor({ dir: '/srv/saves/dark/world', seed: '77', override: 'darkrpg' }),
     'the same slug over a different save must not inherit that save\'s payloads - rsync and tar keep mtimes, '
     + 'so the per-chunk staleness check cannot see the swap');
   assert.notEqual(worldTagFor({ dir: '/x', override: 'world one' }), worldTagFor({ dir: '/x', override: 'world-two' }));
+  // With no directory to ask, the name carries the identity: a hand-named cache stays portable by name
+  // and seed, which is the case `--world-tag` exists for.
+  assert.equal(worldTagFor({ override: 'probe', seed: '1' }), worldTagFor({ override: 'probe', seed: '1' }));
   assert.ok(isWorldTag(worldTagFor({ dir: '/x', override: '\u30b9\u30d1\u30a4\u30b7' })));
+});
+
+test('one save reached two ways is one cache: the hash asks the directory the filesystem means', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canon-'));
+  const save = path.join(root, 'Dark Save', 'world');
+  fs.mkdirSync(save, { recursive: true });
+  const spelled = path.join(root, 'Dark Save', 'nowhere', '..', 'world');
+  assert.equal(canonicalDir(spelled), canonicalDir(save),
+    'realpath answers "which directory is this" the way the filesystem does, junctions included');
+  assert.equal(worldTagFor({ dir: canonicalDir(spelled), seed: '7', override: 'darkrpg' }),
+    worldTagFor({ dir: canonicalDir(save), seed: '7', override: 'darkrpg' }),
+    'the same folder reached through a link must not cost a re-decode');
+  assert.equal(canonicalDir(path.join(root, 'not-here-at-all')), path.resolve(path.join(root, 'not-here-at-all')),
+    'a path that cannot be resolved still gets a stable tag: the real problem deserves the log line');
 });
 
 // ---------------------------------------------------------------- two saves, one state table

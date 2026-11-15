@@ -473,13 +473,22 @@ build/cache/<worldTag>/<tableTag>/<lit|nolight>/<dimKey>/<cx>_<cz>.bin
 ```
 
 The save half matters: two saves running the same mods share a state-table tag, and both call their
-biggest dimension folder `region`, so a cache without it can answer for the wrong world. `worldTag` is
-derived from the world directory and the `level.dat` seed; name it yourself with `--world-tag`, and inside
-a `--worlds` root the folder's slug *is* the name. The name is half the key, so renaming a save's folder
-(or opening it under a different `--world-tag`) is a new cache: `node tools/cache-retag.mjs --dir <root>
---from <oldTag> --to <newTag> --merge` moves it, one `rename` per dimension the new name lacks. The server
-refuses to delete such a tree when its state table belongs to a save on the box - it prints the retag
-command instead of throwing away a world's worth of decoded chunks.
+biggest dimension folder `region`, so a cache without it can answer for the wrong world. `<worldTag>` is
+`<name>.<hash>`, and the **hash is the save**: the directory it lives in as `realpath` resolves it, plus
+the `level.dat` seed. The name is display - `--world-tag`, or the folder's slug inside a `--worlds` root -
+and it decides nothing about identity. So one save reached through a junction, a bind mount or a `..` is
+one cache, and opening the same save two ways does not cost a second afternoon of decoding. When only the
+name changed, the server adopts the old tree at boot (the hash proves it is the same save) and says so:
+
+```
+cache: adopted 1 cache tree (627579 payloads kept) under the names these worlds read
+```
+
+`--cache-adopt 0` declines it. Rename the *folder* and the identity moves with it, so that case is manual:
+`node tools/cache-retag.mjs --dir <root> --from <oldTag> --to <newTag> --merge` moves the payloads, one
+`rename` per subtree the new name lacks. Either way the server refuses to delete a tree whose state table
+belongs to a save on the box - it prints the retag command instead of throwing away a world's worth of
+decoded chunks.
 
 ### Run it behind a proxy (the recommended shape)
 

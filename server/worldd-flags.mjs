@@ -16,6 +16,10 @@ export const WORLDD_FLAGS = [
   // listed and opened by the first request that names them; `0` opens all of them. See park()/openNow().
   'worlds-max',
   'packs', 'lods', 'skins', 'cache-max-gb', 'cache-keep-h', 'cache-sweep', 'cache-reconcile',
+  // rename a payload tree this save owns under another name, at boot (WD_CACHE_ADOPT, default on): the
+  // identity hash is the resolved directory plus the seed, so the adoption is provable, not guessed.
+  // See server/cache-adopt.mjs.
+  'cache-adopt',
   'slow-ms', 'heartbeat',
   // which save the payload cache belongs to, when the directory and its seed are not answer enough
   // (M18's world dropdown names worlds, so the cache should carry that name). See shared/world-tag.mjs.

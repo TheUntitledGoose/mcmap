@@ -7,6 +7,7 @@ import { readNbt } from '../tools/nbt.mjs';
 import { RegionFile } from '../tools/region.mjs';
 import { listDims, dimExtent, levelSeed } from './world-dims.mjs';
 import { worldTagFor, isWorldTag } from '../shared/world-tag.mjs';
+import { canonicalDir } from './fs-canon.mjs';
 import { packCells, makeReader, toWire } from '../shared/regionbits.mjs';
 import { decodeChunk, packChunk } from './chunk-payload.mjs';
 import { shellFromPayload, shellFrameCols } from './shell.mjs';
@@ -145,7 +146,9 @@ export class WorldService {
     // with the same mod set read each other's decoded chunks: same table tag, same dimension key, same
     // frame, someone else's terrain - and no error anywhere to say so.
     this.worldTag = worldTagFor({
-      dir: path.resolve(worldRoot), seed: levelSeed(worldRoot), override: opts.worldTag,
+      // Resolved, not spelled: the same save reached through a junction, a bind or a `..` is one save
+      // and must land on one cache. `override` is the legible name; it no longer feeds the hash.
+      dir: canonicalDir(worldRoot), seed: levelSeed(worldRoot), override: opts.worldTag,
     });
     if (!isWorldTag(this.worldTag)) {
       // worldTagFor sanitizes, so this only fires on something deliberately hostile in --world-tag.
