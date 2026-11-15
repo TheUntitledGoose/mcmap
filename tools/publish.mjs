@@ -71,5 +71,5 @@ console.log('  largest:');
 for (const [n, f] of biggest.slice(0, 6)) console.log(`    ${(n / 1024).toFixed(0).padStart(6)} KB  ${f}`);
 console.log(`
 next:
-  cd "${DEST}" && cp -r <this repo>/node_modules . && npm test     # 510 here, 387 with honest skips on a clone; no network
-  cd "${out}" && git remote add origin git@github.com:<you>/mcmap.git && git push -u origin main`);
+  cd "${DEST}" && cp -r <this repo>/node_modules . && npm test     # the full suite wants a save and baked packs; on a bare clone it skips the data suites and says what to bake
+  cd "${DEST}" && git remote add origin git@github.com:<you>/mcmap.git && git push -u origin main`);

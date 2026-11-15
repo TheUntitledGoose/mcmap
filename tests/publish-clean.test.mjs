@@ -9,10 +9,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import { existsSync, readFileSync } from 'node:fs';
 
 const git = (args) => execFileSync('git', args, { encoding: 'utf8' });
-const tracked = git(['ls-files']).split('\n').filter(Boolean);
+// Which set of files this checkout can even be asked about. `tools/publish.mjs` builds a tree of files and
+// only sometimes gives it a git history of its own, and a plain copy of a clone has no `.git` either - so
+// the index is not always there to be read, and crashing on that reads as "this tree is dirty" when the
+// true answer is "there is no git here". What can still be checked without git is the files themselves.
+let tracked = null;
+try { tracked = git(['ls-files']).split('\n').filter(Boolean); } catch { /* no git here */ }
+const NO_GIT = tracked === null
+  ? 'no git repository here: no index and no history to inspect (tools/publish.mjs runs this suite in the '
+    + 'repo it is publishing from, where there is one)'
+  : false;
+
+/** Every file in this tree, git or no git - what would be handed over if someone zipped it up. */
+function diskFiles(root = '.') {
+  const out = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === '.git' || e.name === 'node_modules') continue;
+      const rel = dir === '.' ? e.name : `${dir}/${e.name}`;
+      if (e.isDirectory()) walk(rel); else out.push(rel);
+    }
+  };
+  walk(root);
+  return out;
+}
+const SET = tracked ?? diskFiles();
+if (!tracked) console.log('note: no git here, so the file checks below run over the files on disk instead of an index');
 
 const forbiddenTracked = [
   /^DarkRPG\//,                 // the save and the server root: 3.6 GB of other people's world
@@ -33,15 +59,17 @@ const forbiddenTracked = [
 const OUR_PNG = /^web\/img\/(embed|favicon)\.png$/;
 
 test('the tracked set carries no save, no cache, no jars, no faces, no notes', () => {
-  const bad = tracked.filter((f) => forbiddenTracked.some((re) => re.test(f)));
+  const bad = SET.filter((f) => forbiddenTracked.some((re) => re.test(f)));
   assert.deepEqual(bad, [], `these would be published: ${bad.slice(0, 10).join(', ')}`);
 });
 
 test('the working notes are local-only, and say so in .gitignore', () => {
   for (const f of ['HANDOFF.md', 'PLAN.md']) {
-    assert.ok(!tracked.includes(f), `${f} is tracked: it names real players`);
-    const ignored = git(['check-ignore', '-v', f]).trim();
-    assert.ok(ignored.includes(f), `${f} is not git-ignored, so git add -A would bring it back`);
+    assert.ok(!SET.includes(f), `${f} is here: it names real players`);
+    if (!NO_GIT) {
+      const ignored = git(['check-ignore', '-v', f]).trim();
+      assert.ok(ignored.includes(f), `${f} is not git-ignored, so git add -A would bring it back`);
+    }
   }
 });
 
@@ -56,13 +84,13 @@ test('no real player handle survives in a tracked file', () => {
   }
   const names = Object.keys(JSON.parse(readFileSync(mapfile, 'utf8')).map);
   const re = new RegExp(names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'gi');
-  const hits = tracked.filter((f) => {
+  const hits = SET.filter((f) => {
     try { return re.test(readFileSync(f, 'utf8')); } catch { return false; }
   });
   assert.deepEqual(hits, [], `real handles in: ${hits.join(', ')} - run node tools/pseudonymise.mjs`);
 });
 
-test('history carries no save, no server binaries, no notes', () => {
+test('history carries no save, no server binaries, no notes', { skip: NO_GIT }, () => {
   // Every object every commit can reach. A single one of these means a push would upload it.
   const objs = git(['rev-list', '--objects', '--all']).split('\n').filter(Boolean)
     .map((l) => l.slice(41));
@@ -103,7 +131,7 @@ function historyText() {
 }
 const peek = (all, i) => all.slice(Math.max(0, i - 70), i + 70).replace(/[^\x20-\x7e]/g, ' ');
 
-test('no object in history carries a personal path, a personal email or a LAN address', () => {
+test('no object in history carries a personal path, a personal email or a LAN address', { skip: NO_GIT }, () => {
   const all = historyText();
   for (const [what, re] of PERSONAL) {
     const m = all.match(re);
@@ -111,7 +139,7 @@ test('no object in history carries a personal path, a personal email or a LAN ad
   }
 });
 
-test('no real player handle survives anywhere in history, not just at HEAD', () => {
+test('no real player handle survives anywhere in history, not just at HEAD', { skip: NO_GIT }, () => {
   if (!existsSync('.private/names.json')) {
     console.log('skip: no .private/names.json here (expected on a clone), so the handles to look for are '
       + 'unknown; the HEAD-level handle check above skips for the same reason');
@@ -125,13 +153,13 @@ test('no real player handle survives anywhere in history, not just at HEAD', () 
     + '`==>` not `->`) before pushing');
 });
 
-test('the pictures the repo does own are tracked, and only those', () => {
+test('the pictures the repo does own are present, and only those', () => {
   for (const f of ['web/img/embed.png', 'web/img/favicon.png']) {
-    assert.ok(tracked.includes(f), `${f} is what the card's tags and the tab point at: untracked, a clone has no picture`);
+    assert.ok(SET.includes(f), `${f} is what the card's tags and the tab point at: missing, a clone has no picture`);
   }
   // and everything else that looks like a picture on disk stays out: build/embed.png is a screenshot of a
   // private save, and web/img is small enough to audit by eye
-  const pics = tracked.filter((f) => /\.(png|jpg|jpeg|webp)$/i.test(f));
+  const pics = SET.filter((f) => /\.(png|jpg|jpeg|webp)$/i.test(f));
   assert.deepEqual(pics, ['web/img/embed.png', 'web/img/favicon.png'],
     `images in the publishable set: ${pics.join(', ')}`);
 });
@@ -140,5 +168,5 @@ test('the repo does not carry a dependency lock that needs the network to read',
   // `npm test` on a fresh clone should be about the code, not about the internet.
   const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
   assert.ok(pkg.scripts && pkg.scripts.test, 'no test script');
-  assert.ok(tracked.includes('package-lock.json'), 'package-lock.json unpinned: an install can drift');
+  assert.ok(tracked === null || tracked.includes('package-lock.json'), 'package-lock.json unpinned: an install can drift');
 });
