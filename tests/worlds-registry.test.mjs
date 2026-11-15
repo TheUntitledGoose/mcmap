@@ -190,4 +190,62 @@ test('one --world save stays exactly the shape it always was', () => {
   assert.match(reg.whyMiss('anything'), /serves one save/, 'with the reason, and how to get more worlds');
 });
 
+// ------------------------------------------------------- a root that changes while running
+
+test('a save dropped into the worlds root while the box runs is served without a restart', () => {
+  const root = at('grow');
+  mkWorldAt(root, 'first');
+  const { registry: reg } = openWorldsRoot({ root, defaultSlug: 'first', cache: at('cache-grow') });
+  assert.deepEqual(reg.slugs(), ['first'], 'one world at boot');
+  mkWorldAt(root, 'second');
+  // The TTL path declines when asked twice in a row, so `/meta` polling cannot turn into a disk scan.
+  assert.equal(reg.refresh({ floor: 600000 }), null, 'a refresh that is not due declines, and says so');
+  // A request naming the new save is its own trigger: the copy finished a minute ago and the link is now.
+  const b = reg.resolve('second');
+  assert.ok(b && !b.problem, 'the miss itself re-looked at the root');
+  assert.deepEqual(reg.slugs(), ['first', 'second'], 'and the new slug is a world now');
+  assert.notEqual(b.worldTag, reg.resolve('first').worldTag, 'with its own cache identity');
+  const later = reg.refresh({ now: Date.now() + 600000 });
+  assert.ok(later && later.added.length === 0, 'a later glance finds nothing new to add');
+});
+
+test('a slug that is not here does not buy a disk scan per request', () => {
+  const root = at('typo');
+  mkWorldAt(root, 'only');
+  const { registry: reg } = openWorldsRoot({ root, defaultSlug: 'only', cache: at('cache-typo') });
+  assert.equal(reg.resolve('nope'), null, 'refused');
+  mkWorldAt(root, 'arrived');                        // dropped in during the miss-guard's window
+  assert.equal(reg.resolve('arrived'), null, 'the guard means this one does not look again');
+  assert.ok(reg.resolve('nope') === null, 'still refusing, not guessing');
+});
+
+test('a world whose packs arrived late stops being a problem, but not on every glance', () => {
+  const root = at('late');
+  mkWorldAt(root, 'slow', { packs: [] });            // a save with no asset pack: listed, not openable
+  const { registry: reg } = openWorldsRoot({ root, defaultSlug: 'slow', cache: at('cache-late') });
+  const bad = reg.resolve('slow');
+  assert.ok(bad && bad.problem, 'at boot it is a world with a reason, not a crash');
+  assert.match(bad.problem, /atlas\.json/, 'and the reason names the pack that is missing');
+  touch(path.join(root, 'slow', 'packs', 'assets', 'atlas.json'), FAKE_ATLAS);
+  assert.ok(reg.refresh({ now: Date.now() + 1000, floor: 0 }).revived.length === 0,
+    'the retry clock holds: a failed world is not reparsed every 15 s');
+  assert.ok(reg.resolve('slow').problem, 'so it is still the same broken world for now');
+  const r = reg.refresh({ now: Date.now() + FAILED_WAIT, floor: 0 });
+  assert.deepEqual(r.revived, ['slow'], 'once the cooldown passes, the pack that showed up is used');
+  assert.ok(!reg.resolve('slow').problem, 'and the world renders');
+});
+const FAILED_WAIT = 301000;   // just past the registry's own retry interval for a world that failed
+
+test('a save that vanishes from the root is still served, and is said to be gone', () => {
+  const root = at('gone');
+  mkWorldAt(root, 'here'); mkWorldAt(root, 'stable');
+  const { registry: reg } = openWorldsRoot({ root, defaultSlug: 'stable', cache: at('cache-gone') });
+  fs.rmSync(path.join(root, 'here'), { recursive: true, force: true });
+  const r = reg.refresh({ now: Date.now() + 600000 });
+  assert.deepEqual(r.missing, ['here'], 'the fact is reported');
+  assert.ok(reg.resolve('here'), 'and the tabs already looking at it do not go blank mid-pan: a folder '
+    + 'that is briefly absent is usually a re-sync in progress');
+  assert.ok(reg.slugs().includes('here'), 'still listed, because hiding it would be the same lie');
+});
+
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));

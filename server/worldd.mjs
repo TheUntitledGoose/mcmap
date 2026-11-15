@@ -396,6 +396,10 @@ const server = http.createServer(async (req, res) => {
       return send(req, res, 200, JSON.stringify(stripJson(s.strip, s.pack)), 'application/json; charset=utf-8');
     }
     if (u.pathname === '/meta') {
+      // A save dropped into the worlds root since boot shows up here, which is what makes the page's save
+      // list true without a restart. Rate-limited inside the registry, and it is a readdir plus (only when
+      // something is genuinely new) one atlas parse, so the cost of asking every few seconds is nil.
+      REG.refresh();
       return send(req, res, 200, JSON.stringify({
         world: W.paths.world, slug: W.slug, label: W.label, worldTag: svc.worldTag,
         level: W.level(), dims: svc.dimList(),
@@ -403,6 +407,8 @@ const server = http.createServer(async (req, res) => {
         // open is listed with its problem rather than hidden - so "where is my other save" is answerable
         // from the browser instead of from the container log.
         worlds: REG.list(), defaultWorld: REG.defaultSlug || '',
+        // Opened here, no longer on disk: a re-sync in progress. Still served, and said out loud.
+        worldMissing: [...REG.missing],
         assets: { states: W.atlas.states.length, textures: W.atlas.textures.length,
           atlasSize: W.atlas.atlasSize, geometry: W.atlas.geometry },
         stats: svc.stats,
@@ -609,6 +615,15 @@ if (HEARTBEAT) {
     lastTick = now;
   }, 1000).unref();
   setInterval(() => {
+    // The worlds root is re-looked at on the registry's own TTL, so a save that appeared since boot is
+    // billed here the same as one that was there at boot - and the log says the set changed, rather than
+    // leaving someone to notice a new slug in a dropdown.
+    const before = REG.slugs().join(' ');
+    const r = REG.refresh();
+    if (r && (r.added.length || r.revived.length)) {
+      console.log(`worlds: ${before} -> ${REG.slugs().join(' ')}`
+        + (r.missing.length ? ` (still serving, not on disk: ${r.missing.join(' ')})` : ''));
+    }
     const now = REG.totals();
     const d = [];
     for (const [k, v] of Object.entries(now)) {

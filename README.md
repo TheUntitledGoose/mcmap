@@ -321,6 +321,18 @@ A save in that folder that will not open does not take the box down and is not h
 its reason, so "where is my other save" has an answer in `/meta` and in the panel instead of only in the
 container log.
 
+A save dropped in after boot is noticed. `/meta` re-looks at the root every 15 s (that is where the page's
+save list comes from), and a request naming a slug that is not here triggers one look of its own before it
+is refused — the copy finished a minute ago and the link is now, which is the common case. A world that
+failed to open at boot because its asset pack had not arrived is retried (on a slower clock, because
+opening one means reading `level.dat` and parsing its atlas), so "the pack showed up later" ends up as a
+map rather than a permanent 404.
+
+A save that *disappears* from the root keeps being served, and is reported as missing
+(`/meta.worldMissing`, and one line in the log). A folder that is briefly absent is usually a re-sync in
+progress, and blanking someone's map over that is a worse failure than continuing to answer from what is
+already open.
+
 **Why each save carries its own packs.** A chunk payload is written as state ids, and those ids are the
 order that save's `assets/atlas.json` lists its states in. Two saves with the same mod set share a state
 table, and both call their biggest dimension folder `region/`, so before this existed one save could be
