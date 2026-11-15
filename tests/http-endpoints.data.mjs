@@ -14,8 +14,11 @@ import { fromWire, makeReader } from '../shared/regionbits.mjs';
 import { decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
 import { pngSize } from '../shared/embed.mjs';
 import { BATCH_MAGIC } from '../shared/chunk-format.mjs';
+import { freePort } from './free-port.mjs';
 
-const PORT = 8790 + (process.pid % 90);
+// A port from the OS, not a slice of 8790-8879: the slices suites used to take overlap each other, and a
+// collision looks like a server that will not start. See tests/free-port.mjs.
+const PORT = await freePort();
 const BASE = `http://127.0.0.1:${PORT}`;
 const child = spawn(process.execPath, ['server/worldd.mjs', '--port', String(PORT), '--cache', 'none',
   '--heartbeat', '0', '--host', '127.0.0.1'], { stdio: ['ignore', 'pipe', 'pipe'] });

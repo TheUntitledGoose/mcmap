@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process';
 import { envArgs } from '../shared/envargs.mjs';
 import { WORLDD_FLAGS } from '../server/worldd-flags.mjs';
 import { needPacks, needServer } from './needs.mjs';
+import { freePort } from './free-port.mjs';
 
 const read = (p) => fs.readFileSync(p, 'utf8').replace(/\r\n/g, '\n');
 const DOCKERFILE = read('Dockerfile');
@@ -163,7 +164,7 @@ test('worldd refuses to boot without the asset pack, and says which variable fix
   // In a stack this one line is the whole user-visible answer between restarts. A bare path in the log is
   // how a deploy that "succeeded" ends up looking like a broken map.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcmap-nopacks-'));
-  const port = 8951 + (process.pid % 40);
+  const port = await freePort();   // not a slice of a range other suites overlap; see tests/free-port.mjs
   try {
     const child = spawn(process.execPath, ['server/worldd.mjs'], {
       env: {

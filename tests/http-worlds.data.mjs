@@ -16,11 +16,14 @@ import { openWorld } from '../server/world-bundle.mjs';
 import { worldTagFor } from '../shared/world-tag.mjs';
 import { stateTableHash } from '../shared/chunk-format.mjs';
 import { openBatch } from '../web/js/payload.js';
+import { freePort } from './free-port.mjs';
 
 const toArrayBuffer = (b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
 
 const SRC = 'DarkRPG/world';
-const PORT = 8900 + (process.pid % 90);
+// Not a slice of the port range: the slices this repo used to take overlap each other, which made one
+// suite's server fail to bind and the suite fail only in a full run. See tests/free-port.mjs.
+const PORT = await freePort();
 const BASE = `http://127.0.0.1:${PORT}`;
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcmap-worlds-http-'));
@@ -31,17 +34,17 @@ function copy(from, to) {
   fs.copyFileSync(from, to);
 }
 
-function stage(slug, regions) {
-  const save = path.join(root, slug, 'save');
+function stage(slug, regions, base = root) {
+  const save = path.join(base, slug, 'save');
   copy(path.join(SRC, 'level.dat'), path.join(save, 'world', 'level.dat'));
   for (const r of regions) copy(path.join(SRC, 'region', r), path.join(save, 'world', 'region', r));
   // Same atlas for both - that is the point: the state table cannot be what keeps them apart.
   for (const f of ['atlas.json', 'atlas.png', 'geometry.bin']) {
-    copy(path.join('build', 'assets', f), path.join(root, slug, 'packs', 'assets', f));
+    copy(path.join('build', 'assets', f), path.join(base, slug, 'packs', 'assets', f));
   }
   return {
     world: path.join(save, 'world'),
-    assets: path.join(root, slug, 'packs', 'assets'),
+    assets: path.join(base, slug, 'packs', 'assets'),
   };
 }
 
@@ -274,8 +277,78 @@ test('two saves whose atlases number the same blocks differently stay apart, and
   assert.notEqual(hit.ia, hit.ib, 'and a different number in each table, which is the whole reason to name one');
 });
 
+// ---------------------------------------------------------------- more saves than one process holds open
+
+// A second server on its own root, because the cap is about how many saves one *process* holds open: it
+// needs a root with more saves than the cap, and a `/meta` and a `/stats` read on either side of a request
+// that names one of the closed ones. Same staged saves as above - one region file each, real decode work.
+const CAP = fs.mkdtempSync(path.join(os.tmpdir(), 'mcmap-worlds-cap-'));
+const capCache = path.join(CAP, 'cache');
+for (const slug of ['alpha', 'bravo', 'charlie']) stage(slug, ['r.0.0.mca'], CAP);
+// A port of our own, asked of the OS: this suite runs two worldd servers at once, and "the next port"
+// after the first one's is another suite's port some fraction of the time.
+const CAPPORT = await freePort();
+const capBase = `http://127.0.0.1:${CAPPORT}`;
+const capChild = spawn(process.execPath, ['server/worldd.mjs', '--port', String(CAPPORT),
+  '--host', '127.0.0.1', '--worlds', CAP, '--world-default', 'alpha', '--cache', capCache,
+  // Two of the three saves stand open; the third is listed and closed until a request names it.
+  '--worlds-max', '2', '--heartbeat', '0', '--cache-sweep', '0', '--cache-reconcile', '0'],
+  { stdio: ['ignore', 'pipe', 'pipe'] });
+let capLog = '';
+capChild.stdout.on('data', (b) => { capLog += b; });
+capChild.stderr.on('data', (b) => { capLog += b; });
+const capGet = async (p) => {
+  const r = await fetch(capBase + p);
+  const buf = Buffer.from(await r.arrayBuffer());
+  return { code: r.status, buf, text: buf.toString('utf8') };
+};
+
+test('a worlds root holding more saves than --worlds-max serves every one of them and holds few open', async () => {
+  let meta = null;
+  for (let i = 0; i < 240 && !meta; i++) {
+    try {
+      const r = await fetch(`${capBase}/meta`);
+      if (r.ok) meta = JSON.parse(await r.text());
+    } catch { /* not listening yet */ }
+    if (!meta) await new Promise((r) => setTimeout(r, 250));
+  }
+  assert.ok(meta, `the capped server did not come up:\n${capLog}`);
+  assert.deepEqual(meta.worlds.map((w) => w.slug), ['alpha', 'bravo', 'charlie'],
+    'all three are worlds on this box, default first');
+  assert.equal(meta.worlds.filter((w) => w.open).length, 2, 'and only --worlds-max of them stand open');
+  const shut = meta.worlds.find((w) => w.slug === 'charlie');
+  assert.equal(shut.parked, 1, "the third says so in its own row");
+  assert.equal(shut.label, 'charlie', 'named: a blank entry in a dropdown would be worse than leaving it out');
+  assert.match(String(shut.worldTag), /^charlie\./, 'naming the payload directory it will use');
+  assert.match(String(shut.tableTag), /^[0-9a-f]{8}$/, 'and the state table its blocks are numbered by');
+  assert.match(capLog, /serving 3 world\(s\).*2 open, 1 closed until asked/, 'and the boot line says the same');
+
+  const v = await capGet('/voxels?dim=minecraft:overworld&cx0=0&cz0=0&w=2&h=2&world=charlie');
+  assert.equal(v.code, 200, v.text.slice(0, 200));
+  assert.ok(v.buf.length > 100000, `a link to a closed save answered with payloads: ${v.buf.length} B`);
+  assert.match(capLog, /world charlie opened on request/, 'and the log says what just happened, unasked');
+  assert.ok(fs.existsSync(path.join(capCache, shut.worldTag)), 'filed under its own cache identity');
+
+  // The cap holds, and it is the idlest that lets go - not the default (a request naming nothing gets
+  // that save) and not the one just asked for.
+  const later = JSON.parse((await capGet('/meta')).text);
+  assert.equal(later.worlds.filter((w) => w.open).length, 2, 'still two open');
+  assert.equal(later.worlds.find((w) => w.slug === 'charlie').open, 1, 'the one just asked for stayed');
+  assert.equal(later.worlds.find((w) => w.slug === 'alpha').open, 1, 'and so did the default');
+  assert.equal(later.worlds.find((w) => w.slug === 'bravo').parked, 1, 'the idlest of the rest let go');
+
+  const st = JSON.parse((await capGet('/stats')).text);
+  assert.equal(st.perWorld.filter((r) => r.open).length, 2, '/stats says how many are holding files');
+  const idle = st.perWorld.find((r) => r.slug === 'bravo');
+  assert.equal(idle.parked, 1, 'and which one is not');
+  assert.equal(idle.regionOpen, 0, 'a closed save reports no region handles');
+  assert.ok(st.perWorld.find((r) => r.slug === 'charlie').decodes > 0, 'an open one reports what it decoded');
+});
+
 after(() => {
   child.kill();
+  capChild.kill();
   // The staged saves are copies of two region files in a temp directory; nothing of yours is in there.
   try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* windows can be slow to let go */ }
+  try { fs.rmSync(CAP, { recursive: true, force: true }); } catch { /* ditto */ }
 });

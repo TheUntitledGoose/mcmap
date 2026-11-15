@@ -12,6 +12,9 @@ export const WORLDD_FLAGS = [
   // M18: a folder of worlds (WD_WORLDS) instead of one save, and which of them a request gets when it
   // does not name one. See server/world-registry.mjs; the page asks with ?world=<slug>.
   'worlds', 'world-default', 'worlds-scan',
+  // How many of the worlds in that folder may stand open at once (WD_WORLDS_MAX, default 4). The rest are
+  // listed and opened by the first request that names them; `0` opens all of them. See park()/openNow().
+  'worlds-max',
   'packs', 'lods', 'skins', 'cache-max-gb', 'cache-keep-h', 'cache-sweep', 'cache-reconcile',
   'slow-ms', 'heartbeat',
   // which save the payload cache belongs to, when the directory and its seed are not answer enough

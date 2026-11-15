@@ -79,6 +79,10 @@ services:
       # a folder drop, not a compose edit. (README, "More than one save on one box".)
       #   WD_WORLDS: /data/worlds
       #   WD_WORLD_DEFAULT: darkrpg
+      # How many of those saves hold files open at once (default 4). The rest are listed in the page's save
+      # dropdown and opened by the first link that names them; their payloads stay on disk in the cache
+      # volume meanwhile. Raise it to keep every save hot, set 0 to open all of them at boot.
+      #   WD_WORLDS_MAX: 4
       # and beside the save mount:
       #   - type: bind
       #     source: ${MCMAP_WORLDS:-./worlds}

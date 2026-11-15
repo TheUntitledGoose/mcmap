@@ -101,7 +101,12 @@ export function levelSummary(worldDir) {
  * name falls back to the directory that holds the save: `/data/DarkRPG/world` is "DarkRPG", and in the
  * `--worlds` layout the slug already is the name an operator chose.
  */
-export function worldLabel(worldDir, slug = '') {
+export function worldLabel(worldDir, slug = '', override = '') {
+  // A name written next to the save (`<slug>/world.json`, `{"label": "..."}`) wins: the folder name is the
+  // slug, the cache identity and the link, and an operator should not have to rename a directory to give
+  // a map a readable title.
+  const o = String(override ?? '').trim();
+  if (o) return o;
   const lv = levelSummary(worldDir);
   const generic = /^(world|world_nether|world_the_end|new world|)?$/i.test(lv.name ?? '');
   if (!generic && lv.name) return lv.name;
@@ -119,7 +124,7 @@ export function worldLabel(worldDir, slug = '') {
  * `{ slug, problem }` - a sentence that names the pack and the verb that would have made it exist.
  */
 export function openWorld({ slug = '', dir = '', paths, cache = null, cacheMaxGb = 2,
-  worldTag = '', worldTagFrom = '', coverageTtlMs, log = () => {} } = {}) {
+  worldTag = '', worldTagFrom = '', labelOverride = '', coverageTtlMs, log = () => {} } = {}) {
   const off = (v) => (v === 'none' || !v ? null : v);
   const P = {
     world: paths.world,
@@ -182,7 +187,7 @@ export function openWorld({ slug = '', dir = '', paths, cache = null, cacheMaxGb
   b.ledger = new LedgerService(P.ledger ?? 'none');
   b.levelCache = null;
   b.level = () => (b.levelCache ??= levelSummary(P.world));
-  b.label = worldLabel(P.world, slug);
+  b.label = worldLabel(P.world, slug, labelOverride);
 
   // The skin pack, read once and re-read only when the manifest moves: a pack that changed under a
   // running server (someone ran tools/fetch-skins.mjs) has to be picked up without a restart.

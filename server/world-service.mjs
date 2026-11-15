@@ -192,6 +192,27 @@ export class WorldService {
     this._sinceSweep = 0;
   }
 
+  /**
+   * Let go of everything this service is holding: open region files, decoded chunk and shell frames,
+   * baked pack buffers, LOD tiles. A box that serves a folder of saves cannot hold every one of them
+   * open - each service is its own 48-file region LRU plus its payload and pack caches - so the registry
+   * parks a world by closing its service and keeps the payloads where they are: on disk, under this
+   * world's own cache tag, ready for the next request that names it.
+   */
+  close() {
+    for (const e of this.regions.values()) {
+      if (e?.rgn) { try { e.rgn.close(); } catch { /* already closed */ } }
+    }
+    this.regions.clear();
+    this.order.length = 0;
+    this.packs.clear();
+    this.packMissAt.clear();
+    this.lods.clear();
+    this.overviews.clear();
+    this.shells.clear();
+    this.closed = true;
+  }
+
   dimList() {
     return [...this.dims.values()].map(d => ({
       id: d.id, dir: d.dir, key: d.key,

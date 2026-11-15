@@ -137,6 +137,21 @@ test('an unknown slug is refused by name; the answer lists what does exist', () 
   for (const s of ['../etc', 'a/b', 'Dark RPG']) assert.equal(registry.resolve(s), null, `${s} is not a world`);
 });
 
+test('a folder whose packs arrived and whose save did not says which half showed up', () => {
+  const root = at('halfmounted');
+  const dir = path.join(root, 'packsonly');
+  touch(path.join(dir, 'packs', 'assets', 'atlas.json'), FAKE_ATLAS);
+  touch(path.join(dir, 'packs', 'shells', '.keep'), '');
+  const found = discoverWorlds(root);
+  assert.deepEqual(found.worlds, [], 'packs without a save are not a world this box can open');
+  const why = found.problems.find((p) => /packsonly/.test(p));
+  assert.ok(why, 'refused by name');
+  assert.match(why, /no save inside/, 'with the reason');
+  assert.match(why, /the packs did arrive \(assets, shells\)/,
+    'naming the half that did arrive, because that is the half someone forgot is the save');
+  assert.match(why, /put the save in/, 'and saying what would fix it');
+});
+
 test('a world whose packs never arrived is listed with its reason, and does not take the box down', () => {
   const root = at('broken');
   mkWorldAt(root, 'ready');
@@ -246,6 +261,86 @@ test('a save that vanishes from the root is still served, and is said to be gone
   assert.ok(reg.resolve('here'), 'and the tabs already looking at it do not go blank mid-pan: a folder '
     + 'that is briefly absent is usually a re-sync in progress');
   assert.ok(reg.slugs().includes('here'), 'still listed, because hiding it would be the same lie');
+});
+
+// ------------------------------------------------------- a root bigger than the process
+
+test('--worlds-max caps how many saves stand open, and a closed one is still a world', () => {
+  const root = at('cap');
+  for (const s of ['aaa', 'bbb', 'ccc', 'ddd']) mkWorldAt(root, s);
+  const { registry: reg } = openWorldsRoot({ root, defaultSlug: 'aaa', cache: at('cache-cap'), maxOpen: 2 });
+  assert.deepEqual(reg.openSlugs(), ['aaa', 'bbb'], 'the default first, then the folders in name order');
+  assert.equal(reg.countOpen(), 2, 'and no more than the cap stands open');
+  const listed = reg.list();
+  assert.equal(listed.length, 4, 'a closed world is still in the dropdown');
+  const c = listed.find((w) => w.slug === 'ccc');
+  assert.equal(c.parked, 1, 'its row says it is parked rather than open');
+  assert.equal(c.open, 0, 'and that it is not standing open');
+  assert.equal(c.label, 'ccc', 'named: a blank entry in a dropdown is worse than no entry');
+  assert.ok(c.worldTag.startsWith('ccc.'), 'and it names the payload directory it will use');
+  assert.match(String(c.tableTag), /^[0-9a-f]{8}$/, 'and the state table its blocks are numbered by');
+  assert.deepEqual(c.dims, [], 'none of which needed a region file opened');
+  // The pruner treats a non-empty keep-list as the truth about which saves are on this box, so a save the
+  // cap is merely holding closed must stay in it or a boot would delete what it is waiting for.
+  assert.ok(reg.cacheKeep().includes(c.worldTag), 'a closed save stays in the cache keep-list');
+  assert.ok(reg.cacheKeepTables().includes(c.tableTag), 'with its table tag');
+  assert.equal(reg.totals().parked, 2, 'and the boot line can say how many are closed until asked');
+  const noCap = openWorldsRoot({ root, defaultSlug: 'aaa', cache: at('cache-cap0'), maxOpen: 0 });
+  assert.equal(noCap.registry.countOpen(), 4, '--worlds-max 0 means what it says: open every one of them');
+});
+
+test('naming a closed save opens it, and the idlest one lets go', () => {
+  const root = at('lru');
+  for (const s of ['aaa', 'bbb', 'ccc', 'ddd']) mkWorldAt(root, s);
+  const { registry: reg } = openWorldsRoot({ root, defaultSlug: 'aaa', cache: at('cache-lru'), maxOpen: 2 });
+  // What parking means inside the service: the handles go, the payloads do not.
+  const bbbPath = reg.bySlug.get('bbb').svc.cachePath('minecraft:overworld', 5, 7);
+  reg.park('bbb');
+  assert.equal(reg.bySlug.get('bbb').svc.regions.size, 0, 'parking lets go of every region handle');
+  assert.equal(reg.bySlug.get('bbb').svc.order.length, 0, 'and the eviction list that tracked them');
+  assert.ok(reg.bySlug.get('bbb').notOpen, 'the world stays listed');
+  const c = reg.resolve('ccc');
+  assert.ok(c && !c.problem && !c.notOpen, 'a link to a closed save opens it on the spot');
+  assert.equal(reg.countOpen(), 2, 'and the cap is back where it belongs');
+  assert.ok(reg.bySlug.get('bbb').notOpen, 'the idlest still-closed world did not get opened to pay for it');
+  assert.ok(!reg.bySlug.get('aaa').notOpen, 'nor did the default: a request naming nothing gets that save, '
+    + 'so the cap bends by one rather than the page breaking');
+  reg.resolve('bbb');
+  assert.ok(reg.bySlug.get('ccc').notOpen, 'a fourth request closes the least recently used of the rest');
+  assert.equal(reg.resolve('ccc').notOpen, undefined, 'and asking it back revives it');
+  assert.equal(reg.cacheKeep().length, 4, 'every save on the box stays in the keep-list, open or not');
+  assert.equal(reg.resolve('bbb').svc.cachePath('minecraft:overworld', 5, 7), bbbPath,
+    'and bringing a save back points at the same payloads: parking cost nothing a later request does not '
+    + 'simply read again');
+});
+
+test('a box that lists twelve saves and holds four can say where its memory went', () => {
+  const root = at('cost');
+  for (const s of ['one', 'two', 'three']) mkWorldAt(root, s);
+  const { registry: reg } = openWorldsRoot({ root, defaultSlug: 'one', cache: at('cache-cost'), maxOpen: 2 });
+  const rows = reg.perWorld();
+  assert.equal(rows.length, 3);
+  const open = rows.filter((r) => r.open), closed = rows.filter((r) => r.parked);
+  assert.equal(open.length, 2, 'two rows say open'); assert.equal(closed.length, 1, 'one says parked');
+  assert.ok(rows.every((r) => r.worldTag && r.tableTag), 'every row names its cache identity and its table');
+  assert.ok(closed.every((r) => r.regionOpen === 0 && r.packsOpen === 0 && r.shellsCached === 0),
+    'a closed save reports that it is holding nothing');
+  assert.ok(open.every((r) => r.regionKnown >= 0 && typeof r.decodes === 'number'),
+    'an open one reports what it has looked at and decoded');
+});
+
+test('a world.json beside the save renames it without renaming the folder', () => {
+  const root = at('labels');
+  mkWorldAt(root, 'mcserver23');
+  mkWorldAt(root, 'othersave');
+  touch(path.join(root, 'mcserver23', 'world.json'), JSON.stringify({ label: 'Thanksgiving 2023' }));
+  const { registry: reg } = openWorldsRoot({ root, defaultSlug: 'mcserver23', cache: at('cache-labels'), maxOpen: 1 });
+  assert.equal(reg.resolve('mcserver23').label, 'Thanksgiving 2023', 'the name an operator chose');
+  const parked = reg.list().find((w) => w.slug === 'othersave');
+  assert.equal(parked.label, 'othersave', 'a world with no world.json is still named by its folder');
+  assert.equal(reg.list().find((w) => w.slug === 'mcserver23').slug, 'mcserver23',
+    'the slug, the link and the cache identity keep the folder name: only the label moved');
+  assert.ok(reg.resolve('mcserver23').facts().label === 'Thanksgiving 2023', 'and the link card sees it too');
 });
 
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));

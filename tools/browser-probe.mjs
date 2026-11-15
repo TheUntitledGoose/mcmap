@@ -29,6 +29,17 @@ const URL0 = arg('url', pos.find((p) => /^https?:\/\//.test(p)) ?? 'http://127.0
 const stray = pos.filter((p) => !/^https?:\/\//.test(p));
 if (stray.length) console.log(`probe: ignoring positional argument(s) ${JSON.stringify(stray)}`);
 if (!pos.includes(URL0) && !argv.includes('--url')) console.log('probe: no URL given, using ' + URL0);
+// Say, once and greppable, which page this probe is on - including the query. Since M18 a `&world=<slug>`
+// changes the save, the atlas, the state table and the payload cache the page reads, so an A/B run that
+// never printed its own query can measure one save twice, or two saves once each, and report either as a
+// finding. The whole query is echoed for the same reason every other knob of a probe is: so a bad run is
+// visible in the log line rather than only in the conclusion.
+{
+  const u = new URL(URL0);
+  const q = [...u.searchParams.entries()].map(([k, v]) => `${k}=${v}`);
+  console.log(`probe: ${u.origin !== 'http://127.0.0.1:8765' ? u.origin : ''}${u.pathname}`
+    + `${q.length ? `  ${q.join('  ')}` : ''}`);
+}
 const WAIT = +arg('wait', 7000);
 const PORT = +arg('port', 9223);
 // --shot takes a size (480x270) or a path (build/x.png); one value, no silent fallbacks. A path used to

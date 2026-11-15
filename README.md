@@ -343,6 +343,29 @@ A save that *disappears* from the root keeps being served, and is reported as mi
 progress, and blanking someone's map over that is a worse failure than continuing to answer from what is
 already open.
 
+A worlds root is a folder, and folders fill up, so the number of saves standing *open* at once is capped:
+`--worlds-max <n>` (env `WD_WORLDS_MAX`, default 4, `0` for no cap). Every save in the root is listed - in
+`/meta`, in the page's dropdown, and in the payload cache's keep-lists, so a save the box is merely holding
+closed does not get its payloads swept away — but only the cap's worth of them hold files open. The default
+save opens first; the rest are opened by the first request that names one, and when that puts the process
+over the cap the longest-idle save lets go (the default excepted, since a request naming nothing means it).
+Opening one is two small reads and an atlas parse, and its payloads are already on disk under its own cache
+identity, so a save that has sat closed for a week answers a link with cache hits rather than decodes. The
+log says each of these unasked:
+
+```text
+worlds: world charlie opened on request: v1.20.1, table e5d20ee9, dims 1
+worlds: world bravo parked: it holds no files now; its payloads stay under bravo.469fb043
+```
+
+and `/stats` carries a `perWorld` row per save — open or parked, region handles held, baked pack buffers,
+decoded far-view frames, LOD tiles, cache hits and decodes — because "why is this process 600 MB" should
+have an answer on a box that lists twelve saves and holds four.
+
+A save's *name* in the dropdown does not have to be its folder name: `<slug>/world.json` holding
+`{"label": "Thanksgiving 2023"}` renames the entry. The slug stays the folder name, because the slug is the
+link (`?world=`), the cache identity, and the thing every test and log line names.
+
 **Why each save carries its own packs.** A chunk payload is written as state ids, and those ids are the
 order that save's `assets/atlas.json` lists its states in. Two saves with the same mod set share a state
 table, and both call their biggest dimension folder `region/`, so before this existed one save could be

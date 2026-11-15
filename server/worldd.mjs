@@ -142,6 +142,19 @@ const REG = (WORLDS === '' || WORLDS === 'none')
     // How often the worlds root is re-looked at while running. 0 means "every time something asks", which
     // is what the multi-world HTTP test uses so it does not sleep for 15 s; a real box leaves it alone.
     refreshTtlMs: Math.max(0, +arg('worlds-scan', 15000) || 0),
+    // How many of them may stand OPEN at once. A worlds root is a folder of saves and people drop saves
+    // into folders: at boot every world opened parsed its atlas, decoded its spawn chunk and armed its
+    // own region-file LRU (48 files) and payload caches, and none of that is what a link asks for. The
+    // rest are listed - named in /meta, in the dropdown, kept out of the cache sweep - and open when a
+    // request first names them. 0 means no cap: open all of them, as before.
+    maxOpen: Math.max(0, +arg('worlds-max', 4) || 0),
+    // The registry is the thing that notices a save arrived, that a late pack fixed a broken one, that a
+    // link just opened a world this box was holding closed, and that the cap closed the idlest one. All of
+    // that is invisible unless it is said out loud: someone watching the log while they copy a save has to
+    // see the box react to it, the same way the heartbeat says when the set of worlds changes.
+    // closed, and the cap closed the idlest one. All of that is invisible unless it is said out loud: an
+    // operator watching the log while they copy a save has to see the box react to it.
+    log: (m) => console.log('  worlds: ' + m),
   }).registry;
 
 // A world that will not open is reported and skipped, not fatal - unless it is the only one and it is
@@ -159,10 +172,11 @@ if (!DEF || DEF.problem) {
 // The keep lists cover every world this process opens: a payload tree belonging to a world that is no
 // longer on disk is dead weight, and one belonging to a world that IS here is never touched.
 if (NOCACHE && num('cache-sweep', 1) !== 0) {
-  const live = [...REG.bySlug.values()].filter((b) => !b.problem);
+  // Every world this registry will answer about, holding files or not: a world the cap keeps closed is
+  // still a save on this box, and its payloads are exactly what it will need when a request names it.
   const r = pruneCache(NOCACHE, {
-    keepTags: live.map((b) => String(b.svc.tableTag)),
-    keepWorlds: live.map((b) => b.svc.worldTag),
+    keepTags: REG.cacheKeepTables(),
+    keepWorlds: REG.cacheKeep(),
     keepHours: num('cache-keep-h', 24),
     log: (m) => console.log('  cache: ' + m),
   });
@@ -177,7 +191,7 @@ if (NOCACHE && num('cache-sweep', 1) !== 0) {
 if (NOCACHE && num('cache-reconcile', 1) !== 0) {
   setTimeout(() => {
     for (const b of REG.bySlug.values()) {
-      if (b.problem) continue;
+      if (b.problem || b.notOpen) continue;   // a parked world has no service to sweep with
       b.svc.sweepCacheBudget().catch((e) => console.log('  cache: reconcile failed: ' + (e.message ?? e)));
     }
   }, 5000).unref();
@@ -385,6 +399,10 @@ const server = http.createServer(async (req, res) => {
         worldTag: svc.worldTag, tableTag: String(svc.tableTag),
         packsOpen: svc.packs.size,
         worlds: REG.list().map((x) => x.slug ?? ''),
+        // One row per save: what it costs while open (region handles, pack buffers, decoded far frames,
+        // LOD tiles), and nothing where the cap keeps it closed. Without this, "why is this process
+        // 600 MB" on a box that lists twelve saves has no answer.
+        perWorld: REG.perWorld(),
         inflight: INFLIGHT.size, byPath }), 'application/json');
       return;
     }
@@ -558,6 +576,14 @@ server.listen(PORT, HOST, () => {
   // --worlds a box can hold a save whose packs never arrived.
   const mark = (slug) => (slug === REG.defaultSlug ? '*' : ' ');
   for (const b of REG.bySlug.values()) {
+    if (b.notOpen) {
+      // Listed, not open: no atlas parsed, no region file touched, nothing to report about packs beyond
+      // what is sitting in its folder. The line says so, and says what will open it.
+      console.log(`  world ${mark(b.slug)} ${b.slug}  ${b.world}`
+        + `  (closed: --worlds-max ${REG.maxOpen} is spent on ${REG.openSlugs().join(' ')}`
+        + ` — it opens the first time a request names it)`);
+      continue;
+    }
     console.log(`  world ${mark(b.slug)} ${b.slug || '(single)'}  ${b.paths.world}` +
       `${b.problem ? `  FAILED: ${b.problem.split('\n')[0]}` : `  (${b.svc.dims.size} dimensions)`}`);
     if (b.problem) continue;
@@ -590,7 +616,9 @@ server.listen(PORT, HOST, () => {
     }
   }
   if (REG.multi) {
-    console.log(`  serving ${REG.slugs().length} world(s): ${REG.slugs().join(' ')} - the page asks with ?world=<slug>,`);
+    const t = REG.totals();
+    console.log(`  serving ${t.worlds} world(s): ${REG.slugs().join(' ')} - ${t.open} open, ${t.parked} closed until asked`
+      + ` (--worlds-max ${REG.maxOpen}${t.parked ? '' : ', no cap needed here'}); the page asks with ?world=<slug>,`);
     console.log(`    an unknown slug is refused by name rather than answered with the default (${REG.defaultSlug}).`);
   }
   for (const p of REG.problems) console.log(`  worlds: ${p}`);
