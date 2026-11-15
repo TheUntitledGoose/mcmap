@@ -117,6 +117,28 @@ export function worldLabel(worldDir, slug = '', override = '') {
 }
 
 /**
+ * The slug a save in the `--worlds` layout goes by: `<root>/<slug>/save/world`, or the bare
+ * `<root>/<slug>/world`. The registry passes that slug as the cache identity's *name*, so anything else
+ * that decodes the same save has to agree with it or its payloads land where no server will read them.
+ *
+ * Measured, not hypothetical: baking the `prominence` save in that layout filed 30 038 chunks under
+ * `save-world.00504d09/`, because the last two segments of every worlds-root save are `save/world` - so
+ * the name says nothing about which save, and two saves copied from one seed would share the directory
+ * outright. An empty answer means "this is not a worlds-root path", and the caller falls back to naming
+ * the cache by directory and seed, which is what it always did.
+ */
+export function worldSlugFor(worldDir) {
+  const dir = path.resolve(worldDir);
+  const here = path.basename(dir);
+  const up1 = path.basename(path.dirname(dir));
+  const up2 = path.basename(path.dirname(path.dirname(dir)));
+  if (here !== 'world') return '';
+  if (up1 === 'save' && slugOk(up2)) return up2;
+  if (slugOk(up1)) return up1;
+  return '';
+}
+
+/**
  * Open one world. `paths` are absolute-ish directories: `world` (the save's world folder), `assets`,
  * `shells` (the shell/overview packs), `lods`, `ledger`, `skins`, `embed`; `none` or null means "off".
  *

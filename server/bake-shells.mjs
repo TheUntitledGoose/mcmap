@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { WorldService } from './world-service.mjs';
 import { buildStateIds } from './chunk-payload.mjs';
+import { worldSlugFor } from './world-bundle.mjs';
 import { classifyStates } from '../shared/cube-path.mjs';
 import { shellFromPayload, shellPlanes, SHELL_FRAME } from './shell.mjs';
 import { OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_HEADER } from '../shared/chunk-format.mjs';
@@ -22,6 +23,12 @@ const WORLD = arg('world', 'DarkRPG/world');
 const ASSETS = arg('assets', 'build/assets');
 const OUT = arg('out', 'build/shells');
 const CACHE = arg('cache', 'build/cache');
+// Which save the payloads this bake writes belong to (shared/world-tag.mjs). It has to be the SAME name
+// the server will ask with, or the bake is wasted work: in the --worlds layout every save's world folder is
+// <slug>/save/world, so naming a cache from the last two path segments gives every save on the box the name
+// `save-world`. Measured here: a bake of the prominence save filed 30 038 chunks under
+// save-world.00504d09/ that no --worlds server would ever read, because that server names it `prominence`.
+const WORLD_TAG = arg('world-tag', '');
 const ONLY = arg('dim', null);
 const FORCE = argv.includes('--force');
 // Re-cutting just the overview is a pass over the packs, not over the save: seconds instead of the
@@ -42,9 +49,20 @@ const isSolid = (id) => cls.cube[id - 1] === 1;
 const isPaint = (id) => cls.cube[id - 1] === 1 && cls.opaque[id - 1] === 1;
 // Water and ice hold a lake skin up and must not be counted as one: see server/shell.mjs.
 const isFilm = (id) => cls.film[id - 1] === 1;
+const slug = worldSlugFor(WORLD);
+const tag = WORLD_TAG || slug;
 const svc = new WorldService(WORLD, stateIds, CACHE === 'none' ? null : CACHE, {
   isCubeState: isSolid, isPaintState: isPaint, isSolidState: isSolid, isFilmState: isFilm,
+  ...(tag ? { worldTag: tag } : {}),
+  worldTagFrom: WORLD_TAG ? `--world-tag ${WORLD_TAG}`
+    : slug ? 'the folder this save sits in (the --worlds layout)' : undefined,
 });
+if (CACHE !== 'none') {
+  // Say it before the work, not after: this is the line that tells you whether the payloads you are about
+  // to write are the ones the server will read.
+  console.log(`cache  ${CACHE} as ${svc.worldTag}/<table ${svc.tableTag}>/${svc.lightTag}`
+    + ` - named from ${svc.worldTagFrom}`);
+}
 
 const regionName = /^r\.(-?\d+)\.(-?\d+)\.mca$/;
 

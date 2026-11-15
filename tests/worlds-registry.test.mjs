@@ -11,7 +11,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { discoverWorlds, openWorldsRoot, WorldRegistry } from '../server/world-registry.mjs';
-import { slugOk, findSave, openWorld } from '../server/world-bundle.mjs';
+import { slugOk, findSave, openWorld, worldSlugFor } from '../server/world-bundle.mjs';
+import { WorldService } from '../server/world-service.mjs';
+import { worldTagFor } from '../shared/world-tag.mjs';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'worlds-'));
 const at = (...p) => path.join(tmp, ...p);
@@ -341,6 +343,27 @@ test('a world.json beside the save renames it without renaming the folder', () =
   assert.equal(reg.list().find((w) => w.slug === 'mcserver23').slug, 'mcserver23',
     'the slug, the link and the cache identity keep the folder name: only the label moved');
   assert.ok(reg.resolve('mcserver23').facts().label === 'Thanksgiving 2023', 'and the link card sees it too');
+});
+
+test('the baker and the server name the same payload directory for a worlds-root save', () => {
+  const cache = at('cache-baketag');
+  const root = at('baketag');
+  mkWorldAt(root, 'prominence');                       // <slug>/save/world: the documented layout
+  const { registry } = openWorldsRoot({ root, defaultSlug: 'prominence', cache });
+  const svc = registry.resolve('prominence').svc;
+  assert.equal(worldSlugFor(svc.worldRoot), 'prominence', 'the slug is readable off the path it is at');
+  // What `server/bake-shells.mjs` does with no flag typed: name the cache by that slug. Before this it
+  // named it by the last two path segments, which for every save in a worlds root are `save/world`.
+  const baked = new WorldService(svc.worldRoot, svc.stateIds, cache, { worldTag: worldSlugFor(svc.worldRoot) });
+  assert.equal(baked.worldTag, svc.worldTag, 'one save, one payload directory, baker and server agreeing');
+  assert.equal(baked.cachePath('minecraft:overworld', 5, 7), svc.cachePath('minecraft:overworld', 5, 7),
+    'so a chunk the baker decoded is the chunk the server reads instead of decoding again');
+  assert.ok(svc.cachePath('minecraft:overworld', 5, 7).startsWith(cache), 'and it stays inside the cache root');
+  // The identity that would have been used instead: the same name for every save on the box.
+  assert.equal(worldTagFor({ dir: svc.worldRoot, seed: 'same-seed' }).split('.')[0], 'save-world',
+    'which is the trap: two saves copied from one seed would share it outright');
+  const plain = mkWorldAt(root, 'plain', { shape: 'direct' });
+  assert.equal(worldSlugFor(plain), '', 'a bare folder is not a worlds root, and keeps the old naming');
 });
 
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));

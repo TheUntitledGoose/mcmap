@@ -115,6 +115,10 @@ SERVER_ROOT=/srv/DarkRPG VANILLA_JAR="$HOME/.minecraft/versions/1.20.1/1.20.1.ja
 npm run bake:shells -- --world /srv/DarkRPG/world     # ~11 min, ~63 MB
 npm run bake:lod    -- --world /srv/DarkRPG/world     # per rung, additive; ~90 MB total
 
+#    (a save inside a `--worlds` root is `<root>/<slug>/save/world`: the baker names the payload cache by
+#     that slug, the same name the server asks with, so what it decoded is what the server reads. Say
+#     `--world-tag <slug>` to override. It prints the identity it is using on the first line.)
+
 # 4. optional: block history ("who placed this")
 npm run bake:ledger:full -- --world /srv/DarkRPG/world   # export + pack, seconds
 
