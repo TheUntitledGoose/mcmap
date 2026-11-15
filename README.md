@@ -321,6 +321,15 @@ A save in that folder that will not open does not take the box down and is not h
 its reason, so "where is my other save" has an answer in `/meta` and in the panel instead of only in the
 container log.
 
+Each save brings its own state table, and a payload only means something next to the table it was written
+in: the numbers in a payload name entries in *that* save's atlas, and two saves can hold the same block
+under different numbers (measured on a 1.20.1 save and a 1.18.2 one on this box: `minecraft:dirt` is id 6
+in one table and 14 in the other, while `minecraft:stone` is 4 in both). So every batch answer carries the
+table it numbered against and the page refuses an answer numbered by a table it does not hold - because
+drawing one save's payloads through another save's atlas would not crash, it would draw a plausible wrong
+world with the right textures. `__world.tableWhy()` reports the expectation, the last refusal and how many
+answers were refused.
+
 A save dropped in after boot is noticed. `/meta` re-looks at the root every 15 s (that is where the page's
 save list comes from), and a request naming a slug that is not here triggers one look of its own before it
 is refused — the copy finished a minute ago and the link is now, which is the common case. A world that

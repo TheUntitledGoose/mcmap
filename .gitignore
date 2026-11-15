@@ -75,3 +75,12 @@ tests/world-push.test.mjs
 # Real player handles for this private save. Never publish this: the code, the probes and the docs
 # use "player A".."player G" instead (tools/pseudonymise.mjs).
 .private/
+
+# second real save, used for multi-world testing (input, not source)
+MCServerThanksgiving23/
+
+# local multi-world test root (junctions to real saves; never tracked)
+wroot/
+build/cache-wroot/
+build/census-thanksgiving.json
+build/assets-thanksgiving/

@@ -8,7 +8,8 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import zlib from 'node:zlib';
 
-import { openChunk, openBatch, frameDigest } from '../web/js/payload.js';
+import { openChunk, openBatch, frameDigest, declaredTableHash, expectTableHash, BATCH_MAGIC_V1 } from '../web/js/payload.js';
+import { stateTableHash, BATCH_HEADER_V1 } from '../shared/chunk-format.mjs';
 import { decodeChunk, packChunk, buildStateIds } from '../server/chunk-payload.mjs';
 import { packBatch } from '../server/world-service.mjs';
 import { RegionFile } from '../tools/region.mjs';
@@ -49,6 +50,51 @@ test('a chunk frame carries a fingerprint of its bytes, stable across a refetch'
   const flipped = Buffer.from(bytes);
   flipped[flipped.length - 6] ^= 0xff;
   assert.notEqual(openChunk(toArrayBuffer(flipped)).digest, a.digest, 'an edit has to change it');
+});
+
+// A container that claims nothing: the layout from before a batch could name a state table.
+function packBatchV1(frames) {
+  let total = BATCH_HEADER_V1;
+  for (const f of frames) total += 4 + ((f.length + 3) & ~3);
+  const out = Buffer.alloc(total);
+  out.write(BATCH_MAGIC_V1, 0, 'ascii');
+  out.writeUInt32LE(frames.length, BATCH_HEADER_V1 - 4);
+  let p = BATCH_HEADER_V1;
+  for (const f of frames) { out.writeUInt32LE(f.length, p); p += 4; f.copy(out, p); p += (f.length + 3) & ~3; }
+  return out;
+}
+
+test('a batch names the state table its ids number against, and the reader refuses another one', { skip: !haveWorld }, () => {
+  // Two saves on one box can hold the same block under different ids: measured on the deployed pair,
+  // `minecraft:dirt` is id 6 in one save's table and id 14 in the other's, while `minecraft:stone` is 4
+  // in both. So a payload that came from the wrong save is not noise - it is a plausible wrong world,
+  // drawn with the right textures. The container names the table it numbered against, and this reader
+  // is the thing that says no.
+  const keys = censusKeys();
+  const f1 = packChunk(decodeChunk(realChunk(3, 3), buildStateIds(keys)));
+  const mine = stateTableHash(keys);
+  const other = stateTableHash([...keys].reverse());
+  assert.notEqual(mine, other, 'renumbering a table has to change the number it hashes to');
+
+  const batch = toArrayBuffer(packBatch([f1], mine));
+  assert.equal(declaredTableHash(batch), mine, 'the container carries the claim');
+  assert.equal(openBatch(batch, mine).length, 1, 'read by the page that holds that table: fine');
+  assert.throws(() => openBatch(batch, other),
+    (e) => e.tableMismatch === true && e.declared === mine && e.expected === other,
+    'read by a page holding a page holding the other table: refused, naming both tables');
+
+  // A pre-v2 container claims nothing, so there is nothing to refuse - and a page that has not loaded
+  // an atlas yet asks nothing of a container it is handed.
+  const old = toArrayBuffer(packBatchV1([f1]));
+  assert.equal(declaredTableHash(old), 0, 'an old container makes no claim');
+  assert.equal(openBatch(old, mine).length, 1, 'no claim, no refusal');
+
+  // main.js sets the module expectation once, and the stores call openBatch(ab) with no argument.
+  expectTableHash(mine);
+  assert.equal(openBatch(batch).length, 1, 'the page reading its own table accepts its own answer');
+  expectTableHash(other);
+  assert.throws(() => openBatch(batch), (e) => e.tableMismatch === true, 'and the store path refuses');
+  expectTableHash(0);
 });
 
 test('a frame that is a subarray of a batch fingerprints the same as the frame alone', { skip: !haveWorld }, () => {

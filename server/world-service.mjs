@@ -12,7 +12,7 @@ import { decodeChunk, packChunk } from './chunk-payload.mjs';
 import { shellFromPayload, shellFrameCols } from './shell.mjs';
 import {
   BATCH_MAGIC, OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_VERSION_MIN, OVERVIEW_HEADER,
-  OVERVIEW_CELL_BYTES, overviewCellBytes,
+  OVERVIEW_CELL_BYTES, overviewCellBytes, stateTableHash, BATCH_HEADER,
 } from '../shared/chunk-format.mjs';
 import { ShellPack } from './shell-pack.mjs';
 import { loadLodTile, listLodTiles, lodPath } from './lod-pack.mjs';
@@ -123,6 +123,10 @@ export class WorldService {
     // were encoded against. Namespace the cache by that table: a re-pack renumbers ids, and two
     // services with different tables (a test's synthetic one, say) must never read each other's files.
     this.tableTag = opts.tableTag ?? tableTag(stateIds);
+    // The same fact, in the form a *response* can carry: the browser holds the atlas, so it can name
+    // the table it numbers blocks by, and an answer numbered against another table is refused rather
+    // than drawn. `stateIds` is a Map in atlas order, which is the order the page indexes too.
+    this.tableHash = opts.tableHash ?? stateTableHash(stateIds instanceof Map ? [...stateIds.keys()] : stateIds);
     // Payloads now carry light; a cache written before that must never be served as if it were lit.
     this.lightTag = opts.lightTag ?? (opts.light === false ? 'nolight' : 'lit');
     this.opts = opts;
@@ -252,7 +256,7 @@ export class WorldService {
   #emptyBatchFor(dimId, cx0, cz0, w, h) {
     if (this.hasGround(dimId, cx0, cz0, w, h)) return null;
     this.stats.coverageSkips++; this.stats.coverageSlots += w * h;
-    return packBatch(new Array(w * h).fill(Buffer.alloc(0)));
+    return packBatch(new Array(w * h).fill(Buffer.alloc(0)), this.tableHash);
   }
 
   #regionFile(dim, rx, rz) {
@@ -385,7 +389,7 @@ export class WorldService {
     for (let j = 0; j < h; j++) {
       for (let i = 0; i < w; i++) frames.push(this.chunkBytes(dimId, cx0 + i, cz0 + j) ?? Buffer.alloc(0));
     }
-    return packBatch(frames);
+    return packBatch(frames, this.tableHash);
   }
 
   /**
@@ -443,7 +447,7 @@ export class WorldService {
         }
       }
     }
-    return packBatch(frames);
+    return packBatch(frames, this.tableHash);
   }
 
   async shellBatchBytesAsync(dimId, cx0, cz0, w, h, every = YIELD_EVERY) {
@@ -460,7 +464,7 @@ export class WorldService {
         }
       }
     }
-    return packBatch(frames);
+    return packBatch(frames, this.tableHash);
   }
 
   shellBatchBytes(dimId, cx0, cz0, w, h) {
@@ -468,7 +472,7 @@ export class WorldService {
     for (let j = 0; j < h; j++) {
       for (let i = 0; i < w; i++) frames.push(this.shellBytes(dimId, cx0 + i, cz0 + j) ?? Buffer.alloc(0));
     }
-    return packBatch(frames);
+    return packBatch(frames, this.tableHash);
   }
 
   /** Baked shell pack for a region, or null when packs are absent or baked against another atlas. */
@@ -731,12 +735,18 @@ const shortName = (dim) => SHORT[dim] ?? dim;
 
 /** Frames are 4-byte aligned: chunk payloads are read through typed-array views, and a view needs
  *  its byte offset to be a multiple of its element size. Empty frames mean "no such chunk". */
-export function packBatch(frames) {
-  let total = 8 + 4;
+/**
+ * The container a batch response is made of. `tableHash` is the state table these frames' global ids
+ * were numbered against (0 = no claim, which only a hand-built batch should do): it costs 4 bytes and
+ * it is what lets a page refuse an answer that belongs to another save.
+ */
+export function packBatch(frames, tableHash = 0) {
+  let total = BATCH_HEADER;
   for (const b of frames) total += 4 + ((b.length + 3) & ~3);
   const out = Buffer.alloc(total);
   let p = 0;
   out.write(BATCH_MAGIC, p, 'ascii'); p += 8;
+  out.writeUInt32LE(tableHash >>> 0, p); p += 4;
   out.writeUInt32LE(frames.length, p); p += 4;
   for (const f of frames) {
     out.writeUInt32LE(f.length, p); p += 4;

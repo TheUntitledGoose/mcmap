@@ -21,7 +21,33 @@ export const LIGHT_UNKNOWN = 17;
 
 export const HEIGHT_BIAS = 2048;      // heightmaps travel as unsigned (worldY + bias)
 
-export const BATCH_MAGIC = 'DVDXB1  ';
+export const BATCH_MAGIC = 'DVDXB2  ';      // v2: the container names the state table its ids use
+export const BATCH_MAGIC_V1 = 'DVDXB1  ';    // the same container, before it could name one
+export const BATCH_HEADER = 16;                  // magic + table hash u32 + frame count u32
+export const BATCH_HEADER_V1 = 12;               // magic + frame count u32
+
+/**
+ * FNV-1a over a state table's keys, in table order: the number a payload names its ids by.
+ *
+ * A chunk payload is a list of global state ids, and those ids mean something only next to the atlas
+ * that numbered them. Two saves on one box measure that literally: in one save's table
+ * `minecraft:dirt` is id 6 and `minecraft:stone` is 4; in the other, dirt is 14 and stone is still 4.
+ * So an answer that came from the wrong save is not noise - it is a plausible wrong world, drawn with
+ * the right textures. The container therefore says which table it numbered against, and the page
+ * refuses an answer numbered by a table it does not hold.
+ */
+export function stateTableHash(keys) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < keys.length; i++) {
+    const key = String(keys[i]);
+    for (let j = 0; j < key.length; j++) { h = (h ^ key.charCodeAt(j)) >>> 0; h = Math.imul(h, 0x01000193) >>> 0; }
+    h = (h ^ 0x1f) >>> 0; h = Math.imul(h, 0x01000193) >>> 0;              // separator: "a"+"b" != "ab"
+    h = (h ^ (i & 0xff)) >>> 0; h = Math.imul(h, 0x01000193) >>> 0;        // and the id, so order counts
+    h = (h ^ ((i >>> 8) & 0xff)) >>> 0; h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  h = (h ^ keys.length) >>> 0; h = Math.imul(h, 0x01000193) >>> 0;
+  return (h >>> 0) || 1;                 // 0 means "this container names no table", so a hash may not be 0
+}
 
 // Heightmap shell (M5): one 16x16 grid of column tops per chunk, no section data. It exists so the
 // browser can hold a few thousand chunks of *silhouette* for the far view at ~1 KB each instead of

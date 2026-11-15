@@ -13,6 +13,7 @@ import path from 'node:path';
 import { fromWire, makeReader } from '../shared/regionbits.mjs';
 import { decodeTimeline, readPack } from '../shared/ledger-pack.mjs';
 import { pngSize } from '../shared/embed.mjs';
+import { BATCH_MAGIC } from '../shared/chunk-format.mjs';
 
 const PORT = 8790 + (process.pid % 90);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -61,7 +62,8 @@ test('a missing or misspelled coordinate is a 400, not somebody else\'s chunk', 
 test('a correct block still answers, and /regions describes the save', async () => {
   const ok = await get('/voxels?dim=minecraft:overworld&cx0=-20&cz0=-30&w=3&h=3');
   assert.equal(ok.code, 200);
-  assert.equal(ok.buf.subarray(0, 8).toString('latin1'), 'DVDXB1  ', 'batch magic, i.e. real payload');
+  assert.equal(ok.buf.subarray(0, 8).toString('latin1'), BATCH_MAGIC, 'batch magic, i.e. real payload');
+  assert.notEqual(ok.buf.readUInt32LE(8), 0, 'and it names the state table those payload ids number against');
   const meta = JSON.parse((await get('/meta')).text);
   const dim = meta.dims.find((d) => d.id === 'minecraft:overworld');
   const wire = JSON.parse((await get('/regions?dim=minecraft:overworld')).text);

@@ -246,8 +246,10 @@ test('WorldService decodes, caches and re-serves identical bytes', { skip: !have
 
   const cont = svc.batchBytes('minecraft:overworld', 2, 2, 3, 2);
   assert.equal(cont.subarray(0, 8).toString('ascii'), BATCH_MAGIC);
-  assert.equal(cont.readUInt32LE(8), 6);
-  let p = 12, frames = 0;
+  // v2 container: magic, the state table these ids number, frame count, then the frames.
+  assert.equal(cont.readUInt32LE(8), svc.tableHash, 'a container that does not say which state table it numbered against is a payload that could belong to another save');
+  assert.equal(cont.readUInt32LE(12), 6);
+  let p = 16, frames = 0;
   for (let i = 0; i < 6; i++) {
     const len = cont.readUInt32LE(p); p += 4;
     if (len) { const c = openChunk(cont.subarray(p, p + len)); assert.ok(c.palette.length > 0); frames++; }

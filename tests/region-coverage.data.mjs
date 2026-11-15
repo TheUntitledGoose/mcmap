@@ -87,7 +87,7 @@ test('a batch over ground that was never written is answered without a slot walk
   assert.equal(s.stats.coverageSkips, 1, 'answered from coverage');
   assert.equal(s.stats.coverageSlots, 64 * 64, 'and it is charged for the slots it did not walk');
   assert.equal(s.stats.missing, 0, 'no region file was even opened');
-  const frames = openShellBatch(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length), 64, 64);
+  const frames = openShellBatch(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length));
   assert.equal(frames.length, 4096);
   assert.ok(frames.every((f) => !f), 'an empty batch is still an explicit all-empty answer');
 });

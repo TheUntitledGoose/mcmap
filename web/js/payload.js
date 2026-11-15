@@ -5,13 +5,13 @@ import {
   LIGHT_VARIES, LIGHT_UNKNOWN, HEIGHT_BIAS, BATCH_MAGIC, SHELL_MAGIC, SHELL_VERSION, SHELL_HEADER, SHELL_COLS,
   SHELL_COLS_BYTES, SHELL_LIGHT_BYTES, SHELL_BAND_BYTES, SHELL_VERSION_MIN,
   OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_HEADER, OVERVIEW_CELL_BYTES, OVERVIEW_VERSION_MIN,
-  overviewCellBytes,
+  overviewCellBytes, BATCH_MAGIC_V1, BATCH_HEADER, BATCH_HEADER_V1,
 } from '../../shared/chunk-format.mjs';
 
 export {
   CHUNK_MAGIC, CHUNK_VERSION, FLAG_HEIGHT, FLAG_HEIGHT_MOTION, FLAG_BE, FLAG_CLASSIC, FLAG_LIGHT,
   LIGHT_VARIES, LIGHT_UNKNOWN, HEIGHT_BIAS, BATCH_MAGIC, SHELL_MAGIC, SHELL_VERSION, SHELL_HEADER, SHELL_COLS,
-  SHELL_COLS_BYTES, SHELL_LIGHT_BYTES, SHELL_BAND_BYTES,
+  SHELL_COLS_BYTES, SHELL_LIGHT_BYTES, SHELL_BAND_BYTES, BATCH_MAGIC_V1,
   OVERVIEW_MAGIC, OVERVIEW_VERSION, OVERVIEW_HEADER, OVERVIEW_CELL_BYTES,
 };
 
@@ -38,13 +38,42 @@ export function frameDigest(u8) {
  * length and the bytes padded to 4. Returns absolute [offset, length] pairs; a zero length means
  * "this chunk does not exist", which is information, not an error.
  */
-function batchFrames(buf, wantMagic) {
-  const dv = new DataView(buf, buf.byteOffset ?? 0, buf.byteLength);
-  const magic = magicAt(dv, 0);
-  if (magic !== wantMagic) throw new Error(`bad batch magic ${JSON.stringify(magic)}`);
-  const count = dv.getUint32(8, true);
+/**
+ * Which state table this page numbers blocks by, set once the atlas is in hand. Payload ids are only
+ * meaningful next to the atlas that made them, and two saves can agree on every block *name* while
+ * disagreeing about its id - so an answer numbered against another table is refused here rather than
+ * drawn as a plausible wrong world under the right textures.
+ */
+let EXPECT_TABLE = 0;
+export function expectTableHash(h) { EXPECT_TABLE = (h >>> 0) || 0; return EXPECT_TABLE; }
+export function expectedTableHash() { return EXPECT_TABLE; }
+
+const hex32 = (n) => (n >>> 0).toString(16).padStart(8, '0');
+
+/** A container numbered against a table this page does not hold. Flagged, not just worded: "the server
+ *  answered with another save" has to be countable, not grepped out of an error message. */
+function tableMismatch(declared, expected) {
+  const e = new Error(`payload names state table ${hex32(declared)}, this page numbers blocks by ${hex32(expected)}`);
+  e.tableMismatch = true; e.declared = declared; e.expected = expected;
+  return e;
+}
+
+/**
+ * Walk a batch container (see world-service packBatch): table hash, u32 frame count, then per frame a
+ * u32 length and the bytes padded to 4. Returns absolute [offset, length] pairs plus the table the
+ * container claims - 0 when it makes no claim, which is what a pre-v2 container does. A zero frame
+ * length means "this chunk does not exist", which is information, not an error.
+ */
+function batchFrames(buf) {
   const base = buf.byteOffset ?? 0;
-  let p = base + 12;
+  const dv = new DataView(buf, base, buf.byteLength);
+  const magic = magicAt(dv, 0);
+  const v1 = magic === BATCH_MAGIC_V1;
+  if (magic !== BATCH_MAGIC && !v1) throw new Error(`bad batch magic ${JSON.stringify(magic)}`);
+  const head = v1 ? BATCH_HEADER_V1 : BATCH_HEADER;
+  const tableHash = v1 ? 0 : dv.getUint32(base + 8, true);
+  const count = dv.getUint32(base + head - 4, true);
+  let p = base + head;
   const frames = [];
   for (let i = 0; i < count; i++) {
     const len = dv.getUint32(p - base, true); p += 4;
@@ -52,8 +81,11 @@ function batchFrames(buf, wantMagic) {
     p += (len + 3) & ~3;
   }
   if (p !== base + buf.byteLength) throw new Error(`batch length drift ${p - base} != ${buf.byteLength}`);
-  return frames;
+  return { frames, tableHash };
 }
+
+/** The table a container claims, or 0 when it makes no claim. */
+export function declaredTableHash(buf) { return batchFrames(buf).tableHash; }
 
 /**
  * @param {ArrayBuffer} buf        a chunk frame, possibly a slice inside a batch container
@@ -175,9 +207,11 @@ export function withAccessors(ch) {
  * Split a `/voxels` batch container into opened chunks. Frames are padded to 4 bytes by the
  * writer, so each frame can be read in place without copying.
  */
-export function openBatch(buf) {
+export function openBatch(buf, expectHash = EXPECT_TABLE) {
+  const { frames, tableHash } = batchFrames(buf);
+  if (tableHash && expectHash && tableHash !== expectHash) throw tableMismatch(tableHash, expectHash);
   const out = [];
-  for (const [off, len] of batchFrames(buf, BATCH_MAGIC)) out.push(len ? openChunk(buf, off, len) : null);
+  for (const [off, len] of frames) out.push(len ? openChunk(buf, off, len) : null);
   return out;
 }
 
@@ -233,9 +267,11 @@ export function openShellFrame(buf, byteOffset = 0, length = buf.byteLength - by
 }
 
 /** Split a `/shells` batch container into shell frames, `null` for chunks that do not exist. */
-export function openShellBatch(buf) {
+export function openShellBatch(buf, expectHash = EXPECT_TABLE) {
+  const { frames, tableHash } = batchFrames(buf);
+  if (tableHash && expectHash && tableHash !== expectHash) throw tableMismatch(tableHash, expectHash);
   const out = [];
-  for (const [off, len] of batchFrames(buf, BATCH_MAGIC)) out.push(len ? openShellFrame(buf, off, len) : null);
+  for (const [off, len] of frames) out.push(len ? openShellFrame(buf, off, len) : null);
   return out;
 }
 

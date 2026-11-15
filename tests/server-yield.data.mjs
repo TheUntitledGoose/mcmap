@@ -65,7 +65,7 @@ test('async batch yields the loop while it decodes; the sync batch does not', as
 test('async batch bytes decode as a shell batch on the browser side', async () => {
   const buf = await svc().shellBatchBytesAsync(DIM, CX, CZ, 3, 2);
   const ab = (b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.length);
-  const frames = openShellBatch(ab(buf), 3, 2);
+  const frames = openShellBatch(ab(buf));
   assert.equal(frames.length, 6);
   assert.ok(frames.some((f) => f), 'at least one populated chunk in the patch');
 });

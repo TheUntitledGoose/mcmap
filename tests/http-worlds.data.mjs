@@ -14,6 +14,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { openWorld } from '../server/world-bundle.mjs';
 import { worldTagFor } from '../shared/world-tag.mjs';
+import { stateTableHash } from '../shared/chunk-format.mjs';
+import { openBatch } from '../web/js/payload.js';
+
+const toArrayBuffer = (b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
 
 const SRC = 'DarkRPG/world';
 const PORT = 8900 + (process.pid % 90);
@@ -217,6 +221,57 @@ test('a save dropped into the worlds root while the server runs is served withou
     'a save that is a copy of another still gets its own cache identity');
   assert.ok(fs.existsSync(path.join(cache, own.worldTag)),
     'and what it decoded is filed under that name, not under the save it was copied from');
+});
+
+test('two saves whose atlases number the same blocks differently stay apart, and one answer cannot be drawn by the other page', async () => {
+  // The shape this whole level of the cache exists for. Same save bytes, same textures, but the second
+  // save's atlas lists its states in the other order - so `minecraft:dirt` is a different number in
+  // each, and a payload that crossed the line would draw a plausible wrong world instead of failing.
+  const R = stage('renumber', ['r.0.0.mca']);
+  const atlasPath = path.join(R.assets, 'atlas.json');
+  const atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
+  atlas.states.reverse();
+  fs.writeFileSync(atlasPath, JSON.stringify(atlas));
+
+  const keysOf = async (slug) => JSON.parse((await get(`/assets/atlas.json?world=${slug}`)).text).states.map((s) => s.k);
+  const fullKeys = await keysOf('full');
+  const reKeys = await keysOf('renumber');
+  const Hfull = stateTableHash(fullKeys), Hre = stateTableHash(reKeys);
+  assert.notEqual(Hfull, Hre, 'the two saves number blocks by different tables');
+  const block = 'minecraft:dirt';
+  assert.notEqual(fullKeys.indexOf(block), reKeys.indexOf(block),
+    `${block} really is a different id in the two tables`);
+
+  const A = await get('/voxels?dim=minecraft:overworld&cx0=0&cz0=0&w=1&h=1&world=full');
+  const B = await get('/voxels?dim=minecraft:overworld&cx0=0&cz0=0&w=1&h=1&world=renumber');
+  assert.equal(A.code, 200, A.text.slice(0, 120));
+  assert.equal(B.code, 200, B.text.slice(0, 120));
+  const abA = toArrayBuffer(A.buf), abB = toArrayBuffer(B.buf);
+  assert.equal(A.buf.readUInt32LE(8), Hfull, 'each answer names the table it was numbered against');
+  assert.equal(B.buf.readUInt32LE(8), Hre, 'and that is the other save, not this one');
+  assert.notDeepEqual(A.buf, B.buf, 'so the same chunk out of two tables is a different byte stream');
+
+  // Each page reads its own answer; neither can read the other's.
+  const fa = openBatch(abA, Hfull), fb = openBatch(abB, Hre);
+  assert.ok(fa[0] && fb[0], 'both pages get a chunk');
+  assert.throws(() => openBatch(abB, Hfull), (e) => e.tableMismatch === true,
+    'the first page refuses the renumbered save payload instead of drawing it');
+  assert.throws(() => openBatch(abA, Hre), (e) => e.tableMismatch === true, 'and the other way round');
+
+  // Read against the table that made them, both answers describe the same ground. That is the part a
+  // refusal alone does not prove: the ids differ, the blocks do not.
+  let hit = null;
+  for (let x = 0; x < 16 && !hit; x++) {
+    for (let z = 0; z < 16 && !hit; z++) {
+      const y = fa[0].surfaceAt(x, z);
+      const ia = fa[0].stateAt(x, y, z), ib = fb[0].stateAt(x, y, z);
+      if (!ia || !ib) continue;
+      hit = { x, y, z, ia, ib, ka: fullKeys[ia - 1], kb: reKeys[ib - 1] };
+    }
+  }
+  assert.ok(hit, 'found a column with ground in it to compare');
+  assert.equal(hit.ka, hit.kb, `same block, read from its own table: ${JSON.stringify(hit)}`);
+  assert.notEqual(hit.ia, hit.ib, 'and a different number in each table, which is the whole reason to name one');
 });
 
 after(() => {

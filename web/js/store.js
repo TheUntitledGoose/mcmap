@@ -144,7 +144,13 @@ export class ChunkStore {
 
   #ingest(t, ab) {
     let frames;
-    try { frames = openBatch(ab); } catch (e) { console.error('batch parse failed', e); return; }
+    try { frames = openBatch(ab); } catch (e) {
+      // A container numbered by another save's table is not a parse failure: that is the multi-world
+      // guard working, and it has to be countable rather than a line nobody reads in the console.
+      if (e.tableMismatch) { this.tableMismatch = (this.tableMismatch || 0) + 1; this.lastTableErr = e.message; }
+      console.error('batch parse failed', e);
+      return;
+    }
     let added = 0;
     for (const c of frames) {
       if (!c) continue;                                  // empty frame: that chunk does not exist

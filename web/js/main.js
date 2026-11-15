@@ -8,7 +8,7 @@ import { ChunkStore } from './store.js';
 import { ShellStore } from './shell-store.js';
 import { LodStore } from './lod-store.js';
 import { pickLodRung, LOD_CELL } from '../../shared/lod-format.mjs';
-import { openOverview, withAccessors } from './payload.js';
+import { openOverview, withAccessors, expectTableHash, expectedTableHash } from './payload.js';
 import { applyEdits, editsForCell, histStamp, rowsByCell, scanFromCentre, stateIdsByName } from './ledger-terrain.mjs';
 import { sectionIndex, idToState, voxelId } from './lookup.js';
 import { meshShellPatch, meshOverview } from './shell-mesh.js';
@@ -1102,6 +1102,9 @@ async function loadAssets() {
     fetch(withWorld('/assets/atlas.png')).then((r) => r.blob()),
   ]);
   assets = new Assets(json, geo);
+  // From here on every payload container is checked against this atlas: an answer numbered by another
+  // save's state table is refused, not drawn as a plausible wrong world.
+  expectTableHash(assets.tableHash);
   // The mesh workers get the same two blobs, so keep the raw copies around for them.
   assetSource = { json, geo };
   const bmp = await createImageBitmap(blob, { flipY: false });
@@ -7428,6 +7431,15 @@ window.__world = {
     const kk = k ?? (() => { const [tcx, tcz] = centerChunk(); return lodStore.key(Math.floor(tcx / 32), Math.floor(tcz / 32)); })();
     return kk ? lodHideWhy(kk) : { err: 'no tile under the orbit target', target: centerChunk() };
   },
+  // The state-table guard: what this page numbers blocks by, what the last refused answer claimed,
+  // and how many answers were refused. Refused is not missing: it means the server answered with a
+  // save this page is not showing.
+  tableWhy: () => ({
+    tableHash: assets ? assets.tableHash : 0,
+    expected: expectedTableHash(),
+    refused: ((store && store.tableMismatch) || 0) + ((shellStore && shellStore.tableMismatch) || 0),
+    last: (store && store.lastTableErr) || (shellStore && shellStore.lastTableErr) || '',
+  }),
   lodDiag: () => ({
     on: lodActive() ? 1 : 0, avail: lodAvail ? 1 : 0, cap: S.lodCap,
     clipOn: lodClipOn, clip: lodClipRect.map((v) => (v > 1e8 ? 'off' : v)), cov: lodCovPatches,

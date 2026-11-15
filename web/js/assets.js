@@ -14,6 +14,7 @@
 
 import { CANON_RING, decodeFaceCode, classifyStates } from '../../shared/cube-path.mjs';
 import { collisionTable, stateFootprints, stateHeights, C_FULL } from '../../shared/player.mjs';
+import { stateTableHash } from '../../shared/chunk-format.mjs';
 
 export const GEO_MAGIC = 'DVGEO12 ';
 
@@ -27,6 +28,9 @@ export class Assets {
     this.size = json.atlasSize;
     this.textures = json.textures;
     this.states = json.states;
+    // What payload containers are checked against: this atlas' keys, in this atlas' order. The server
+    // hashes the same list, so a response can be refused when its ids number something else.
+    this.tableHash = stateTableHash(this.states.map((s) => s.k));
     this.posScale = json.geometry.posScale;
 
     const dv = new DataView(geoBuf);

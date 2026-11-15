@@ -118,7 +118,11 @@ export class ShellStore {
 
   #ingest(t, ab) {
     let frames;
-    try { frames = openShellBatch(ab); } catch (e) { console.error('shell batch parse failed', e); return; }
+    try { frames = openShellBatch(ab); } catch (e) {
+      if (e.tableMismatch) { this.tableMismatch = (this.tableMismatch || 0) + 1; this.lastTableErr = e.message; }
+      console.error('shell batch parse failed', e);
+      return;
+    }
     let added = 0;
     for (const s of frames) {
       if (!s) continue;
