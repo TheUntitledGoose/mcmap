@@ -217,7 +217,11 @@ export class WorldRegistry {
     // than the TTL clock, so a boot-time scan does not blind the registry to a link typed a minute later,
     // and a stray `?world=` typo cannot turn into a readdir per request.
     const now = Date.now();
-    if (now - (this.lastMissScan ?? 0) < MISS_FLOOR_MS) return null;
+    // The miss guard is the configured glance interval, never longer: a box that asked for a faster
+    // glance (`--worlds-scan 0`, say) means it, and a box on the default still cannot be made to walk the
+    // root once per bogus `?world=`.
+    const floor = Math.min(MISS_FLOOR_MS, this.refreshTtlMs);
+    if (now - (this.lastMissScan ?? 0) < floor) return null;
     this.lastMissScan = now;
     this.refresh({ now, floor: 0 });
     return this.bySlug.get(s) ?? null;

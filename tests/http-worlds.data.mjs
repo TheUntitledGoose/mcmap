@@ -101,7 +101,10 @@ test('the same chunk in two saves answers identically, and a chunk only one of t
 });
 
 const child = spawn(process.execPath, ['server/worldd.mjs', '--port', String(PORT), '--host', '127.0.0.1',
-  '--worlds', root, '--world-default', 'full', '--cache', cache, '--heartbeat', '0', '--cache-sweep', '0'],
+  '--worlds', root, '--world-default', 'full', '--cache', cache, '--heartbeat', '0', '--cache-sweep', '0',
+  // One test drops a save into the root while this server runs and asks for it immediately; without this
+  // the glance interval would make that test a sleep. A real box leaves the default (15 s) alone.
+  '--worlds-scan', '0'],
   { stdio: ['ignore', 'pipe', 'pipe'] });
 let log = '';
 child.stdout.on('data', (b) => { log += b; });
@@ -196,6 +199,24 @@ test('the card and the favicon follow the world that was asked for', async () =>
   const half = page.text.match(/<meta property="og:title" content="([^"]*)"/)[1];
   const other = (await get('/?world=full')).text.match(/<meta property="og:title" content="([^"]*)"/)[1];
   assert.notEqual(half, other, 'and it describes the world in the link, not whichever one booted first');
+});
+
+test('a save dropped into the worlds root while the server runs is served without a restart', async () => {
+  // The deployment story in one test: a folder lands on the mounted share, nobody restarts anything, and
+  // the next link that names it works. Everything here is real decode work - a copy of one region file,
+  // its own atlas copy, and a payload written under its own cache identity.
+  stage('dropped', ['r.0.0.mca']);
+  const hit = await get('/voxels?dim=minecraft:overworld&cx0=0&cz0=0&w=2&h=2&world=dropped');
+  assert.equal(hit.code, 200, 'a request for a slug nobody had heard of made the registry look again');
+  assert.ok(hit.buf.length > 100000, `and it answered with payloads, got ${hit.buf.length} B`);
+  const m = JSON.parse((await get('/meta')).text);
+  const list = m.worlds.map((w) => w.slug);
+  assert.ok(list.includes('dropped'), `the page would offer it now: ${list.join(', ')}`);
+  const own = m.worlds.find((w) => w.slug === 'dropped');
+  assert.notEqual(own.worldTag, m.worlds.find((w) => w.slug === 'full').worldTag,
+    'a save that is a copy of another still gets its own cache identity');
+  assert.ok(fs.existsSync(path.join(cache, own.worldTag)),
+    'and what it decoded is filed under that name, not under the save it was copied from');
 });
 
 after(() => {

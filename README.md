@@ -326,7 +326,8 @@ save list comes from), and a request naming a slug that is not here triggers one
 is refused — the copy finished a minute ago and the link is now, which is the common case. A world that
 failed to open at boot because its asset pack had not arrived is retried (on a slower clock, because
 opening one means reading `level.dat` and parsing its atlas), so "the pack showed up later" ends up as a
-map rather than a permanent 404.
+map rather than a permanent 404. The glance interval is `--worlds-scan <ms>` (default 15000; `0` means look
+every time something asks, which is what this repo's own multi-world test uses so it does not sleep).
 
 A save that *disappears* from the root keeps being served, and is reported as missing
 (`/meta.worldMissing`, and one line in the log). A folder that is briefly absent is usually a re-sync in

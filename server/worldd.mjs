@@ -139,6 +139,9 @@ const REG = (WORLDS === '' || WORLDS === 'none')
   : openWorldsRoot({
     root: WORLDS, defaultSlug: WORLD_DEFAULT, cache: NOCACHE, cacheMaxGb: CACHE_MAX_GB,
     defaultEmbed: DEFAULT_CARD,
+    // How often the worlds root is re-looked at while running. 0 means "every time something asks", which
+    // is what the multi-world HTTP test uses so it does not sleep for 15 s; a real box leaves it alone.
+    refreshTtlMs: Math.max(0, +arg('worlds-scan', 15000) || 0),
   }).registry;
 
 // A world that will not open is reported and skipped, not fatal - unless it is the only one and it is
@@ -609,20 +612,23 @@ if (HEARTBEAT) {
   // loop was blocked, and by how much. That is the difference between "the server is slow" and "the
   // server is stuck", which is the question the 11/07 incident was about.
   let lastTick = Date.now(), lagMax = 0;
+  let knownWorlds = REG.slugs().join(' '), knownMissing = '';
   setInterval(() => {
     const now = Date.now();
     lagMax = Math.max(lagMax, now - lastTick - 1000);
     lastTick = now;
   }, 1000).unref();
   setInterval(() => {
-    // The worlds root is re-looked at on the registry's own TTL, so a save that appeared since boot is
-    // billed here the same as one that was there at boot - and the log says the set changed, rather than
-    // leaving someone to notice a new slug in a dropdown.
-    const before = REG.slugs().join(' ');
-    const r = REG.refresh();
-    if (r && (r.added.length || r.revived.length)) {
-      console.log(`worlds: ${before} -> ${REG.slugs().join(' ')}`
-        + (r.missing.length ? ` (still serving, not on disk: ${r.missing.join(' ')})` : ''));
+    // The worlds root is re-looked at on the registry's TTL, so a save that appeared since boot is billed
+    // here like one that was there at boot. The change is detected from the slug set rather than from the
+    // refresh's own report, because the thing that found the new save may have been a request instead.
+    REG.refresh();
+    const here = REG.slugs().join(' '), gone = [...REG.missing].join(' ');
+    if (here !== knownWorlds || gone !== knownMissing) {
+      const was = knownWorlds;
+      knownWorlds = here; knownMissing = gone;
+      console.log(`worlds: ${was} -> ${here}`
+        + (gone ? ` (no longer on disk, still served: ${gone})` : ''));
     }
     const now = REG.totals();
     const d = [];
