@@ -429,6 +429,19 @@ export class WorldRegistry {
   cacheKeepTables() { return this.live().map((b) => b.svc?.tableTag || b.tableTag).filter(Boolean); }
 
   /**
+   * [save tag, its state-table tags] for every world this process answers about, open or closed. The
+   * pruner needs the PAIRING: two separate keep-lists cannot tell "another save's cache" apart from "this
+   * save's cache under a name it changed" - and the second is 11 GB of saved CPU that a sweep would throw
+   * away, leaving the viewer slow and the log silent.
+   */
+  cacheTableOwners() {
+    return this.live()
+      .map((b) => [String(b.svc?.worldTag || b.worldTag || ''),
+        [String(b.svc?.tableTag || b.tableTag || '')].filter(Boolean)])
+      .filter(([w, tabs]) => w && tabs.length);
+  }
+
+  /**
    * A per-world row for `/stats`: what each save costs while it is open, nothing where it is parked.
    * Otherwise "why is this process 600 MB" has no answer on a box that lists twelve saves and holds four.
    */

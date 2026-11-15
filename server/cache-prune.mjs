@@ -104,6 +104,14 @@ export function trimCache(root, maxBytes, { dry = false, log = () => {} } = {}) 
  *                migration in progress (tools/cache-retag.mjs) is not eaten by a boot.
  *   bad tag:     a child of a save dir that has no light level under it, or a child of a table dir that
  *                is not itself a light tag.
+ *   renamed save: an unclaimed save dir holding a state table that a LIVE save reads (`tableOwners`:
+ *                [live save tag, its table tags] pairs). That is not a second save - it is the same save
+ *                under a cache name it no longer answers to, because the identity is a name plus a hash of
+ *                that name and the seed: `--world-tag darkrpg-world` one boot, the folder's slug
+ *                `darkrpg` the next, and both spellings are legal and different. Its payloads are kept and
+ *                reported with the exact command that moves them. Deleting them is the expensive mistake:
+ *                627k payloads and 11 GB of saved CPU go, every chunk decodes again (~25 min for a big
+ *                save), and the only symptom is that the viewer got slower for no visible reason.
  *   stale save:  a save dir nothing has been written into for `keepHours`, unless named in `keepWorlds`.
  *                This is what a removed world's cache is: nobody will ever read it again. When
  *                `keepWorlds` is non-empty the list IS the answer - the server knows which worlds it
@@ -114,11 +122,19 @@ export function trimCache(root, maxBytes, { dry = false, log = () => {} } = {}) 
  *
  * `dry` reports and changes nothing.
  */
-export function pruneCache(root, { keepTags = [], keepWorlds = [], keepHours = 24, dry = false, log = () => {} } = {}) {
-  if (!fs.existsSync(root)) return { removed: [], files: 0, bytes: 0 };
+export function pruneCache(root, { keepTags = [], keepWorlds = [], keepHours = 24, dry = false,
+  log = () => {}, tableOwners = [] } = {}) {
+  if (!fs.existsSync(root)) return { removed: [], renamed: [], files: 0, bytes: 0 };
   const keep = new Set(keepTags);
   const keepWorld = new Set(keepWorlds);
-  const out = { removed: [], files: 0, bytes: 0 };
+  // Which live save reads which state table. Separate keep-lists cannot say this: `darkrpg-world.8f192217`
+  // is not in the save list and `e5d20ee9` IS in the table list, and the pair is the whole question.
+  const readers = new Map();
+  for (const [w, tabs] of tableOwners) for (const t of tabs ?? []) {
+    if (!readers.has(t)) readers.set(t, new Set());
+    readers.get(t).add(w);
+  }
+  const out = { removed: [], renamed: [], files: 0, bytes: 0 };
   const rm = (dir, why) => {
     const m = measure(dir);
     out.removed.push({ dir, why, ...m });
@@ -132,6 +148,12 @@ export function pruneCache(root, { keepTags = [], keepWorlds = [], keepHours = 2
     try { ent = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
     return ent.some((s) => s.isDirectory() && LIGHTS.has(s.name));
   };
+  /** The state-table directories under a save dir - the ones that have a light level under them. */
+  const tablesOf = (dir) => {
+    let ent;
+    try { ent = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+    return ent.filter((s) => s.isDirectory() && hasLight(path.join(dir, s.name))).map((s) => s.name);
+  };
   const stale = (dir, depth) => (Date.now() - newestMtime(dir, depth)) / 3.6e6 > keepHours;
   const namedSaves = keepWorld.size > 0;
   const namedTables = keep.size > 0;
@@ -140,8 +162,25 @@ export function pruneCache(root, { keepTags = [], keepWorlds = [], keepHours = 2
     if (!e.isDirectory()) { if (e.name.endsWith('.bin')) rm(p, 'stray file'); continue; }
     if (hasLight(p)) { rm(p, 'pre-world layout: no save level, so its payloads belong to every save at once'); continue; }
     // A save this server does not serve: one walk, one delete, and no per-table work inside a tree that
-    // is going away anyway.
-    if (!keepWorld.has(e.name) && namedSaves) { rm(p, 'a save this server does not serve'); continue; }
+    // is going away anyway - unless the state table inside it is one a save that IS here reads.
+    if (!keepWorld.has(e.name) && namedSaves) {
+      const mine = tablesOf(p).filter((t) => readers.has(t));
+      if (mine.length) {
+        const wanted = [...new Set(mine.flatMap((t) => [...readers.get(t)]))];
+        const m = measure(p);
+        out.renamed.push({ dir: e.name, tables: mine, wantedBy: wanted, files: m.files, bytes: m.bytes });
+        log(`keeping ${e.name} - ${m.files} payloads, ${(m.bytes / 1e9).toFixed(2)} GB: ${mine.join(', ')} `
+          + `${mine.length === 1 ? 'is' : 'are'} the state table${mine.length === 1 ? '' : 's'} that `
+          + `${wanted.join(', ')} ${wanted.length === 1 ? 'reads' : 'read'}. That is the same save under a cache `
+          + 'name it no longer answers to, and those payloads are saved CPU: a sweep here costs a full '
+          + 're-decode of that world. Move them where the server looks:\n'
+          + `    node tools/cache-retag.mjs --dir ${root} --from ${e.name}`
+          + ` --to ${wanted[0] ?? '<live save tag>'} --merge`);
+        continue;
+      }
+      rm(p, 'a save this server does not serve');
+      continue;
+    }
     for (const t of fs.readdirSync(p, { withFileTypes: true })) {
       const tp = path.join(p, t.name);
       if (!t.isDirectory()) { rm(tp, `stray file under a save tag: ${t.name}`); continue; }
@@ -165,5 +204,6 @@ export function pruneCache(root, { keepTags = [], keepWorlds = [], keepHours = 2
     if (!left.length) { rm(p, 'left empty by the tag sweep'); continue; }
     if (!keepWorld.has(e.name) && stale(p, 3)) rm(p, `nothing written for this save in ${keepHours}+ h`);
   }
-  return { removed: out.removed, dirs: out.removed.length, files: out.files, bytes: out.bytes };
+  return { removed: out.removed, renamed: out.renamed, dirs: out.removed.length,
+    files: out.files, bytes: out.bytes };
 }

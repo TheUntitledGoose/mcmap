@@ -177,10 +177,19 @@ if (NOCACHE && num('cache-sweep', 1) !== 0) {
   const r = pruneCache(NOCACHE, {
     keepTags: REG.cacheKeepTables(),
     keepWorlds: REG.cacheKeep(),
+    tableOwners: REG.cacheTableOwners(),
     keepHours: num('cache-keep-h', 24),
     log: (m) => console.log('  cache: ' + m),
   });
   if (r.files) console.log('  cache: swept ' + r.files + ' unreachable files, ' + (r.bytes / 1e9).toFixed(2) + ' GB');
+  // A cache tree under an old name for a live save is kept on purpose, and said so: the alternative is a
+  // quiet 25-minute re-decode that the operator reads as the viewer having gotten slower.
+  if (r.renamed?.length) {
+    console.log('  cache: kept ' + r.renamed.length + ' cache tree' + (r.renamed.length === 1 ? '' : 's')
+      + ' filed under a name this box no longer uses (' + r.renamed.map((n) => n.dir).join(', ')
+      + ', ' + (r.renamed.reduce((s, n) => s + n.bytes, 0) / 1e9).toFixed(2) + ' GB)'
+      + ' - the line above says how to move ' + (r.renamed.length === 1 ? 'it' : 'them') + ' with tools/cache-retag.mjs');
+  }
 }
 
 // Reconcile the payload cache against its byte budget in the background, once, after the first requests

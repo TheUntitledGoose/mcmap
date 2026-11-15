@@ -474,9 +474,12 @@ build/cache/<worldTag>/<tableTag>/<lit|nolight>/<dimKey>/<cx>_<cz>.bin
 
 The save half matters: two saves running the same mods share a state-table tag, and both call their
 biggest dimension folder `region`, so a cache without it can answer for the wrong world. `worldTag` is
-derived from the world directory and the `level.dat` seed; name it yourself with `--world-tag`.
-`node tools/cache-retag.mjs --dry` moves an existing cache under that level instead of re-decoding it
-(do it before the server writes into the new layout, where it is a rename rather than 627k file ops).
+derived from the world directory and the `level.dat` seed; name it yourself with `--world-tag`, and inside
+a `--worlds` root the folder's slug *is* the name. The name is half the key, so renaming a save's folder
+(or opening it under a different `--world-tag`) is a new cache: `node tools/cache-retag.mjs --dir <root>
+--from <oldTag> --to <newTag> --merge` moves it, one `rename` per dimension the new name lacks. The server
+refuses to delete such a tree when its state table belongs to a save on the box - it prints the retag
+command instead of throwing away a world's worth of decoded chunks.
 
 ### Run it behind a proxy (the recommended shape)
 

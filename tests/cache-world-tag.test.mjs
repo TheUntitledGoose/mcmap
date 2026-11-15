@@ -204,6 +204,49 @@ test('the retag tool can just say what a save would be called, which is what ops
   assert.equal(tag, worldTagFor({ dir: path.resolve(path.join(tmp, 'darkrpg', 'save')), seed: '' }));
 });
 
+test('cache-retag moves a whole cache when only the NAME of the save moved', () => {
+  const world = fakeSave('renamed-save');
+  const cache = path.join(tmp, 'cache-renamed');
+  const OLD = 'oldname.11111111', NEW = 'newname.22222222';
+  const putAt = (tag, dim, name, body, ageMin) => {
+    const p = path.join(cache, tag, 'table1', 'lit', dim, name);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, Buffer.from(body));
+    const t = new Date(Date.now() - ageMin * 60e3);
+    fs.utimesSync(p, t, t);
+    return p;
+  };
+  const both = putAt(OLD, 'region', '5_6.bin', 'DVZ1old-a', 120);
+  const newer = putAt(NEW, 'region', '5_6.bin', 'DVZ1newer-a', 5);   // same chunk, decoded later
+  const theirs = putAt(NEW, 'region', '9_9.bin', 'DVZ1theirs', 5);
+
+  // Refused first: two trees for one state table is the merge the tool will not do unasked.
+  const noMerge = runTool(['--dir', cache, '--world', world, '--from', OLD, '--to', NEW]);
+  assert.equal(noMerge.status, 2, 'a table that exists on both sides is refused without --merge');
+  assert.match(noMerge.stderr, /REFUSED table1/);
+  assert.ok(fs.existsSync(both) && fs.existsSync(newer), 'and a refusal changes nothing');
+
+  // Now a dimension only the old tree has, so one branch moves whole and one merges.
+  const lonely = putAt(OLD, 'DIM1_region', '1_1.bin', 'DVZ1old-b', 120);
+  const dry = runTool(['--dir', cache, '--world', world, '--from', OLD, '--to', NEW, '--merge', '--dry']);
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /would merge table1 .* 1 dimension in one rename each/,
+    'a dimension the live tree has never served must move in one rename, not 124k: ' + dry.stdout);
+  assert.match(dry.stdout, /would merge table1/);
+  assert.ok(fs.existsSync(both) && fs.existsSync(lonely), 'a dry run moves nothing');
+
+  const run = runTool(['--dir', cache, '--world', world, '--from', OLD, '--to', NEW, '--merge']);
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  const movedDim = path.join(cache, NEW, 'table1', 'lit', 'DIM1_region', '1_1.bin');
+  assert.ok(fs.existsSync(movedDim), `the dimension the live tree lacks moves whole: ${run.stdout}`);
+  assert.deepEqual(fs.readFileSync(movedDim), Buffer.from('DVZ1old-b'), 'a rename, not a rewrite');
+  const settled = path.join(cache, NEW, 'table1', 'lit', 'region', '5_6.bin');
+  assert.deepEqual(fs.readFileSync(settled), Buffer.from('DVZ1newer-a'),
+    'two payloads for one chunk settle by mtime: the newer decode sits closer to its region file');
+  assert.ok(fs.existsSync(theirs), 'the live tree keeps what it already had');
+  assert.ok(!fs.existsSync(path.join(cache, OLD)), 'the old name is gone once it is empty');
+});
+
 test('tagHash is a string hash, not a coincidence generator', () => {
   const seen = new Set();
   for (let i = 0; i < 5000; i++) seen.add(tagHash(`C:/saves/${i}/world|12345`));

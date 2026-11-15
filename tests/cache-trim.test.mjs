@@ -100,6 +100,39 @@ test('pruneCache drops a state generation it was told is not live, and keeps the
   assert.ok(fs.existsSync(path.join(root, 'saveA', 'livetab', 'lit', 'region')));
 });
 
+test('a cache tree under an old NAME for a live save is kept, and the pruner prints the way out', () => {
+  const root = mk();
+  // Two names, one save: the first boot was `--world-tag oldname`, this one calls the same save by its
+  // folder slug. Both spellings hash differently, so the warm payloads are in the directory nothing asks.
+  for (let i = 0; i < 40; i++) put(root, 'oldname.11111111', 'e5d20ee9', 'lit', `o${i}.bin`, 3000, 200 + i);
+  for (let i = 0; i < 4; i++) put(root, 'newname.22222222', 'e5d20ee9', 'lit', `n${i}.bin`, 3000, 1 + i);
+  const said = [];
+  const r = pruneCache(root, {
+    keepWorlds: ['newname.22222222'], keepTags: ['e5d20ee9'], keepHours: 24,
+    tableOwners: [['newname.22222222', ['e5d20ee9']]], log: (m) => said.push(m),
+  });
+  assert.equal(r.files, 0, 'nothing is deleted: those payloads belong to a save that is on this box');
+  assert.equal(r.dirs, 0);
+  assert.equal(r.renamed.length, 1, 'and the operator sees why a tree was spared');
+  assert.equal(r.renamed[0].dir, 'oldname.11111111');
+  assert.deepEqual(r.renamed[0].tables, ['e5d20ee9']);
+  assert.deepEqual(r.renamed[0].wantedBy, ['newname.22222222']);
+  assert.equal(r.renamed[0].files, 40);
+  const hint = said.join('\n');
+  assert.match(hint, /cache-retag\.mjs --dir .* --from oldname\.11111111 --to newname\.22222222 --merge/,
+    'the fix has to be a command that can be pasted, not a hint: ' + hint);
+  // The other half of the rule: a tree whose table belongs to no live save is still dead weight.
+  for (let i = 0; i < 5; i++) put(root, 'gonebox.33333333', 'aabbccdd', 'lit', `g${i}.bin`, 3000, 3);
+  const gone = pruneCache(root, {
+    keepWorlds: ['newname.22222222'], keepTags: ['e5d20ee9'], keepHours: 24,
+    tableOwners: [['newname.22222222', ['e5d20ee9']]], log: () => {},
+  });
+  assert.equal(gone.dirs, 1, 'a save that is not here and shares no table still goes');
+  assert.ok(!fs.existsSync(path.join(root, 'gonebox.33333333')));
+  assert.ok(fs.existsSync(path.join(root, 'oldname.11111111', 'e5d20ee9', 'lit', 'region', 'o7.bin')),
+    'and the renamed one is still there, waiting to be moved');
+});
+
 test('the cache tree the code wrote before saves had identities is deleted, never read', () => {
   const root = mk();
   // <state table>/<generation>/<dimension>/<chunk>.bin: correct-looking, and ambiguous about which save.
